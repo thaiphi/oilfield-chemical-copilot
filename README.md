@@ -1,0 +1,2 @@
+# oilfield-chemical-copilot
+llmzoomcamp
