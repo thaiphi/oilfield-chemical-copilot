@@ -1,0 +1,16 @@
+﻿.env
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+uv.lock
+
+# Keep public sample data trackable; keep private corpus local only.
+data/private/*
+!data/private/.gitkeep
+
+# Local runtime output
+logs/
+tmp/
+outputs/

@@ -1,0 +1,30 @@
+﻿id: oilfield_copilot_ingest
+namespace: oilfield.chemical_copilot
+
+description: Scaffold ingestion flow for parse -> chunk -> embed -> load_pgvector.
+
+inputs:
+  - id: data_mode
+    type: STRING
+    defaults: sample
+
+tasks:
+  - id: parse
+    type: io.kestra.plugin.scripts.shell.Commands
+    commands:
+      - echo "TODO: parse PDFs, DOCX, XLSX, CSV, and nested folders for {{ inputs.data_mode }}"
+
+  - id: chunk
+    type: io.kestra.plugin.scripts.shell.Commands
+    commands:
+      - echo "TODO: chunk parsed text with source_file, topic, page_or_sheet, chunk_id metadata"
+
+  - id: embed
+    type: io.kestra.plugin.scripts.shell.Commands
+    commands:
+      - echo "TODO: create embeddings with OpenAI or sentence-transformers"
+
+  - id: load_pgvector
+    type: io.kestra.plugin.scripts.shell.Commands
+    commands:
+      - echo "TODO: load chunks and embeddings into PostgreSQL + PGVector"

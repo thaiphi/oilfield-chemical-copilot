@@ -1,0 +1,72 @@
+﻿services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    env_file:
+      - .env.example
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-oilfield_copilot}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-oilfield_copilot}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env.example
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4.1-mini}
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-openai}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://postgres:postgres@postgres:5432/oilfield_copilot}
+      DATA_MODE: ${DATA_MODE:-sample}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${STREAMLIT_PORT:-8501}:8501"
+    volumes:
+      - ./data:/app/data:ro
+
+  kestra:
+    image: kestra/kestra:latest
+    env_file:
+      - .env.example
+    command: server standalone
+    ports:
+      - "${KESTRA_PORT:-8080}:8080"
+    volumes:
+      - kestra-data:/app/storage
+      - ./flows/kestra:/app/flows:ro
+      - ./data:/app/data:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  grafana:
+    image: grafana/grafana:latest
+    env_file:
+      - .env.example
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana:/etc/grafana/provisioning:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  kestra-data:
+  grafana-data:
