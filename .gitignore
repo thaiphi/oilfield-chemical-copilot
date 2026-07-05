@@ -1,10 +1,9 @@
-﻿.env
+.env
 .venv/
 __pycache__/
 *.py[cod]
 .pytest_cache/
 .ruff_cache/
-uv.lock
 
 # Keep public sample data trackable; keep private corpus local only.
 data/private/*
@@ -14,3 +13,7 @@ data/private/*
 logs/
 tmp/
 outputs/
+
+.uv-cache/
+.pytest-tmp/
+pytest-cache-files-*

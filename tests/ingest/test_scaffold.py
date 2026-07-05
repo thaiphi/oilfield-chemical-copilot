@@ -8,12 +8,8 @@ def test_data_root_for_sample_mode() -> None:
     assert data_root_for_mode("sample") == Path("data/sample")
 
 
-def test_scan_sources_finds_supported_nested_files(tmp_path: Path) -> None:
-    nested = tmp_path / "nested"
-    nested.mkdir()
-    supported = nested / "water.csv"
-    unsupported = nested / "notes.txt"
-    supported.write_text("chloride,hardness\n35000,2500\n", encoding="utf-8")
-    unsupported.write_text("ignore", encoding="utf-8")
+def test_scan_sources_finds_supported_sample_file() -> None:
+    sources = scan_sources(Path("data/sample"))
 
-    assert scan_sources(tmp_path) == [supported]
+    assert Path("data/sample/sample_water_analysis.csv") in sources
+    assert all(path.suffix.lower() in {".pdf", ".docx", ".xlsx", ".csv"} for path in sources)

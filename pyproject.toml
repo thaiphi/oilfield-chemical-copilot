@@ -1,4 +1,4 @@
-﻿[project]
+[project]
 name = "oilfield-chemical-copilot"
 version = "0.1.0"
 description = "LLM Zoomcamp 2026 capstone scaffold for an oilfield production-chemistry troubleshooting RAG assistant."
@@ -27,7 +27,7 @@ dev = [
 ]
 
 [tool.uv]
-package = true
+package = false
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -35,3 +35,6 @@ where = ["src"]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
