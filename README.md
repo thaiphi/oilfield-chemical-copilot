@@ -24,6 +24,8 @@ This first pass creates the repository shape, local app shell, data-mode convent
 app/                         Streamlit chat UI scaffold
 data/sample/                 Public sample dataset included in the repo
 data/private/                Private corpus location, gitignored except .gitkeep
+data/processed/              Generated inventory reports, kept local
+ingestion/inventory.py       Metadata-only recursive inventory CLI
 db/migrations/               PostgreSQL + PGVector schema scaffold
 eval/                        Retrieval and answer-quality evaluation placeholders
 flows/kestra/                Kestra ingestion flow scaffold
@@ -65,6 +67,34 @@ Then open:
 - `data/private`: full private corpus, excluded from Git by `.gitignore`.
 
 Set `DATA_MODE=sample` or `DATA_MODE=private` in `.env` before running ingestion.
+
+## Corpus Inventory
+
+Milestone 1 inventories file metadata only. It recursively records paths, sizes, MIME guesses,
+topic and parser classifications, ingestion priority, and OCR candidates. It does not parse file
+contents, create embeddings, load a database, or copy source files.
+
+Public sample data:
+
+```powershell
+uv run python ingestion/inventory.py --data-dir data/sample --output-dir data/processed --max-files 20
+```
+
+Private files kept under the local repository:
+
+```powershell
+uv run python ingestion/inventory.py --data-dir data/private --output-dir data/processed --summary-only
+```
+
+An external mounted Google Drive folder:
+
+```powershell
+uv run python ingestion/inventory.py --data-dir "G:\My Drive\Operational Challenges Chenical_Electronic Handouts" --output-dir data/processed --summary-only
+```
+
+The command creates `data/processed/inventory.csv` and
+`data/processed/inventory_summary.md`. These generated reports are gitignored because private
+inventories can expose file names and absolute local paths.
 
 ## LLM Zoomcamp 2026 Mapping
 
