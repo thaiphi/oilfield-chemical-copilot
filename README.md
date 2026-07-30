@@ -1,4 +1,4 @@
-﻿# Oilfield Chemical Troubleshooting Copilot
+# Oilfield Chemical Troubleshooting Copilot
 
 Scaffold for an LLM Zoomcamp 2026 capstone project: an end-to-end RAG and tool-calling assistant for oilfield production-chemistry troubleshooting.
 
@@ -96,6 +96,15 @@ The command creates `data/processed/inventory.csv` and
 `data/processed/inventory_summary.md`. These generated reports are gitignored because private
 inventories can expose file names and absolute local paths.
 
+## Sample Parsing and Chunking
+
+Milestone 2 parses supported sample files and writes metadata-rich chunks for later retrieval work. It supports Markdown, text, CSV, XLSX, DOCX, and PDF files. This step does not create embeddings, load PGVector, call OpenAI, or run the RAG application.
+
+```powershell
+uv run python ingestion/ingest.py --data-dir data/sample --output-dir data/processed --max-files 20
+```
+
+The command creates `data/processed/chunks.jsonl`. The file is gitignored because private runs can include source names, local paths, and extracted text from private documents.
 ## LLM Zoomcamp 2026 Mapping
 
 - Introduction and environment: Python project managed with `uv`, `.env.example`, and Docker Compose.
