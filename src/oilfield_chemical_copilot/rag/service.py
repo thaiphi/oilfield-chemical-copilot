@@ -21,11 +21,13 @@ class BasicRagService:
         self.max_context_chars = max_context_chars
 
     @classmethod
-    def from_settings(cls, *, retriever, generator, settings: RetrievalSettings) -> "BasicRagService":
+    def from_settings(
+        cls, *, retriever, generator, settings: RetrievalSettings
+    ) -> "BasicRagService":
         return cls(
             retriever=retriever,
             generator=generator,
-            min_score=settings.min_score,
+            min_score=settings.evidence_threshold,
             max_context_chars=settings.max_context_chars,
         )
 
@@ -41,7 +43,9 @@ class BasicRagService:
             max_context_chars=self.max_context_chars,
         )
         if not prompt.sources:
-            return weak_evidence_answer(limitations="Retrieved chunks did not fit the context budget.")
+            return weak_evidence_answer(
+                limitations="Retrieved chunks did not fit the context budget."
+            )
         try:
             draft = self.generator.generate(
                 system_prompt=prompt.system_prompt,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -14,15 +15,15 @@ if str(SRC_DIR) not in sys.path:
 import streamlit as st
 
 from oilfield_chemical_copilot.ollama import OllamaClientError
-from oilfield_chemical_copilot.rag.models import RagAnswer, RagConfigurationError, SourceEvidence
 from oilfield_chemical_copilot.rag.generator_factory import build_answer_generator
+from oilfield_chemical_copilot.rag.models import RagAnswer, RagConfigurationError, SourceEvidence
 from oilfield_chemical_copilot.rag.service import BasicRagService
 from oilfield_chemical_copilot.retrieval.embeddings import build_embedding_provider
-from oilfield_chemical_copilot.retrieval.pipeline import BasicRetrievalPipeline, RetrievalSettings
+from oilfield_chemical_copilot.retrieval.keyword import KeywordSearchIndex
+from oilfield_chemical_copilot.retrieval.pipeline import RetrievalSettings, build_retrieval_pipeline
 from oilfield_chemical_copilot.storage.pgvector import PgVectorStore
 from oilfield_chemical_copilot.tools.chemical_dosage import calculate_dosage
 from oilfield_chemical_copilot.tools.water_analysis import summarize_water_analysis
-
 
 
 def _database_url() -> str:
@@ -44,21 +45,30 @@ def _initialize_state() -> None:
 
 
 @st.cache_resource(show_spinner=False)
-def _build_rag_service() -> BasicRagService:
-    settings = RetrievalSettings.from_env()
+def _build_rag_service(retrieval_mode: str) -> BasicRagService:
+    settings = replace(RetrievalSettings.from_env(), retrieval_mode=retrieval_mode)
     embedding_provider = build_embedding_provider()
     store = PgVectorStore(_database_url(), embedding_dimension=embedding_provider.dimension)
-    retriever = BasicRetrievalPipeline(
+    keyword_index = (
+        KeywordSearchIndex.from_hits(store.list_chunks())
+        if settings.retrieval_mode == "hybrid"
+        else None
+    )
+    retriever = build_retrieval_pipeline(
         store=store,
         embedding_provider=embedding_provider,
         settings=settings,
+        keyword_index=keyword_index,
     )
-    generator = build_answer_generator()
-    return BasicRagService.from_settings(retriever=retriever, generator=generator, settings=settings)
+    return BasicRagService.from_settings(
+        retriever=retriever,
+        generator=build_answer_generator(),
+        settings=settings,
+    )
 
 
-def _answer_question(prompt: str) -> RagAnswer:
-    service = _build_rag_service()
+def _answer_question(prompt: str, retrieval_mode: str) -> RagAnswer:
+    service = _build_rag_service(retrieval_mode)
     try:
         return service.answer(prompt)
     except OllamaClientError as error:
@@ -67,9 +77,11 @@ def _answer_question(prompt: str) -> RagAnswer:
 
 def _citation_display(source: SourceEvidence) -> str:
     source_file = _safe_source_file(source.source_file)
+    retrieval_sources = source.retrieval_sources or (source.retrieval_method,)
     return (
         f"{source.source_id}: {source_file} | {source.page_or_sheet} | "
-        f"chunk {source.chunk_id} | score {source.score:.3f}"
+        f"chunk {source.chunk_id} | score {source.score:.3f} | "
+        f"{source.retrieval_method}: {' + '.join(retrieval_sources)}"
     )
 
 
@@ -88,8 +100,13 @@ def _excerpt(text: str, *, limit: int = 280) -> str:
     return normalized[: limit - 3] + "..."
 
 
-def _render_tools_sidebar() -> None:
+def _render_tools_sidebar(default_retrieval_mode: str) -> str:
     with st.sidebar:
+        retrieval_mode = st.selectbox(
+            "Retrieval mode",
+            ("hybrid", "vector"),
+            index=("hybrid", "vector").index(default_retrieval_mode),
+        )
         st.header("Tools")
         st.caption("Standalone calculators. LLM tool routing starts in Milestone 5.")
 
@@ -117,6 +134,7 @@ def _render_tools_sidebar() -> None:
         if st.button("Summarize water"):
             result = summarize_water_analysis(chloride_mg_l, hardness_mg_l)
             st.info(result.summary)
+    return retrieval_mode
 
 
 def _render_message(message: dict[str, object]) -> None:
@@ -135,7 +153,8 @@ def run_app() -> None:
     _initialize_state()
     st.title("Oilfield Chemical Troubleshooting Copilot")
     st.caption("Basic RAG with source-grounded answers for production chemistry.")
-    _render_tools_sidebar()
+    default_retrieval_mode = RetrievalSettings.from_env().retrieval_mode
+    retrieval_mode = _render_tools_sidebar(default_retrieval_mode)
 
     for message in st.session_state.messages:
         _render_message(message)
@@ -151,7 +170,7 @@ def run_app() -> None:
     start = time.perf_counter()
     with st.chat_message("assistant"):
         try:
-            answer = _answer_question(prompt)
+            answer = _answer_question(prompt, retrieval_mode)
             latency_ms = int((time.perf_counter() - start) * 1000)
             st.write(answer.text)
             st.caption(f"RAG latency: {latency_ms} ms")

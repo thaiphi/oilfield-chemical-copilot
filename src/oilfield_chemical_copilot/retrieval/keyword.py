@@ -22,6 +22,10 @@ class KeywordSearchIndex:
     def from_chunks(cls, chunks: list[LoadedChunk]) -> "KeywordSearchIndex":
         return cls([_document_for_chunk(chunk) for chunk in chunks])
 
+    @classmethod
+    def from_hits(cls, hits: list[RetrievalHit]) -> "KeywordSearchIndex":
+        return cls([_document_for_hit(hit) for hit in hits])
+
     def search(self, query: str, limit: int = 5, topic: str | None = None) -> list[RetrievalHit]:
         if not query.strip() or limit < 1 or not self._documents:
             return []
@@ -50,6 +54,20 @@ def _document_for_chunk(chunk: LoadedChunk) -> dict[str, object]:
     }
 
 
+def _document_for_hit(hit: RetrievalHit) -> dict[str, object]:
+    return {
+        "chunk_id": hit.chunk_id,
+        "content": hit.text,
+        "source_file": hit.source_file,
+        "source_path": hit.source_path,
+        "topic": hit.topic,
+        "parser_type": hit.parser_type,
+        "page_or_sheet": hit.page_or_sheet,
+        "chunk_index": hit.chunk_index,
+        "metadata": dict(hit.metadata),
+    }
+
+
 def _hit_from_document(document: dict[str, object], *, score: float) -> RetrievalHit:
     return RetrievalHit(
         chunk_id=str(document["chunk_id"]),
@@ -64,3 +82,4 @@ def _hit_from_document(document: dict[str, object], *, score: float) -> Retrieva
         chunk_index=int(document["chunk_index"]),
         metadata=dict(document.get("metadata", {})),
     )
+

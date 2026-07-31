@@ -70,3 +70,46 @@ def test_build_prompt_sanitizes_legacy_absolute_source_file() -> None:
 
     assert "C:/private" not in prompt.user_prompt
     assert prompt.sources[0].source_file == "scale.md"
+
+def test_build_prompt_carries_hybrid_provenance_without_exposing_it_to_the_llm() -> None:
+    hit = _hit("Scale evidence")
+    hit = RetrievalHit(
+        chunk_id=hit.chunk_id,
+        text=hit.text,
+        score=hit.score,
+        retrieval_method="hybrid",
+        source_file=hit.source_file,
+        source_path=hit.source_path,
+        topic=hit.topic,
+        parser_type=hit.parser_type,
+        page_or_sheet=hit.page_or_sheet,
+        chunk_index=hit.chunk_index,
+        metadata={
+            "rrf_methods": ("keyword", "vector"),
+            "keyword_rank": 1,
+            "vector_rank": 2,
+        },
+    )
+
+    prompt = build_prompt(
+        question="How should I think about scale risk?",
+        hits=[hit],
+        max_context_chars=200,
+    )
+
+    assert prompt.sources[0].retrieval_method == "hybrid"
+    assert prompt.sources[0].retrieval_sources == ("keyword", "vector")
+    assert "C:/private" not in prompt.user_prompt
+    assert "rrf_methods" not in prompt.user_prompt
+    assert "keyword_rank" not in prompt.user_prompt
+    assert "hybrid: keyword + vector" not in prompt.user_prompt
+
+
+def test_build_prompt_marks_non_rrf_hits_as_vector_sources() -> None:
+    prompt = build_prompt(
+        question="How should I think about scale risk?",
+        hits=[_hit("Scale evidence")],
+        max_context_chars=200,
+    )
+
+    assert prompt.sources[0].retrieval_sources == ("vector",)

@@ -26,6 +26,8 @@ class SourceEvidence:
     topic: str
     excerpt: str
     score: float
+    retrieval_method: str = "vector"
+    retrieval_sources: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

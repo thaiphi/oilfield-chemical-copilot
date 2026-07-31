@@ -154,10 +154,10 @@ uv run pytest -m integration tests/storage/test_pgvector_integration.py
 Milestone 4 wires the Module 1 RAG loop into Streamlit:
 
 ```text
-question -> vector retrieval -> bounded evidence prompt -> Ollama structured draft -> deterministic answer with citations
+question -> keyword candidates + vector candidates -> RRF fusion -> bounded evidence prompt -> Ollama structured draft -> deterministic answer with citations
 ```
 
-The app uses only retrieved source chunks for citations. It hides absolute `source_path` values from user-visible answers and shows source filename, page/sheet, chunk ID, score, and a bounded excerpt. If no retrieved chunk clears `RAG_MIN_SCORE`, the app does not call OpenAI and returns:
+The app uses only retrieved source chunks for citations. It hides absolute `source_path` values from user-visible answers and shows source filename, page/sheet, chunk ID, score, and a bounded excerpt. If no retrieved chunk clears `HYBRID_MIN_RRF_SCORE` in hybrid mode or `RAG_MIN_SCORE` in vector mode, the app does not call the answer provider and returns:
 
 ```text
 I do not have enough retrieved evidence to answer confidently.
@@ -202,7 +202,7 @@ $env:TEST_DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/oilfield
 uv run pytest -m integration tests/rag/test_ollama_integration.py -v
 ```
 
-Learning note: this milestone covers the basic Module 1 RAG path. Agentic tool selection, function calling, monitoring, evaluation, and hybrid/RRF improvements are intentionally later milestones.
+Module 1 learning note: hybrid retrieval combines lexical precision for exact identifiers such as a chemical or product name with semantic recall for related language. Reciprocal rank fusion (RRF) uses `1 / (60 + keyword rank) + 1 / (60 + vector rank)`, where each rank starts at one. This is a ranking score, not a percentage or cosine similarity. Set `RETRIEVAL_MODE=vector` to compare vector-only retrieval; `RAG_MIN_SCORE` applies only in that mode.
 ## LLM Zoomcamp 2026 Mapping
 
 - Introduction and environment: Python project managed with `uv`, `.env.example`, `uv.lock`, and Docker Compose.

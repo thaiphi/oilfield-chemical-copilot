@@ -47,6 +47,12 @@ def _source_evidence(hits: list[RetrievalHit], *, max_context_chars: int) -> lis
             break
         excerpt = _bounded_excerpt(hit.text, remaining)
         used += len(excerpt)
+        raw_methods = hit.metadata.get("rrf_methods")
+        retrieval_sources = (
+            tuple(str(method) for method in raw_methods)
+            if isinstance(raw_methods, tuple)
+            else (hit.retrieval_method,)
+        )
         sources.append(
             SourceEvidence(
                 source_id=f"Source {index}",
@@ -56,6 +62,8 @@ def _source_evidence(hits: list[RetrievalHit], *, max_context_chars: int) -> lis
                 topic=hit.topic,
                 excerpt=excerpt,
                 score=hit.score,
+                retrieval_method=hit.retrieval_method,
+                retrieval_sources=retrieval_sources,
             )
         )
     return sources

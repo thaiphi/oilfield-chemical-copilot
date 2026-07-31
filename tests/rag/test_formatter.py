@@ -8,7 +8,7 @@ def _source(label: str = "Source 1") -> SourceEvidence:
     return SourceEvidence(
         source_id=label,
         chunk_id="scale-1",
-        source_file="docs/scale.md",
+        source_file="C:/private/docs/scale.md",
         page_or_sheet="document",
         topic="scale",
         excerpt="Scale inhibitors are selected from water analysis evidence.",
@@ -30,7 +30,7 @@ def test_format_answer_renders_required_sections_and_metadata_citations() -> Non
 
     assert answer.text.startswith("Answer:\nCheck the water analysis")
     assert "Why this matters:\nScale can restrict" in answer.text
-    assert "Evidence from retrieved sources:\n- Source 1: docs/scale.md, document, chunk scale-1" in answer.text
+    assert "Evidence from retrieved sources:\n- Source 1: scale.md, document, chunk scale-1" in answer.text
     assert "Recommended next checks:\n1. Review calcium\n2. Review sulfate\n3. Confirm temperature" in answer.text
     assert "C:/" not in answer.text
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 from oilfield_chemical_copilot.rag.models import FALLBACK_MESSAGE, RagDraft, RagGenerationError
 from oilfield_chemical_copilot.rag.service import BasicRagService
 from oilfield_chemical_copilot.retrieval.models import RetrievalHit
+from oilfield_chemical_copilot.retrieval.pipeline import RetrievalSettings
 
 
 class FakeRetriever:
@@ -19,7 +20,9 @@ class FakeGenerator:
         self.error = error
         self.calls = 0
 
-    def generate(self, *, system_prompt: str, user_prompt: str, allowed_source_ids: set[str]) -> RagDraft:
+    def generate(
+        self, *, system_prompt: str, user_prompt: str, allowed_source_ids: set[str]
+    ) -> RagDraft:
         self.calls += 1
         if self.error:
             raise self.error
@@ -87,3 +90,31 @@ def test_service_uses_safe_fallback_when_generation_fails() -> None:
 
     assert FALLBACK_MESSAGE in answer.text
     assert "raw provider details" not in answer.text
+
+
+def test_service_accepts_qualified_hybrid_rrf_score() -> None:
+    generator = FakeGenerator(draft=_draft())
+    service = BasicRagService(
+        retriever=FakeRetriever([_hit(score=2 / 61)]), generator=generator, min_score=0.015
+    )
+
+    answer = service.answer("How should I assess scale risk?")
+
+    assert answer.weak_evidence is False
+    assert generator.calls == 1
+
+
+def test_service_from_settings_uses_hybrid_rrf_evidence_threshold() -> None:
+    generator = FakeGenerator(draft=_draft())
+    service = BasicRagService.from_settings(
+        retriever=FakeRetriever([_hit(score=2 / 61)]),
+        generator=generator,
+        settings=RetrievalSettings(
+            retrieval_mode="hybrid", min_score=0.2, hybrid_min_rrf_score=0.015
+        ),
+    )
+
+    answer = service.answer("How should I assess scale risk?")
+
+    assert answer.weak_evidence is False
+    assert generator.calls == 1

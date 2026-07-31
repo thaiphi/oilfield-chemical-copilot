@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import PurePosixPath, PureWindowsPath
+
 from oilfield_chemical_copilot.rag.models import FALLBACK_MESSAGE, RagAnswer, RagDraft, SourceEvidence
 
 
@@ -50,6 +52,12 @@ def weak_evidence_answer(*, limitations: str) -> RagAnswer:
 
 def _evidence_line(source: SourceEvidence) -> str:
     return (
-        f"- {source.source_id}: {source.source_file}, {source.page_or_sheet}, "
+        f"- {source.source_id}: {_safe_source_file(source.source_file)}, {source.page_or_sheet}, "
         f"chunk {source.chunk_id}, score {source.score:.3f}. Excerpt: {source.excerpt}"
     )
+
+
+def _safe_source_file(source_file: str) -> str:
+    if PureWindowsPath(source_file).is_absolute() or PurePosixPath(source_file).is_absolute():
+        return source_file.replace("\\", "/").rsplit("/", maxsplit=1)[-1]
+    return source_file
