@@ -1,6 +1,6 @@
 # Oilfield Chemical Troubleshooting Copilot
 
-LLM Zoomcamp 2026 capstone project for an oilfield production-chemistry troubleshooting RAG assistant. The repository now includes the local data inventory, sample parser/chunker, deterministic/local embedding providers, keyword retrieval, and PGVector storage/search needed for Milestones 1 through 3.
+LLM Zoomcamp 2026 capstone project for an oilfield production-chemistry troubleshooting RAG assistant. The repository now includes the local data inventory, sample parser/chunker, deterministic/local embedding providers, keyword retrieval, PGVector storage/search, and a basic source-grounded RAG app needed for Milestones 1 through 4.
 
 ## Implemented Capabilities
 
@@ -11,13 +11,12 @@ LLM Zoomcamp 2026 capstone project for an oilfield production-chemistry troubles
 - Generate deterministic test embeddings or local sentence-transformer embeddings.
 - Store chunks and 384-dimensional embeddings in PostgreSQL with PGVector.
 - Run keyword search with `minsearch` and vector search through PGVector.
+- Ask questions in a Streamlit RAG app that retrieves source chunks, calls the configured answer provider (defaulting to local Ollama), and returns cited answers or a weak-evidence fallback.
 
 ## Planned Capabilities
 
 - Fuse keyword and vector results into hybrid retrieval.
-- Add source-grounded answer generation and citations.
 - Expose tool-calling helpers for chemical dosage calculations and water-analysis interpretation.
-- Serve a Streamlit chat UI with source citations and feedback controls.
 - Log conversations, feedback, latency, retrieved chunks, and tool calls.
 - Provide evaluation scripts for retrieval quality and LLM answer quality.
 - Orchestrate ingestion with Kestra: parse -> chunk -> embed -> load_pgvector.
@@ -26,7 +25,7 @@ LLM Zoomcamp 2026 capstone project for an oilfield production-chemistry troubles
 ## Repo Layout
 
 ```text
-app/                         Streamlit chat UI scaffold
+app/                         Streamlit RAG chat UI
 data/sample/                 Public sample dataset included in the repo
 data/private/                Private corpus location, gitignored except .gitkeep
 data/processed/              Generated inventory and chunk reports, kept local
@@ -60,6 +59,14 @@ With Docker Compose:
 ```powershell
 cp .env.example .env
 docker compose up --build
+```
+
+For a fresh database, run parsing and indexing before expecting cited answers:
+
+```powershell
+uv run python ingestion/ingest.py --data-dir data/sample --output-dir data/processed --max-files 20
+$env:DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/oilfield_copilot"
+uv run python ingestion/index_chunks.py --input data/processed/chunks.jsonl --database-url $env:DATABASE_URL
 ```
 
 Then open:
@@ -110,9 +117,11 @@ uv run python ingestion/ingest.py --data-dir data/sample --output-dir data/proce
 
 The command creates `data/processed/chunks.jsonl`. The file is gitignored because private runs can include source names, local paths, and extracted text from private documents.
 
+Learning note: Milestone 4 defaults to local Ollama embeddings using `granite-embedding:latest`. Use `EMBEDDING_PROVIDER=deterministic` for reproducible offline tests or dry runs, or `EMBEDDING_PROVIDER=sentence-transformers` for local sentence-transformer embeddings.
+
 ## Retrieval Indexing and Search
 
-Milestone 3 adds local embedding providers, keyword search, and PGVector loading/search. The default indexing provider is deterministic so tests and dry runs do not download models or call APIs. For local semantic embeddings, use `--embedding-provider sentence-transformers`, which uses `SENTENCE_TRANSFORMERS_MODEL` and stores 384-dimensional vectors by default.
+Milestone 3 adds local embedding providers, keyword search, and PGVector loading/search. The default indexing provider is local Ollama using `granite-embedding:latest`. Select `--embedding-provider deterministic` for offline tests and dry runs, or `--embedding-provider sentence-transformers` for the configured sentence-transformer model.
 
 Dry run without database writes:
 
@@ -139,12 +148,67 @@ $env:TEST_DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/oilfield
 uv run pytest -m integration tests/storage/test_pgvector_integration.py
 ```
 
+
+## Basic RAG App
+
+Milestone 4 wires the Module 1 RAG loop into Streamlit:
+
+```text
+question -> vector retrieval -> bounded evidence prompt -> Ollama structured draft -> deterministic answer with citations
+```
+
+The app uses only retrieved source chunks for citations. It hides absolute `source_path` values from user-visible answers and shows source filename, page/sheet, chunk ID, score, and a bounded excerpt. If no retrieved chunk clears `RAG_MIN_SCORE`, the app does not call OpenAI and returns:
+
+```text
+I do not have enough retrieved evidence to answer confidently.
+```
+
+Ollama is the default local answer provider. Start the local service and download the configured answer and embedding models:
+
+```powershell
+ollama serve
+ollama pull granite4.1:8b
+ollama pull granite-embedding:latest
+```
+
+In a second terminal, parse the public sample corpus and re-index it with Ollama embeddings:
+
+```powershell
+uv run python ingestion/ingest.py --data-dir data/sample --output-dir data/processed --max-files 20
+docker compose up -d postgres
+docker compose run --rm migrate
+$env:DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/oilfield_copilot"
+uv run python ingestion/index_chunks.py --input data/processed/chunks.jsonl --database-url $env:DATABASE_URL
+```
+
+Re-index after changing embedding providers or models: PGVector search is model-labelled, so it returns rows only for the query embedding's model label.
+
+Then launch Streamlit:
+
+```powershell
+cp .env.example .env
+$env:DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/oilfield_copilot"
+$env:LLM_PROVIDER = "ollama"
+uv run streamlit run app/streamlit_app.py
+```
+
+To use OpenAI instead, set `LLM_PROVIDER=openai` and provide `OPENAI_API_KEY` (optionally set `OPENAI_MODEL`). Warning: selecting OpenAI sends retrieved source excerpts, including private corpus content, to OpenAI.
+
+Run the complete local Ollama smoke test only after Docker Postgres and Ollama are reachable:
+
+```powershell
+$env:RUN_OLLAMA_INTEGRATION = "1"
+$env:TEST_DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/oilfield_copilot_test"
+uv run pytest -m integration tests/rag/test_ollama_integration.py -v
+```
+
+Learning note: this milestone covers the basic Module 1 RAG path. Agentic tool selection, function calling, monitoring, evaluation, and hybrid/RRF improvements are intentionally later milestones.
 ## LLM Zoomcamp 2026 Mapping
 
 - Introduction and environment: Python project managed with `uv`, `.env.example`, `uv.lock`, and Docker Compose.
 - Search and retrieval: implemented keyword search with `minsearch`; vector retrieval uses PGVector and filters by embedding model.
 - Vector databases: PGVector migrations create durable chunk and 384-dimensional embedding storage.
-- LLM integration: OpenAI API settings are included; answer generation is still a TODO.
+- LLM integration: OpenAI Responses API adapter generates structured drafts for source-grounded answers.
 - Evaluation: `eval/retrieval_eval.py` and `eval/answer_eval.py` define the planned evaluation entrypoints.
 - Monitoring: `monitoring/grafana/README.md` documents the Grafana-compatible dashboard plan.
 - Orchestration: `flows/kestra/ingest.yml` sketches parse, chunk, embed, and load steps.
@@ -154,7 +218,7 @@ uv run pytest -m integration tests/storage/test_pgvector_integration.py
 
 - Problem framing: production-chemistry troubleshooting for oilfield operations.
 - Data preparation: inventory plus parser/chunker coverage for PDF, DOCX, XLSX, CSV, text, Markdown, and nested folders.
-- Retrieval quality: keyword and vector retrieval primitives are implemented with source metadata and test coverage.
+- Retrieval quality: keyword and vector retrieval primitives are implemented; Milestone 4 uses a minimal vector-only RAG pipeline with source metadata and test coverage.
 - LLM answer quality: answer evaluation script placeholder is included.
 - Tool use: chemical dosage and water-analysis helper scaffolds are included.
 - Monitoring: conversation, latency, retrieval, feedback, and tool-call logging tables are scaffolded.
@@ -163,6 +227,6 @@ uv run pytest -m integration tests/storage/test_pgvector_integration.py
 ## Next Implementation Steps
 
 - Fuse keyword and vector results with a tested hybrid ranking strategy.
-- Wire source-grounded OpenAI answer generation with citations.
+- Add agentic tool routing for chemical dosage and water-analysis helpers.
 - Persist Streamlit conversations, feedback, latency, retrieval, and tool-call events.
 - Add a small labeled retrieval and answer-quality evaluation dataset.

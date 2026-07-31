@@ -43,4 +43,4 @@ def test_vector_retriever_embeds_query_and_delegates_to_store() -> None:
 
     assert hits[0].chunk_id == "chunk-1"
     assert len(store.calls[0][0]) == 8
-    assert store.calls[0][1:] == (3, "scale", "deterministic-hash-8")
+    assert store.calls[0][1:] == (3, "scale", "deterministic-token-hash-8")
