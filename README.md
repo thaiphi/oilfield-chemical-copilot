@@ -1,6 +1,6 @@
 # Oilfield Chemical Troubleshooting Copilot
 
-LLM Zoomcamp 2026 capstone project for an oilfield production-chemistry troubleshooting RAG assistant. The repository now includes the local data inventory, sample parser/chunker, deterministic/local embedding providers, keyword retrieval, PGVector storage/search, and a basic source-grounded RAG app needed for Milestones 1 through 4.
+LLM Zoomcamp 2026 capstone project for an oilfield production-chemistry troubleshooting RAG assistant. The repository now includes the local data inventory, sample parser/chunker, deterministic/local embedding providers, keyword, vector, and hybrid retrieval, PGVector storage/search, a retrieval evaluator, and a basic source-grounded RAG app needed for Milestones 1 through 4.
 
 ## Implemented Capabilities
 
@@ -10,15 +10,15 @@ LLM Zoomcamp 2026 capstone project for an oilfield production-chemistry troubles
 - Write `chunks.jsonl` with `source_file`, `source_path`, `topic`, `parser_type`, `page_or_sheet`, `chunk_index`, and `chunk_id` metadata.
 - Generate deterministic test embeddings or local sentence-transformer embeddings.
 - Store chunks and 384-dimensional embeddings in PostgreSQL with PGVector.
-- Run keyword search with `minsearch` and vector search through PGVector.
+- Run keyword search with `minsearch`, vector search through PGVector, and RRF-based hybrid retrieval.
+- Evaluate keyword, vector, and hybrid retrieval with fixed `k=5`, provenance, and public/private privacy boundaries.
 - Ask questions in a Streamlit RAG app that retrieves source chunks, calls the configured answer provider (defaulting to local Ollama), and returns cited answers or a weak-evidence fallback.
 
 ## Planned Capabilities
 
-- Fuse keyword and vector results into hybrid retrieval.
 - Expose tool-calling helpers for chemical dosage calculations and water-analysis interpretation.
 - Log conversations, feedback, latency, retrieved chunks, and tool calls.
-- Provide evaluation scripts for retrieval quality and LLM answer quality.
+
 - Orchestrate ingestion with Kestra: parse -> chunk -> embed -> load_pgvector.
 - Monitor operational metrics with Grafana-compatible dashboards.
 
@@ -34,7 +34,7 @@ ingestion/ingest.py          Sample parser and chunking CLI
 ingestion/index_chunks.py    Chunk embedding and PGVector indexing CLI
 ingestion/apply_migrations.py SQL migration runner for existing databases
 db/migrations/               PostgreSQL + PGVector schema migrations
-eval/                        Retrieval and answer-quality evaluation placeholders
+eval/                        Retrieval evaluator and public evaluation dataset
 flows/kestra/                Kestra ingestion flow scaffold
 monitoring/grafana/          Grafana dashboard/provisioning plan
 src/oilfield_chemical_copilot/
@@ -203,13 +203,34 @@ uv run pytest -m integration tests/rag/test_ollama_integration.py -v
 ```
 
 Module 1 learning note: hybrid retrieval combines lexical precision for exact identifiers such as a chemical or product name with semantic recall for related language. Reciprocal rank fusion (RRF) uses `1 / (60 + keyword rank) + 1 / (60 + vector rank)`, where each rank starts at one. This is a ranking score, not a percentage or cosine similarity. Set `RETRIEVAL_MODE=vector` to compare vector-only retrieval; `RAG_MIN_SCORE` applies only in that mode.
+
+## Retrieval Evaluation
+
+The retrieval evaluator compares keyword, vector, and hybrid modes at an exact fixed `k=5`. The public evaluation set measures retrieval only: it does not establish chemistry truth or production readiness.
+
+Public mode requires a database containing **only the complete derived `data/sample` chunk manifest**. With Docker PGVector running and that public-only sample index available, run:
+
+```powershell
+$env:DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/oilfield_copilot"
+uv run python eval/retrieval_eval.py --privacy-mode public --dataset eval/public_retrieval_dataset.jsonl --output-dir data/processed/evaluation/public --modes keyword,vector,hybrid --k 5
+```
+
+Public mode applies the `oracle_gold_topic` filter. It writes local, gitignored reports with sanitized provenance and, for public failures only, public question and topic identifiers with rank. The reports must not contain absolute paths.
+
+Private datasets belong under the gitignored `eval/private/` directory. Run private evaluation explicitly with `--privacy-mode private` and a private dataset path. Private reports are aggregate-only: they must not include question IDs, topics, chunk IDs, text, or paths.
+
+Hit Rate@k is the share of evaluation questions whose expected evidence appears in the first *k* retrieved chunks. MRR is the average reciprocal rank of the first expected evidence chunk, so it rewards placing evidence earlier in the results.
+
+Current public baseline (18 questions): keyword, vector, and hybrid each achieved Hit Rate@3 `1.000`, Hit Rate@5 `1.000`, and MRR@5 `1.000`, with no observed failures. This perfect, small, topic-filtered baseline does not justify a retrieval change and does not establish chemistry truth, private-corpus performance, or production readiness.
+
+Learning checkpoint: high Hit Rate with low MRR means the evidence was found but ranked poorly, and MRR exposes that weakness.
 ## LLM Zoomcamp 2026 Mapping
 
 - Introduction and environment: Python project managed with `uv`, `.env.example`, `uv.lock`, and Docker Compose.
 - Search and retrieval: implemented keyword search with `minsearch`; vector retrieval uses PGVector and filters by embedding model.
 - Vector databases: PGVector migrations create durable chunk and 384-dimensional embedding storage.
 - LLM integration: OpenAI Responses API adapter generates structured drafts for source-grounded answers.
-- Evaluation: `eval/retrieval_eval.py` and `eval/answer_eval.py` define the planned evaluation entrypoints.
+- Evaluation: `eval/retrieval_eval.py` evaluates keyword, vector, and hybrid retrieval at fixed `k=5` with public/private report boundaries; `eval/answer_eval.py` remains a placeholder.
 - Monitoring: `monitoring/grafana/README.md` documents the Grafana-compatible dashboard plan.
 - Orchestration: `flows/kestra/ingest.yml` sketches parse, chunk, embed, and load steps.
 - Capstone deployment: Docker Compose includes app, migration, Postgres/PGVector, Kestra, and Grafana services.
@@ -218,7 +239,7 @@ Module 1 learning note: hybrid retrieval combines lexical precision for exact id
 
 - Problem framing: production-chemistry troubleshooting for oilfield operations.
 - Data preparation: inventory plus parser/chunker coverage for PDF, DOCX, XLSX, CSV, text, Markdown, and nested folders.
-- Retrieval quality: keyword and vector retrieval primitives are implemented; Milestone 4 uses a minimal vector-only RAG pipeline with source metadata and test coverage.
+- Retrieval quality: keyword, vector, and hybrid retrieval are implemented with source metadata, test coverage, and a privacy-hardened retrieval evaluator.
 - LLM answer quality: answer evaluation script placeholder is included.
 - Tool use: chemical dosage and water-analysis helper scaffolds are included.
 - Monitoring: conversation, latency, retrieval, feedback, and tool-call logging tables are scaffolded.
@@ -226,7 +247,5 @@ Module 1 learning note: hybrid retrieval combines lexical precision for exact id
 
 ## Next Implementation Steps
 
-- Fuse keyword and vector results with a tested hybrid ranking strategy.
 - Add agentic tool routing for chemical dosage and water-analysis helpers.
 - Persist Streamlit conversations, feedback, latency, retrieval, and tool-call events.
-- Add a small labeled retrieval and answer-quality evaluation dataset.
