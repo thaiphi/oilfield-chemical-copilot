@@ -23,20 +23,21 @@ class OllamaClient:
         system_prompt: str,
         user_prompt: str,
         response_schema: dict[str, object] | None = None,
+        generation_options: dict[str, object] | None = None,
     ) -> str:
         response_format = response_schema if response_schema is not None else "json"
-        payload = self._post(
-            "/api/chat",
-            {
-                "model": model,
-                "stream": False,
-                "format": response_format,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-            },
-        )
+        payload = {
+            "model": model,
+            "stream": False,
+            "format": response_format,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        }
+        if generation_options is not None:
+            payload["options"] = generation_options
+        payload = self._post("/api/chat", payload)
         return _parse_chat_content(payload)
 
     def _post(self, path: str, payload: dict[str, object]) -> object:

@@ -224,13 +224,29 @@ Hit Rate@k is the share of evaluation questions whose expected evidence appears 
 Current public baseline (18 questions): keyword, vector, and hybrid each achieved Hit Rate@3 `1.000`, Hit Rate@5 `1.000`, and MRR@5 `1.000`, with no observed failures. This perfect, small, topic-filtered baseline does not justify a retrieval change and does not establish chemistry truth, private-corpus performance, or production readiness.
 
 Learning checkpoint: high Hit Rate with low MRR means the evidence was found but ranked poorly, and MRR exposes that weakness.
+## Grounded Answer Evaluation
+
+Module 2 evaluates public synthetic answers in two layers. Deterministic checks verify that expected citations are present and allowed, and that insufficient evidence causes abstention. The structured judge then rates groundedness, relevance, limitation awareness, and operational certainty from 1 to 5. The first layer is a contract check; the second is advisory quality evidence, not chemistry validation.
+
+The judge uses local Ollama with `granite4.1:8b` by default. It sends structured JSON requests at temperature `0`. Set `ANSWER_EVAL_JUDGE_PROVIDER=openai`, `OPENAI_API_KEY`, and optionally `ANSWER_EVAL_OPENAI_MODEL` to use OpenAI instead; OpenAI receives the public fixture's answer and evidence text. Reports retain public case IDs, deterministic status counts, judge status counts, provider labels, hashed model labels, and aggregate scores only. They never serialize questions, answers, evidence excerpts, source IDs, paths, credentials, or raw provider errors.
+
+Run the public evaluator after local Ollama is reachable:
+
+```powershell
+$env:ANSWER_EVAL_JUDGE_PROVIDER = "ollama"
+$env:OLLAMA_BASE_URL = "http://localhost:11434"
+$env:OLLAMA_MODEL = "granite4.1:8b"
+uv run python eval/answer_eval.py --dataset eval/public_answer_evaluation.jsonl --answers eval/public_generated_answers.jsonl --output-dir data/processed/evaluation/answers/public
+```
+
+The committed answer fixture is synthetic. Its baseline verifies evaluator wiring and safe reporting, not the live RAG application's answer quality. A judge can also be biased, particularly when it is similar to the model that generated an answer. Citation validity proves only structural grounding, not chemical correctness or operational safety.
 ## LLM Zoomcamp 2026 Mapping
 
 - Introduction and environment: Python project managed with `uv`, `.env.example`, `uv.lock`, and Docker Compose.
 - Search and retrieval: implemented keyword search with `minsearch`; vector retrieval uses PGVector and filters by embedding model.
 - Vector databases: PGVector migrations create durable chunk and 384-dimensional embedding storage.
 - LLM integration: OpenAI Responses API adapter generates structured drafts for source-grounded answers.
-- Evaluation: `eval/retrieval_eval.py` evaluates keyword, vector, and hybrid retrieval at fixed `k=5` with public/private report boundaries; `eval/answer_eval.py` remains a placeholder.
+- Evaluation: `eval/retrieval_eval.py` evaluates keyword, vector, and hybrid retrieval at fixed `k=5` with public/private report boundaries; `eval/answer_eval.py` provides deterministic checks plus a structured local/optional judge with aggregate-only reports.
 - Monitoring: `monitoring/grafana/README.md` documents the Grafana-compatible dashboard plan.
 - Orchestration: `flows/kestra/ingest.yml` sketches parse, chunk, embed, and load steps.
 - Capstone deployment: Docker Compose includes app, migration, Postgres/PGVector, Kestra, and Grafana services.
@@ -240,7 +256,7 @@ Learning checkpoint: high Hit Rate with low MRR means the evidence was found but
 - Problem framing: production-chemistry troubleshooting for oilfield operations.
 - Data preparation: inventory plus parser/chunker coverage for PDF, DOCX, XLSX, CSV, text, Markdown, and nested folders.
 - Retrieval quality: keyword, vector, and hybrid retrieval are implemented with source metadata, test coverage, and a privacy-hardened retrieval evaluator.
-- LLM answer quality: answer evaluation script placeholder is included.
+- LLM answer quality: public deterministic and structured-judge answer evaluation is implemented; it remains a learning baseline, not chemistry validation.
 - Tool use: chemical dosage and water-analysis helper scaffolds are included.
 - Monitoring: conversation, latency, retrieval, feedback, and tool-call logging tables are scaffolded.
 - Reproducibility: `pyproject.toml`, `uv.lock`, `.env.example`, Dockerfile, and Docker Compose are included.

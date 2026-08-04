@@ -76,6 +76,20 @@ def test_chat_posts_supplied_response_schema_as_format() -> None:
     )
 
     assert opener.request_payload["format"] == schema
+
+
+def test_chat_posts_optional_generation_options() -> None:
+    opener = _fake_opener({"message": {"content": "{}"}}, "/api/chat")
+    client = OllamaClient("http://ollama.test", opener=opener)
+
+    client.chat(
+        model="granite4.1:8b",
+        system_prompt="system",
+        user_prompt="user",
+        generation_options={"temperature": 0},
+    )
+
+    assert opener.request_payload["options"] == {"temperature": 0}
 @pytest.mark.parametrize("payload", [{}, {"embeddings": []}, {"embeddings": [[]]}, {"message": {}}])
 def test_client_rejects_invalid_payloads(payload: object) -> None:
     with pytest.raises(OllamaClientError):
