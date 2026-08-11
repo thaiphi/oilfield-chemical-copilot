@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from oilfield_chemical_copilot.rag.formatter import format_answer, weak_evidence_answer
+from oilfield_chemical_copilot.evaluation.abstention_policy import classify_claim_scope
+from oilfield_chemical_copilot.rag.formatter import (
+    format_answer,
+    scope_limited_answer,
+    weak_evidence_answer,
+)
 from oilfield_chemical_copilot.rag.models import RagAnswer, RagGenerationError
 from oilfield_chemical_copilot.rag.prompt_builder import build_prompt
 from oilfield_chemical_copilot.retrieval.pipeline import RetrievalSettings
@@ -14,24 +19,36 @@ class BasicRagService:
         generator,
         min_score: float = 0.2,
         max_context_chars: int = 4000,
+        apply_claim_scope_policy: bool = True,
     ) -> None:
         self.retriever = retriever
         self.generator = generator
         self.min_score = min_score
         self.max_context_chars = max_context_chars
+        self.apply_claim_scope_policy = apply_claim_scope_policy
 
     @classmethod
     def from_settings(
-        cls, *, retriever, generator, settings: RetrievalSettings
+        cls,
+        *,
+        retriever,
+        generator,
+        settings: RetrievalSettings,
+        apply_claim_scope_policy: bool = True,
     ) -> "BasicRagService":
         return cls(
             retriever=retriever,
             generator=generator,
             min_score=settings.evidence_threshold,
             max_context_chars=settings.max_context_chars,
+            apply_claim_scope_policy=apply_claim_scope_policy,
         )
 
     def answer(self, question: str, topic: str | None = None) -> RagAnswer:
+        if self.apply_claim_scope_policy:
+            claim_scope = classify_claim_scope(question)
+            if claim_scope.action == "abstain":
+                return scope_limited_answer(category=claim_scope.category)
         hits = self.retriever.retrieve(question, topic=topic)
         if not hits or max(hit.score for hit in hits) < self.min_score:
             return weak_evidence_answer(
@@ -52,7 +69,7 @@ class BasicRagService:
                 user_prompt=prompt.user_prompt,
                 allowed_source_ids={source.source_id for source in prompt.sources},
             )
-            return format_answer(draft, prompt.sources)
+            return format_answer(draft, prompt.sources, question=question)
         except RagGenerationError:
             return weak_evidence_answer(
                 limitations="Answer generation failed safely after retrieval. Check configuration and retry."

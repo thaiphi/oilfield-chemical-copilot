@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from oilfield_chemical_copilot.rag.models import FALLBACK_MESSAGE, RagDraft, RagGenerationError
 from oilfield_chemical_copilot.rag.service import BasicRagService
 from oilfield_chemical_copilot.retrieval.models import RetrievalHit
@@ -9,8 +11,10 @@ from oilfield_chemical_copilot.retrieval.pipeline import RetrievalSettings
 class FakeRetriever:
     def __init__(self, hits: list[RetrievalHit]) -> None:
         self.hits = hits
+        self.calls = 0
 
     def retrieve(self, question: str, topic: str | None = None):
+        self.calls += 1
         return self.hits
 
 
@@ -65,6 +69,66 @@ def test_service_returns_fallback_without_openai_call_when_evidence_is_weak() ->
     assert FALLBACK_MESSAGE in answer.text
     assert answer.sources == []
     assert generator.calls == 0
+
+
+@pytest.mark.parametrize(
+    ("question", "expected_limitation"),
+    [
+        (
+            "Can this determine the root cause at a named asset?",
+            "site-specific determination",
+        ),
+        (
+            "Can you prescribe a field-ready dosage?",
+            "field-ready prescription",
+        ),
+        (
+            "Can this replace a complete field analysis?",
+            "replace a complete analysis",
+        ),
+    ],
+)
+def test_service_abstains_before_retrieval_or_generation_for_closed_claim_scopes(
+    question: str, expected_limitation: str
+) -> None:
+    retriever = FakeRetriever([_hit()])
+    generator = FakeGenerator(draft=_draft())
+    service = BasicRagService(retriever=retriever, generator=generator)
+
+    answer = service.answer(question)
+
+    assert expected_limitation in answer.text.lower()
+    assert answer.sources == []
+    assert answer.weak_evidence is True
+    assert retriever.calls == 0
+    assert generator.calls == 0
+
+
+def test_service_evaluation_only_bypass_preserves_ungated_rag_baseline() -> None:
+    retriever = FakeRetriever([_hit()])
+    generator = FakeGenerator(draft=_draft())
+    service = BasicRagService(
+        retriever=retriever,
+        generator=generator,
+        apply_claim_scope_policy=False,
+    )
+
+    service.answer("Can you prescribe a field-ready dosage?")
+
+    assert retriever.calls == 1
+    assert generator.calls == 1
+
+
+def test_service_allows_general_review_through_unchanged_rag_path() -> None:
+    retriever = FakeRetriever([_hit()])
+    generator = FakeGenerator(draft=_draft())
+    service = BasicRagService(retriever=retriever, generator=generator)
+
+    answer = service.answer("How should I assess scale risk from produced water analysis?")
+
+    assert answer.weak_evidence is False
+    assert retriever.calls == 1
+    assert generator.calls == 1
 
 
 def test_service_formats_grounded_openai_answer_with_citations() -> None:

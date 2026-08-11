@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from oilfield_chemical_copilot.rag.formatter import format_answer, weak_evidence_answer
+from oilfield_chemical_copilot.rag.formatter import (
+    format_answer,
+    select_supported_sources,
+    weak_evidence_answer,
+)
 from oilfield_chemical_copilot.rag.models import FALLBACK_MESSAGE, RagDraft, SourceEvidence
 
 
@@ -26,6 +30,7 @@ def test_format_answer_renders_required_sections_and_metadata_citations() -> Non
             limitations="Only one sample source was retrieved.",
         ),
         [_source()],
+        question="Which water-analysis fields should be reviewed for scale risk?",
     )
 
     assert answer.text.startswith("Answer:\nCheck the water analysis")
@@ -41,7 +46,7 @@ def test_weak_evidence_answer_uses_exact_fallback_sentence() -> None:
     assert answer.text.splitlines()[1] == FALLBACK_MESSAGE
     assert answer.sources == []
 
-def test_format_answer_rejects_successful_answer_without_citations() -> None:
+def test_format_answer_rejects_answer_without_any_supported_source() -> None:
     draft = RagDraft(
         answer="This answer has evidence available but cites none.",
         why_this_matters="Uncited answers are not grounded.",
@@ -53,4 +58,102 @@ def test_format_answer_rejects_successful_answer_without_citations() -> None:
     import pytest
 
     with pytest.raises(Exception, match="at least one cited source"):
-        format_answer(draft, [_source()])
+        format_answer(
+            draft,
+            [_source()],
+            question="Which paraffin properties should be reviewed?",
+        )
+
+
+def test_selector_replaces_unrelated_model_citations_with_the_best_supported_source() -> None:
+    sources = [
+        SourceEvidence(
+            source_id="Source 1",
+            chunk_id="dosage",
+            source_file="docs/chemical_dosage_examples.md",
+            page_or_sheet="document",
+            topic="dosage",
+            excerpt="A continuous treatment estimate uses ppm, water barrels per day, and 42 gallons per barrel.",
+            score=0.72,
+        ),
+        SourceEvidence(
+            source_id="Source 2",
+            chunk_id="corrosion",
+            source_file="docs/corrosion_root_cause.md",
+            page_or_sheet="document",
+            topic="corrosion",
+            excerpt="Corrosion reviews compare acid gas exposure, bacteria indicators, and inhibitor residuals.",
+            score=0.95,
+        ),
+    ]
+    draft = RagDraft(
+        answer="Frame inhibitor dosage with ppm and water barrels per day.",
+        why_this_matters="A continuous treatment estimate needs those inputs.",
+        cited_source_ids=["Source 2"],
+        recommended_next_checks=["Check ppm", "Check water rate", "Check active fraction"],
+        limitations="General review only.",
+    )
+
+    selected = select_supported_sources(
+        question="What public inputs frame an inhibitor dosage review?",
+        draft=draft,
+        sources=sources,
+    )
+
+    assert [source.source_id for source in selected] == ["Source 1"]
+
+
+def test_selector_requires_a_topical_source_anchor_before_using_answer_overlap() -> None:
+    sources = [
+        SourceEvidence(
+            source_id="Dosage",
+            chunk_id="dosage",
+            source_file="docs/chemical_dosage_examples.md",
+            page_or_sheet="document",
+            topic="dosage",
+            excerpt="A continuous treatment estimate uses ppm, water barrels per day, and 42 gallons per barrel.",
+            score=0.64,
+        ),
+        SourceEvidence(
+            source_id="README",
+            chunk_id="readme",
+            source_file="README.md",
+            page_or_sheet="document",
+            topic="unknown",
+            excerpt="Dosage, water analysis, corrosion, and scale are all covered by this public project.",
+            score=0.62,
+        ),
+    ]
+    draft = RagDraft(
+        answer="Review dosage alongside water analysis, corrosion, and scale context.",
+        why_this_matters="General operating context affects treatment review.",
+        cited_source_ids=["README"],
+        recommended_next_checks=["Review water", "Review corrosion", "Review scale"],
+        limitations="General review only.",
+    )
+
+    selected = select_supported_sources(
+        question="What public inputs frame an inhibitor dosage review?",
+        draft=draft,
+        sources=sources,
+    )
+
+    assert [source.source_id for source in selected] == ["Dosage"]
+
+
+def test_selector_fails_closed_when_no_source_directly_supports_the_answer() -> None:
+    draft = RagDraft(
+        answer="Evaluate paraffin cloud point and crude composition.",
+        why_this_matters="Those factors determine wax deposition behavior.",
+        cited_source_ids=["Source 1"],
+        recommended_next_checks=["Check one", "Check two", "Check three"],
+        limitations="General review only.",
+    )
+
+    selected = select_supported_sources(
+        question="Which paraffin properties should be reviewed?",
+        draft=draft,
+        sources=[_source()],
+    )
+
+    assert selected == []

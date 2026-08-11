@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 
@@ -6,7 +6,7 @@ import pytest
 
 from oilfield_chemical_copilot.ollama import OllamaClientError
 from oilfield_chemical_copilot.rag.models import RagGenerationError
-from oilfield_chemical_copilot.rag.ollama_client import OllamaAnswerClient
+from oilfield_chemical_copilot.rag.ollama_client import LazyOllamaAnswerClient, OllamaAnswerClient
 
 
 class FakeOllamaClient:
@@ -163,3 +163,26 @@ def test_ollama_adapter_rejects_string_valued_next_checks() -> None:
             user_prompt="user",
             allowed_source_ids={"Source 1"},
         )
+
+def test_ollama_adapter_forwards_optional_generation_options() -> None:
+    class Client(FakeOllamaClient):
+        def chat(self, *, model: str, system_prompt: str, user_prompt: str, response_schema=None, generation_options=None) -> str:
+            self.generation_options = generation_options
+            return super().chat(model=model, system_prompt=system_prompt, user_prompt=user_prompt, response_schema=response_schema)
+
+    client = Client(_valid_draft_json())
+    adapter = OllamaAnswerClient(model="granite4.1:8b", client=client, generation_options={"temperature": 0})
+    adapter.generate(system_prompt="system", user_prompt="user", allowed_source_ids={"Source 1"})
+    assert client.generation_options == {"temperature": 0}
+
+
+def test_lazy_ollama_adapter_forwards_generation_options() -> None:
+    class Client(FakeOllamaClient):
+        def chat(self, *, model: str, system_prompt: str, user_prompt: str, response_schema=None, generation_options=None) -> str:
+            self.generation_options = generation_options
+            return super().chat(model=model, system_prompt=system_prompt, user_prompt=user_prompt, response_schema=response_schema)
+
+    client = Client(_valid_draft_json())
+    adapter = LazyOllamaAnswerClient(client=client, generation_options={"temperature": 0})
+    adapter.generate(system_prompt="system", user_prompt="user", allowed_source_ids={"Source 1"})
+    assert client.generation_options == {"temperature": 0}

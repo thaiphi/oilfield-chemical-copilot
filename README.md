@@ -12,7 +12,7 @@ LLM Zoomcamp 2026 capstone project for an oilfield production-chemistry troubles
 - Store chunks and 384-dimensional embeddings in PostgreSQL with PGVector.
 - Run keyword search with `minsearch`, vector search through PGVector, and RRF-based hybrid retrieval.
 - Evaluate keyword, vector, and hybrid retrieval with fixed `k=5`, provenance, and public/private privacy boundaries.
-- Ask questions in a Streamlit RAG app that retrieves source chunks, calls the configured answer provider (defaulting to local Ollama), and returns cited answers or a weak-evidence fallback.
+- Ask questions in a Streamlit RAG app with a claim-scope gate before retrieval. Closed-scope questions return a safe response without retrieval or generation; general-review questions retrieve source chunks, call the configured provider (defaulting to local Ollama), and return cited answers or a weak-evidence fallback.
 
 ## Planned Capabilities
 
@@ -154,10 +154,10 @@ uv run pytest -m integration tests/storage/test_pgvector_integration.py
 Milestone 4 wires the Module 1 RAG loop into Streamlit:
 
 ```text
-question -> keyword candidates + vector candidates -> RRF fusion -> bounded evidence prompt -> Ollama structured draft -> deterministic answer with citations
+question -> explicit product-dose contract -> claim-scope gate -> validated calculation OR general RAG -> retrieval -> bounded evidence prompt -> Ollama structured draft -> deterministic answer with citations
 ```
 
-The app uses only retrieved source chunks for citations. It hides absolute `source_path` values from user-visible answers and shows source filename, page/sheet, chunk ID, score, and a bounded excerpt. If no retrieved chunk clears `HYBRID_MIN_RRF_SCORE` in hybrid mode or `RAG_MIN_SCORE` in vector mode, the app does not call the answer provider and returns:
+The app uses only retrieved source chunks for citations. It hides absolute `source_path` values from user-visible answers and shows source filename, page/sheet, chunk ID, score, and a bounded excerpt. The claim-scope gate runs before retrieval and before an explicit product-dose calculation: it returns a scope-limited response with no calculator, retriever, or generator call for site-specific determinations, field-ready prescriptions, and attempts to replace a complete analysis. If a general-review question has no retrieved chunk above `HYBRID_MIN_RRF_SCORE` in hybrid mode or `RAG_MIN_SCORE` in vector mode, the app does not call the answer provider and returns:
 
 ```text
 I do not have enough retrieved evidence to answer confidently.
@@ -240,13 +240,86 @@ uv run python eval/answer_eval.py --dataset eval/public_answer_evaluation.jsonl 
 ```
 
 The committed answer fixture is synthetic. Its baseline verifies evaluator wiring and safe reporting, not the live RAG application's answer quality. A judge can also be biased, particularly when it is similar to the model that generated an answer. Citation validity proves only structural grounding, not chemical correctness or operational safety.
+
+## Live RAG Answer Comparison
+
+The live comparison evaluates the actual `BasicRagService` in `vector` and `hybrid` modes against the same public questions. Unlike the synthetic answer fixture above, it calls the local RAG path, captures each generated draft and its cited public evidence only in memory, and writes aggregate-only results. It does not use the fixture's prewritten answers or evidence.
+
+This is intentionally an end-to-end retrieval comparison, so `service.answer(question)` is called without an `oracle_gold_topic` filter. The evaluator must measure what the live service retrieves from the public-only index; an oracle topic would make that comparison less representative. The run is a small public baseline only. It does not establish chemistry correctness, operational readiness, or a winning retrieval mode.
+
+Before running it, make sure Docker/Postgres and local Ollama are available, pull both required models, and rebuild a public-only sample index with the Ollama embedding model:
+
+```powershell
+# Terminal 1: leave this running if Ollama is not already running as a service.
+ollama serve
+
+# Terminal 2
+ollama pull granite4.1:8b
+ollama pull granite-embedding:latest
+docker compose up -d postgres
+docker compose run --rm migrate
+uv run python ingestion/ingest.py --data-dir data/sample --output-dir data/processed --max-files 20
+$env:DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/oilfield_copilot"
+$env:EMBEDDING_PROVIDER = "ollama"
+$env:OLLAMA_EMBEDDING_MODEL = "granite-embedding:latest"
+uv run python ingestion/index_chunks.py --input data/processed/chunks.jsonl --database-url $env:DATABASE_URL
+```
+
+The runner rejects mixed or incomplete databases. With those prerequisites satisfied, use this exact command:
+
+```powershell
+$env:LLM_PROVIDER = "ollama"
+$env:ANSWER_EVAL_JUDGE_PROVIDER = "ollama"
+$env:OLLAMA_MODEL = "granite4.1:8b"
+$env:OLLAMA_BASE_URL = "http://localhost:11434"
+$env:EMBEDDING_PROVIDER = "ollama"
+$env:OLLAMA_EMBEDDING_MODEL = "granite-embedding:latest"
+uv run python eval/live_rag_answer_eval.py --dataset eval/public_answer_evaluation.jsonl --output-dir data/processed/evaluation/live_rag --database-url $env:DATABASE_URL
+```
+
+The aggregate-only comparison report records the `vector`/`hybrid` relationship and the numeric `top_k`, `min_score`, `max_context_chars`, `hybrid_candidate_limit`, `hybrid_rrf_k`, and `hybrid_min_rrf_score` settings used for the run. It does not record database or Ollama URLs.
+
+Completed small public baseline: both `vector` and `hybrid` ran 12 questions. In each mode, deterministic citations had 4 passes and 8 failures, abstention had 6 passes and 6 failures, and all 12 judge results were available. Judge aggregates were:
+
+| Mode | Groundedness | Relevance | Limitation awareness | Operational certainty |
+| --- | ---: | ---: | ---: | ---: |
+| Vector | 3.9166666666666665 | 4.833333333333333 | 3.9166666666666665 | 3.0833333333333335 |
+| Hybrid | 3.75 | 5 | 3.75 | 3.0 |
+
+This is a small public baseline, not a winner selection, chemistry validation, or production-readiness claim.
+
+### Approved Live Failure Diagnosis
+
+The approved aggregate diagnosis reproduced the baseline. `vector` and `hybrid` each ran 12 questions and had category-identical failures: citation failures were `expected_citation_allowed_retrieved_not_cited` (1), `expected_citation_mixed_with_disallowed` (1), and `unexpected_citation_when_abstention_expected` (6); abstention failures were `under_abstention_answered_on_insufficient_case` (6). These aggregates do not select a retrieval winner or establish a retrieval cause.
+
+### Claim-Scope Policy Investigation
+
+The approved local, public policy run reproduced the control baseline in both modes and evaluated `claim_scope v1` in shadow mode. Each mode had 12 paired questions and the same six allow/six abstain decisions. Control metrics remained citation 4 pass/8 fail and abstention 6 pass/6 fail. Shadow metrics were citation 10 pass/2 fail and abstention 12 pass/0 fail.
+
+The policy subsequently passed a sealed local 36-case v2 holdout with 36/36 exact action and category matches, zero false allows, zero false abstains, and zero stratum failures. It now runs before RAG in the production service. This is bounded evaluation evidence only: it does not establish chemistry correctness, operational safety, generalization, private-corpus quality, or a retrieval-mode winner.
+
+### Citation Selection
+
+The separate citation-selection investigation found that the two remaining allowed-case failures were answer-path selection failures, not retrieval failures: the allowed evidence had already been retrieved. The answer formatter now requires the question to match a source filename or declared topic before answer-content overlap can select that source. This prevents a broad `README` or water-analysis source from winning merely because a generated answer contains general oilfield terms.
+
+A new local ID-only diagnostic capture reran the six evidence-sufficient public cases with the unchanged public corpus, retrieval settings, Granite model, and vector/hybrid modes. Both modes retrieved allowed evidence for all six cases and produced allowed-only citations for all six. The evaluator intentionally bypasses the production claim-scope gate to retain the historical baseline, so its six overclaim cases remain unchanged in that capture. The diagnostic is Git-excluded and contains no answer or source text. This is citation-structure evidence only, not chemistry validation or production readiness.
+
+### Chemical-Dose Tool Boundary
+
+The first tool-calling milestone is an allowlisted deterministic contract, `chemical_dosage.product_ppm_water_basis` version `v1`. An explicit chat request must use `Product dose:` and provide `water_bbl_per_day` and `product_ppm`. It computes `product_ppm * water_bbl_per_day * 42 / 1,000,000` as product gallons per day. The calculator rejects invalid values instead of clamping or guessing, and results are labeled as general calculations rather than field-ready prescriptions.
+
+The app classifies a recognized tool request before parsing or calculation. Closed claims invoke no calculator, retriever, or generator; valid general requests invoke the calculator without RAG; all other questions retain the normal RAG route. The tool does not support active-ingredient ppm, active fraction, water analysis, arbitrary model-selected functions, or model-generated executable arguments.
+
+### Aggregate-Safe Monitoring
+
+Module 1 now includes a process-local aggregate monitor for six closed outcomes: successful and weak-evidence RAG responses, claim-scope abstentions, valid and invalid product-dose routes, and RAG configuration failures. It stores only outcome counts plus count/minimum/average/maximum response latency. The monitor has no event list or payload API and cannot retain prompts, answers, excerpts, source paths, tool inputs, identifiers, or raw error text. It is intentionally in-memory only; it does not write to the existing database logging tables because those tables permit raw content.
 ## LLM Zoomcamp 2026 Mapping
 
 - Introduction and environment: Python project managed with `uv`, `.env.example`, `uv.lock`, and Docker Compose.
 - Search and retrieval: implemented keyword search with `minsearch`; vector retrieval uses PGVector and filters by embedding model.
 - Vector databases: PGVector migrations create durable chunk and 384-dimensional embedding storage.
 - LLM integration: OpenAI Responses API adapter generates structured drafts for source-grounded answers.
-- Evaluation: `eval/retrieval_eval.py` evaluates keyword, vector, and hybrid retrieval at fixed `k=5` with public/private report boundaries; `eval/answer_eval.py` provides deterministic checks plus a structured local/optional judge with aggregate-only reports.
+- Evaluation: `eval/retrieval_eval.py` evaluates keyword, vector, and hybrid retrieval at fixed `k=5` with public/private report boundaries; `eval/answer_eval.py` completes synthetic-answer contract and judge evaluation; `eval/live_rag_answer_eval.py` completed a small public vector-versus-hybrid baseline without an oracle topic filter.
 - Monitoring: `monitoring/grafana/README.md` documents the Grafana-compatible dashboard plan.
 - Orchestration: `flows/kestra/ingest.yml` sketches parse, chunk, embed, and load steps.
 - Capstone deployment: Docker Compose includes app, migration, Postgres/PGVector, Kestra, and Grafana services.
@@ -256,12 +329,17 @@ The committed answer fixture is synthetic. Its baseline verifies evaluator wirin
 - Problem framing: production-chemistry troubleshooting for oilfield operations.
 - Data preparation: inventory plus parser/chunker coverage for PDF, DOCX, XLSX, CSV, text, Markdown, and nested folders.
 - Retrieval quality: keyword, vector, and hybrid retrieval are implemented with source metadata, test coverage, and a privacy-hardened retrieval evaluator.
-- LLM answer quality: public deterministic and structured-judge answer evaluation is implemented; it remains a learning baseline, not chemistry validation.
-- Tool use: chemical dosage and water-analysis helper scaffolds are included.
-- Monitoring: conversation, latency, retrieval, feedback, and tool-call logging tables are scaffolded.
+- LLM answer quality: public synthetic deterministic and structured-judge answer evaluation is complete; the live public vector-versus-hybrid baseline is complete; neither evaluation is chemistry validation or production readiness.
+- Tool use: a scope-gated, deterministic product-ppm water-basis dosage calculator is available through the sidebar and an explicit chat contract; water-analysis tooling remains deferred.
+- Monitoring: aggregate-safe, process-local response and routing signals are implemented; raw-content database logging remains unused by the runtime.
 - Reproducibility: `pyproject.toml`, `uv.lock`, `.env.example`, Dockerfile, and Docker Compose are included.
 
 ## Next Implementation Steps
 
-- Add agentic tool routing for chemical dosage and water-analysis helpers.
-- Persist Streamlit conversations, feedback, latency, retrieval, and tool-call events.
+### Immediate Quality Task
+
+- Review the completed Module 1 boundary as a whole: claim-scope abstention, citation selection, deterministic dosage routing, and aggregate-safe monitoring. Do not add persistence or dashboards until a separate data-retention design is approved.
+
+### Later Deferred Branch
+
+- Monitor citation selection on larger approved public and private corpora before considering retrieval changes; keep retrieval frozen unless new evidence identifies a retrieval gap.

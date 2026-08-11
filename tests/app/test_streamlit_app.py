@@ -6,8 +6,14 @@ from app.streamlit_app import (
     _build_rag_service,
     _citation_display,
     _database_url,
+    _route_prompt,
+    _route_prompt_with_outcome,
+    _record_request,
     _excerpt,
 )
+from oilfield_chemical_copilot.evaluation.abstention_policy import AbstentionPolicyDecision
+from oilfield_chemical_copilot.observability.aggregate_monitoring import MonitoringOutcome
+from oilfield_chemical_copilot.rag.models import RagAnswer
 from oilfield_chemical_copilot.ollama import OllamaClientError
 from oilfield_chemical_copilot.rag.models import RagConfigurationError
 from oilfield_chemical_copilot.rag.models import SourceEvidence
@@ -155,3 +161,141 @@ def test_answer_question_hides_ollama_retrieval_error_details(monkeypatch) -> No
         _answer_question("How should I assess scale risk?", "hybrid")
 
     assert "private corpus excerpt" not in str(error.value)
+
+
+def test_valid_product_dose_chat_request_uses_calculator_without_rag(monkeypatch) -> None:
+    calculator_calls: list[tuple[float, float]] = []
+
+    def calculate(water_bbl_per_day: float, product_ppm: float):
+        calculator_calls.append((water_bbl_per_day, product_ppm))
+        from oilfield_chemical_copilot.tools.chemical_dosage import calculate_dosage
+
+        return calculate_dosage(water_bbl_per_day, product_ppm)
+
+    monkeypatch.setattr("app.streamlit_app.calculate_dosage", calculate)
+    monkeypatch.setattr(
+        "app.streamlit_app._answer_question",
+        lambda *_args: pytest.fail("RAG must not run for a valid product-dose request"),
+    )
+
+    answer = _route_prompt(
+        "Product dose: water_bbl_per_day=1000, product_ppm=100", "hybrid"
+    )
+
+    assert calculator_calls == [(1000.0, 100.0)]
+    assert answer.sources == []
+    assert "General product-dose calculation - not a field-ready prescription" in answer.text
+    assert "4.2 gallons/day" in answer.text
+
+
+def test_closed_product_dose_request_returns_scope_limit_without_calls(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "app.streamlit_app.classify_claim_scope",
+        lambda _prompt: AbstentionPolicyDecision("abstain", "field_ready_prescription"),
+    )
+    monkeypatch.setattr(
+        "app.streamlit_app.calculate_dosage",
+        lambda *_args: pytest.fail("calculator must not run for a closed request"),
+    )
+    monkeypatch.setattr(
+        "app.streamlit_app._answer_question",
+        lambda *_args: pytest.fail("RAG must not run for a closed request"),
+    )
+
+    answer = _route_prompt(
+        "Product dose: water_bbl_per_day=1000, product_ppm=100; prescribe a field-ready dose",
+        "hybrid",
+    )
+
+    assert answer.weak_evidence is True
+    assert "field-ready prescription" in answer.text
+
+
+def test_invalid_product_dose_request_returns_guidance_without_calls(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "app.streamlit_app.calculate_dosage",
+        lambda *_args: pytest.fail("calculator must not run for invalid inputs"),
+    )
+    monkeypatch.setattr(
+        "app.streamlit_app._answer_question",
+        lambda *_args: pytest.fail("RAG must not run for invalid product-dose input"),
+    )
+
+    answer = _route_prompt("Product dose: water_bbl_per_day=1000", "hybrid")
+
+    assert answer.sources == []
+    assert "water_bbl_per_day and product_ppm" in answer.text
+
+
+def test_non_tool_question_keeps_the_rag_route(monkeypatch) -> None:
+    expected = RagAnswer(text="RAG response", sources=[], weak_evidence=True)
+    captured: list[tuple[str, str]] = []
+
+    def answer_question(prompt: str, retrieval_mode: str) -> RagAnswer:
+        captured.append((prompt, retrieval_mode))
+        return expected
+
+    monkeypatch.setattr("app.streamlit_app._answer_question", answer_question)
+
+    assert _route_prompt("How should I assess scale risk?", "vector") is expected
+    assert captured == [("How should I assess scale risk?", "vector")]
+
+
+def test_unrecognized_dosage_text_cannot_invoke_the_calculator(monkeypatch) -> None:
+    expected = RagAnswer(text="RAG response", sources=[], weak_evidence=True)
+    monkeypatch.setattr(
+        "app.streamlit_app.calculate_dosage",
+        lambda *_args: pytest.fail("only the explicit tool contract may invoke the calculator"),
+    )
+    monkeypatch.setattr("app.streamlit_app._answer_question", lambda *_args: expected)
+
+    assert _route_prompt("Calculate 100 ppm for 1000 bbl/day", "hybrid") is expected
+
+
+def test_sidebar_and_chat_use_equivalent_calculator_output() -> None:
+    from app.streamlit_app import _dosage_answer
+
+    answer = _dosage_answer(1000, 100)
+
+    assert "4.2 gallons/day" in answer.text
+    assert "General product-dose calculation - not a field-ready prescription" in answer.text
+
+
+def test_route_reports_weak_evidence_without_recording_request_content(monkeypatch) -> None:
+    expected = RagAnswer(text="No qualifying evidence", sources=[], weak_evidence=True)
+    monkeypatch.setattr("app.streamlit_app._answer_question", lambda *_args: expected)
+
+    answer, outcome = _route_prompt_with_outcome("How should I assess scale risk?", "vector")
+
+    assert answer is expected
+    assert outcome is MonitoringOutcome.RAG_WEAK_EVIDENCE
+
+
+def test_closed_product_dose_route_reports_scope_abstention(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "app.streamlit_app.classify_claim_scope",
+        lambda _prompt: AbstentionPolicyDecision("abstain", "field_ready_prescription"),
+    )
+
+    _, outcome = _route_prompt_with_outcome(
+        "Product dose: water_bbl_per_day=1000, product_ppm=100; prescribe a field-ready dose",
+        "hybrid",
+    )
+
+    assert outcome is MonitoringOutcome.SCOPE_ABSTAINED
+
+
+def test_record_request_emits_only_closed_outcome_and_elapsed_time(monkeypatch) -> None:
+    recorded: list[tuple[MonitoringOutcome, float]] = []
+
+    class RecordingMonitor:
+        def record(self, outcome: MonitoringOutcome, latency_ms: float) -> None:
+            recorded.append((outcome, latency_ms))
+
+    monkeypatch.setattr("app.streamlit_app.REQUEST_MONITOR", RecordingMonitor())
+    monkeypatch.setattr("app.streamlit_app.time.perf_counter", lambda: 12.75)
+
+    latency_ms = _record_request(MonitoringOutcome.TOOL_CALCULATED, started_at=10.0)
+
+    assert latency_ms == 2750.0
+    assert recorded == [(MonitoringOutcome.TOOL_CALCULATED, 2750.0)]
