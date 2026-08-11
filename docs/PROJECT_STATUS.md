@@ -20,9 +20,12 @@
 13. **Chemical-dose tool boundary**: the explicit `Product dose:` contract validates product-ppm water-basis inputs and calculates product gallons per day with the `42 gal/bbl` conversion. Recognized requests pass the production claim-scope gate before parsing; closed requests make zero calculator, retriever, and generator calls, while non-tool questions retain the RAG path.
 14. **Aggregate-safe monitoring**: process-local monitoring records six closed response and routing outcomes plus count/minimum/average/maximum latency. It accepts no payloads and retains no prompts, answers, excerpts, source paths, tool inputs, identifiers, or raw errors; existing raw-content database tables remain unused.
 
-## Active Lesson
+## Learning Progress
 
-- **Module 1: Core RAG fundamentals.** Advanced work remains preserved but is classified as implemented early, scaffold only, or not started in [LEARNING_ROADMAP.md](LEARNING_ROADMAP.md).
+- **Module 1: Core RAG fundamentals** - locked.
+- **Module 2: Evaluation** - locked.
+- **Module 3: Safety and claim scope** - locked.
+- **Module 4: Tool calling** - next lesson; the code remains preserved as implemented-early work.
 
 ## Later Milestones
 
@@ -35,7 +38,7 @@ The completed baselines, diagnosis, and policy boundary do not select a retrieva
 
 ## Immediate Next Task
 
-Finish the **Module 1 teaching review** across the core RAG path: inventory, parsing, chunking, embedding, retrieval, source grounding, and weak-evidence fallback. Claim scope, citation selection, dosage routing, and aggregate monitoring are preserved implemented-early features, not required Module 1 teaching scope.
+Resume the **Module 4 tool-calling lesson** from the explicit product-ppm water-basis contract, validation, deterministic calculation, and scope-first route. No new implementation is required until the lesson exposes a verified gap.
 
 ## Course Alignment
 

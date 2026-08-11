@@ -8,6 +8,8 @@ This sequence aligns the project to the course while applying a project-specific
 
 For the learning sequence, use [LEARNING_ROADMAP.md](LEARNING_ROADMAP.md). A completed row below may be implemented early rather than part of the active lesson.
 
+Learning locks recorded on 2026-08-11: Module 1 (core RAG fundamentals), Module 2 (evaluation), and Module 3 (safety and claim scope). Module 4 tool calling is the next lesson.
+
 | Milestone | Learning objective | Observable deliverable | Validation evidence | Privacy boundary |
 | --- | --- | --- | --- | --- |
 | Evaluation planning | Define how retrieval and answers will be measured before capability expansion. | Reviewed evaluation task breakdown covering datasets, metrics, baselines, acceptance criteria, and evidence. | Documented review and approval of the breakdown. | Use identifiers and aggregate results only; do not include source content, local paths, or credentials. |

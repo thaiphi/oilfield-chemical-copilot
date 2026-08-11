@@ -22,6 +22,13 @@
 | 6. Orchestration | Coordinate ingestion, retrieval, generation, tools, and safeguards. | Scaffold only | `flows/kestra/ingest.yml` and the project workflow-role configuration. | No claim of a complete runtime orchestration system. |
 | 7. Capstone readiness | End-to-end quality gates, deployment readiness, and documented operational limits. | Not started | Docker and deployment files are prerequisites, not readiness evidence. | Start only after the preceding modules are taught and locked. |
 
+## Learning Locks
+
+- **Module 1: Core RAG fundamentals** - locked on 2026-08-11.
+- **Module 2: Evaluation** - locked on 2026-08-11.
+- **Module 3: Safety and claim scope** - locked on 2026-08-11.
+- **Module 4: Tool calling** - next lesson. Its implementation is preserved as implemented-early work; no new code is required before the lesson begins.
+
 ## Cross-Cutting Scaffolds
 
 - Database tables for conversations, feedback, latency, retrieved chunks, and tool calls are **scaffold only**. The current runtime does not write raw-content telemetry to them.
