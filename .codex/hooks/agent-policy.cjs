@@ -9,6 +9,17 @@ const ROLE_TASK_CLASSES = Object.freeze({
   explorer: "exploration",
   "mechanical-implementer": "mechanical",
 });
+const REVIEW_RETURN_FIELDS = Object.freeze([
+  "Critical findings",
+  "Important findings",
+  "Minor findings",
+  "Evidence reviewed",
+  "Privacy verdict",
+  "Test coverage verdict",
+  "Plan/spec conformance",
+  "Overall verdict",
+  "REVIEW_INCOMPLETE",
+]);
 
 function deny(reason) {
   return {
@@ -58,6 +69,12 @@ function validateAgentDispatch(payload) {
   }
   if (input.agent_type === "mechanical-implementer" && fields.scope.some((entry) => !FILE_LIKE_SCOPE.test(entry))) {
     return deny("Luna mechanical work requires one or two named file paths.");
+  }
+  if (input.agent_type === "reviewer" && fields.scope.some((entry) => !FILE_LIKE_SCOPE.test(entry))) {
+    return deny("Sol reviews require named file paths; evidence packets belong in the assignment body.");
+  }
+  if (input.agent_type === "reviewer" && !REVIEW_RETURN_FIELDS.every((field) => fields.returnField.includes(field))) {
+    return deny("Sol review return contract must include findings, evidence, verdicts, and REVIEW_INCOMPLETE.");
   }
   return null;
 }

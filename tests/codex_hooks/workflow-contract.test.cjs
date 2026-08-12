@@ -64,6 +64,13 @@ test("agent profiles and startup prompt enforce the approved routing and dispatc
   assert.match(reviewer, /^model = "gpt-5\.6-sol"$/m);
   assert.match(reviewer, /^sandbox_mode = "read-only"$/m);
   assert.match(reviewer, /^Task class: review\. Read-only; final milestone review only; do not implement\.$/m);
+  assert.match(reviewer, /^Sol is the review lead: synthesize a final verdict from the assignment and any controller-supplied Luna evidence packets\.$/m);
+  assert.match(reviewer, /^Sol is an optional independent second opinion; Terra owns the final operational decision and does not wait on Sol when evidence establishes a Critical or Important finding\.$/m);
+  assert.match(reviewer, /^For a small review of one or two tightly related files, review directly; do not delegate automatically\.$/m);
+  assert.match(reviewer, /^For medium or large reviews with independent evidence streams, use only controller-supplied bounded Luna evidence packets; do not recursively explore the repository\.$/m);
+  assert.match(reviewer, /^When a medium or large review lacks required evidence, return exact bounded Luna assignments for Terra to dispatch\.$/m);
+  assert.match(reviewer, /^Reserve the final portion of the review window for judgment and return\. If the window or evidence is insufficient, return `REVIEW_INCOMPLETE` with reviewed evidence, unresolved items, and the reason; do not keep exploring until timeout\.$/m);
+  assert.match(reviewer, /^Overall verdict: `APPROVE`, `APPROVE WITH MINOR ISSUES`, `CHANGES REQUIRED`, or `REVIEW_INCOMPLETE`\.$/m);
   assert.match(reviewer, /^Do not edit, commit, or push\.$/m);
 
   assert.match(implementer, /^model = "gpt-5\.6-terra"$/m);
@@ -73,7 +80,8 @@ test("agent profiles and startup prompt enforce the approved routing and dispatc
   assert.match(explorer, /^model = "gpt-5\.6-luna"$/m);
   assert.match(explorer, /^sandbox_mode = "read-only"$/m);
   assert.match(explorer, /^Task class: exploration\. Read-only, targeted file\/interface investigation; do not implement\.$/m);
-  assert.match(explorer, /^Return a compact reconnaissance packet for Sol: inspected paths, interfaces and invariants, risks, unanswered questions, and facts needed for the next task breakdown\.$/m);
+  assert.match(explorer, /^For review evidence, return a compact packet for Sol: inspected paths, exact line evidence, findings by severity, privacy or regression facts when assigned, and unanswered questions\.$/m);
+  assert.match(explorer, /^Do not propose implementation, decide a final review verdict, expand scope, or wait for other agents\.$/m);
 
   assert.match(mechanicalImplementer, /^model = "gpt-5\.6-luna"$/m);
   assert.match(mechanicalImplementer, /^Task class: mechanical\. Work in one or two named files only\.$/m);
@@ -84,6 +92,12 @@ test("agent profiles and startup prompt enforce the approved routing and dispatc
   assert.match(prompt, /major architecture change, an irreversible or external action, or deployment/i);
   assert.match(prompt, /primary Terra lead owns the roadmap, implementation, fixes, validation, status, and integration/i);
   assert.match(prompt, /subagents only for bounded review, research, or edge-case testing/i);
+  assert.match(prompt, /^Small review \(one or two tightly related files\): Sol reviews directly\.$/m);
+  assert.match(prompt, /^Medium review \(implementation plus tests\): Terra obtains one or two bounded Luna evidence packets, then Sol synthesizes\.$/m);
+  assert.match(prompt, /^Large review \(implementation, tests, privacy, and plan conformance\): Terra obtains independent bounded Luna evidence packets, then Sol synthesizes\.$/m);
+  assert.match(prompt, /^When Luna evidence clearly establishes a Critical or Important finding, Terra marks `CHANGES REQUIRED` and proceeds with correction; Sol is optional\.$/m);
+  assert.match(prompt, /^When evidence is ambiguous, Terra may request Sol's second opinion; if Sol stalls, Terra makes and records an evidence-based fallback decision\.$/m);
+  assert.match(prompt, /`REVIEW_INCOMPLETE`/);
 
   const dispatch = prompt.match(/## Reusable Dispatch Template\r?\n\r?\n```text\r?\n([\s\S]*?)\r?\n```/);
   assert.ok(dispatch, "startup prompt includes a reusable dispatch template");

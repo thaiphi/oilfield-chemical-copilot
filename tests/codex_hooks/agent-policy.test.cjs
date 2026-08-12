@@ -124,6 +124,30 @@ test("rejects broad Luna mechanical scope entries", () => {
   }
 });
 
+test("rejects a Sol reviewer packet with a broad scope entry", () => {
+  const result = validateAgentDispatch(packet("reviewer", "review", ["entire repository"]));
+  assertDenied(result, /Sol reviews require named file paths/i);
+});
+
+test("rejects a Sol reviewer packet without the structured review return contract", () => {
+  const result = validateAgentDispatch(packet("reviewer", "review", ["src/rag/provider.py"]));
+  assertDenied(result, /review return contract/i);
+});
+
+test("rejects a Sol reviewer packet whose return contract omits REVIEW_INCOMPLETE", () => {
+  const result = validateAgentDispatch(packet("reviewer", "review", ["src/rag/provider.py"], {
+    returnField: "Critical findings; Important findings; Minor findings; Evidence reviewed; Privacy verdict; Test coverage verdict; Plan/spec conformance; Overall verdict (APPROVE / APPROVE WITH MINOR ISSUES / CHANGES REQUIRED).",
+  }));
+  assertDenied(result, /REVIEW_INCOMPLETE/i);
+});
+
+test("allows a Sol reviewer packet with the structured review return contract", () => {
+  const result = validateAgentDispatch(packet("reviewer", "review", ["src/rag/provider.py"], {
+    returnField: "Critical findings; Important findings; Minor findings; Evidence reviewed; Privacy verdict; Test coverage verdict; Plan/spec conformance; Overall verdict (APPROVE / APPROVE WITH MINOR ISSUES / CHANGES REQUIRED / REVIEW_INCOMPLETE).",
+  }));
+  assert.equal(result, null);
+});
+
 test("adds Terra-led context and warns on an unexpected main model", () => {
   const output = sessionStartOutput({ model: "gpt-5.5", source: "resume" });
   assert.match(output.hookSpecificOutput.additionalContext, /Terra/i);

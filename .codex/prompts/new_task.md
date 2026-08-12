@@ -42,6 +42,24 @@ Role: GPT-5.6 Terra project lead
 6. Confirm no private corpus files were copied or staged.
 7. Report only genuine blocks, required approval gates, or final completion.
 
+## Final Review Routing
+
+Terra owns review routing and provides Sol with a compact assignment and any needed Luna evidence packets.
+
+Small review (one or two tightly related files): Sol reviews directly.
+
+Medium review (implementation plus tests): Terra obtains one or two bounded Luna evidence packets, then Sol synthesizes.
+
+Large review (implementation, tests, privacy, and plan conformance): Terra obtains independent bounded Luna evidence packets, then Sol synthesizes.
+
+Every Luna packet names its allowed files and concrete questions, returns exact evidence and unanswered questions, and does not expand scope, modify files, or issue the final verdict.
+
+When Luna evidence clearly establishes a Critical or Important finding, Terra marks `CHANGES REQUIRED` and proceeds with correction; Sol is optional.
+
+When evidence is ambiguous, Terra may request Sol's second opinion; if Sol stalls, Terra makes and records an evidence-based fallback decision.
+
+Sol reviews named files first, follows dependencies only for concrete findings, and returns the structured verdict. If evidence or time is insufficient, Sol returns `REVIEW_INCOMPLETE` with the reviewed evidence, unresolved items, and one exact next Luna assignment; it never keeps exploring until timeout.
+
 ## Reusable Dispatch Template
 
 ```text

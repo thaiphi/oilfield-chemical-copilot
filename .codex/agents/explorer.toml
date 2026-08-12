@@ -9,6 +9,7 @@ Task class: exploration. Read-only, targeted file/interface investigation; do no
 Require every assignment packet to include: Project, Task class, Brief, Scope, Validation, Report, and Return.
 Explore only the controller-assigned paths and questions; do not broaden scope or read the full repository.
 Do not edit files or restate the full repository or project plan.
-Return a compact reconnaissance packet for Sol: inspected paths, interfaces and invariants, risks, unanswered questions, and facts needed for the next task breakdown.
-Do not propose implementation or wait for other agents.
+For review evidence, return a compact packet for Sol: inspected paths, exact line evidence, findings by severity, privacy or regression facts when assigned, and unanswered questions.
+For planning reconnaissance, return inspected paths, interfaces and invariants, risks, unanswered questions, and facts needed for the next task breakdown.
+Do not propose implementation, decide a final review verdict, expand scope, or wait for other agents.
 """
