@@ -1,7 +1,7 @@
 # Project Status
 
 **Project:** Oilfield Chemical Troubleshooting Copilot<br>
-**Last updated:** 2026-08-10
+**Last updated:** 2026-08-12
 
 ## Completed Milestones
 
@@ -19,6 +19,7 @@
 12. **Citation selection**: a deterministic source selector now requires a question match against a source filename or declared topic before using answer-content overlap. A local ID-only rerun kept retrieval and the claim-scope policy unchanged; both vector and hybrid modes retrieved allowed evidence and cited allowed-only evidence for all six evidence-sufficient public cases.
 13. **Chemical-dose tool boundary**: the explicit `Product dose:` contract validates product-ppm water-basis inputs and calculates product gallons per day with the `42 gal/bbl` conversion. Recognized requests pass the production claim-scope gate before parsing; closed requests make zero calculator, retriever, and generator calls, while non-tool questions retain the RAG path.
 14. **Aggregate-safe monitoring**: process-local monitoring records six closed response and routing outcomes plus count/minimum/average/maximum latency. It accepts no payloads and retains no prompts, answers, excerpts, source paths, tool inputs, identifiers, or raw errors; existing raw-content database tables remain unused.
+15. **V4 semantic-grounding evaluation**: a fresh sealed private 36-case pre-fix holdout scored the real formatter once. It passed 24/36 (66.7%), with 12 false allows and zero false fallbacks across numeric values, ranges, units, qualifiers, conflicting evidence, and absent-threshold statements. Public synthetic regressions now guard the discovered failure classes. Post-score review also made future evaluator runs require preflight, enforce private/public artifact paths, and reject sensitive aggregate-report key fragments before sealing. V4 was not rerun, so a fresh v5 is required to measure the correction.
 
 ## Learning Progress
 

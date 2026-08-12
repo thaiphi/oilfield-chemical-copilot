@@ -12,6 +12,33 @@ _FIELD_TREATMENT_DIRECTIVE = re.compile(
     re.IGNORECASE,
 )
 _NUMERIC_VALUE = re.compile(r"\b\d+(?:\.\d+)?\b")
+_MEASUREMENT = re.compile(
+    r"\b(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>mg\s*/\s*l|ppm|ppb|psi|bbl\s*/\s*d|gal\s*/\s*d|percent|%|(?:degrees?\s*)?[fc])(?=$|\W)",
+    re.IGNORECASE,
+)
+_COMPARATOR_PATTERNS = (
+    ("range", re.compile(r"\bbetween\s+(\d+(?:\.\d+)?)\s+and\s+(\d+(?:\.\d+)?)\b", re.IGNORECASE)),
+    ("above", re.compile(r"\b(?:above|greater than|more than)\s+(\d+(?:\.\d+)?)\b", re.IGNORECASE)),
+    ("at_least", re.compile(r"\b(?:at least|no less than)\s+(\d+(?:\.\d+)?)\b", re.IGNORECASE)),
+    ("below", re.compile(r"\b(?:below|less than|under)\s+(\d+(?:\.\d+)?)\b", re.IGNORECASE)),
+    ("at_most", re.compile(r"\b(?:not exceed|no more than|at most)\s+(\d+(?:\.\d+)?)\b", re.IGNORECASE)),
+)
+_STRONG_CONCLUSION = re.compile(
+    r"\b(?:prove(?:s|d)?|confirm(?:s|ed)?|demonstrate(?:s|d)?|cause(?:s|d)?|will)\b",
+    re.IGNORECASE,
+)
+_LIMITING_EVIDENCE = re.compile(
+    r"\b(?:may|might|could|possible|associated|not definitive|does not establish|insufficient|no established|no validated)\b",
+    re.IGNORECASE,
+)
+_CONFLICT_EVIDENCE = re.compile(
+    r"\b(?:no direct|does not identify|does not establish|insufficient|cannot identify|unable to identify)\b",
+    re.IGNORECASE,
+)
+_UNCERTAINTY_LANGUAGE = re.compile(
+    r"\b(?:may|might|could|possible|associated|conflict(?:ing)?|differ(?:s|ent|ing)?|mixed|uncertain|inconclusive|insufficient|cannot|does not establish|limited)\b",
+    re.IGNORECASE,
+)
 _ENGINEERING_REVIEW_CHECK = "Obtain qualified engineering review before any field treatment change."
 
 
@@ -24,6 +51,10 @@ def format_answer(draft: RagDraft, sources: list[SourceEvidence], *, question: s
     if _has_unsupported_numeric_claim(selected_draft.answer, cited_sources):
         return weak_evidence_answer(
             limitations="Retrieved evidence did not support a numeric claim in the generated answer."
+        )
+    if _has_unsupported_semantic_claim(selected_draft.answer, cited_sources):
+        return weak_evidence_answer(
+            limitations="Retrieved evidence did not preserve the technical claim in the generated answer."
         )
     evidence_lines = [_evidence_line(source) for source in cited_sources]
     if not evidence_lines:
@@ -70,6 +101,55 @@ def _safe_next_check(check: str) -> str:
 def _has_unsupported_numeric_claim(answer: str, sources: list[SourceEvidence]) -> bool:
     cited_text = " ".join(source.excerpt for source in sources)
     return any(value not in cited_text for value in _NUMERIC_VALUE.findall(answer))
+
+
+def _has_unsupported_semantic_claim(answer: str, sources: list[SourceEvidence]) -> bool:
+    cited_text = " ".join(source.excerpt for source in sources)
+    if not _measurements_supported(answer, cited_text):
+        return True
+    if not _comparators_supported(answer, cited_text):
+        return True
+    if _STRONG_CONCLUSION.search(answer) and not _STRONG_CONCLUSION.search(cited_text):
+        return True
+    if _LIMITING_EVIDENCE.search(cited_text) and _asserts_without_uncertainty(answer):
+        return True
+    return len(sources) > 1 and bool(_CONFLICT_EVIDENCE.search(cited_text)) and not bool(
+        _UNCERTAINTY_LANGUAGE.search(answer)
+    )
+
+
+def _measurements_supported(answer: str, cited_text: str) -> bool:
+    cited_measurements = {
+        (match.group("value"), _normalize_unit(match.group("unit")))
+        for match in _MEASUREMENT.finditer(cited_text)
+    }
+    return all(
+        (match.group("value"), _normalize_unit(match.group("unit"))) in cited_measurements
+        for match in _MEASUREMENT.finditer(answer)
+    )
+
+
+def _normalize_unit(unit: str) -> str:
+    return re.sub(r"\s+", "", unit.casefold())
+
+
+def _comparators_supported(answer: str, cited_text: str) -> bool:
+    cited_comparators = _comparators(cited_text)
+    return _comparators(answer).issubset(cited_comparators)
+
+
+def _comparators(text: str) -> set[tuple[str, ...]]:
+    return {
+        (kind, *match.groups())
+        for kind, pattern in _COMPARATOR_PATTERNS
+        for match in pattern.finditer(text)
+    }
+
+
+def _asserts_without_uncertainty(answer: str) -> bool:
+    return bool(re.search(r"\b(?:is|are|was|were|proves?|confirms?|causes?|will)\b", answer, re.IGNORECASE)) and not bool(
+        _UNCERTAINTY_LANGUAGE.search(answer)
+    )
 
 
 def weak_evidence_answer(*, limitations: str) -> RagAnswer:

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+import pytest
+
 from oilfield_chemical_copilot.rag.formatter import (
     format_answer,
     select_supported_sources,
@@ -146,6 +148,78 @@ def test_format_answer_allows_a_numeric_claim_found_in_cited_evidence() -> None:
 
     assert answer.weak_evidence is False
     assert "The cited threshold is 0.9." in answer.text
+
+
+@pytest.mark.parametrize(
+    ("answer_text", "excerpt", "question"),
+    [
+        (
+            "The synthetic laboratory result was 75 ppm.",
+            "The laboratory result was 75 mg/L using the stated method.",
+            "What result did the synthetic laboratory report?",
+        ),
+        (
+            "The synthetic temperature was 75 C.",
+            "The synthetic temperature was 75 F during the observation.",
+            "What temperature did the synthetic observation report?",
+        ),
+        (
+            "Above 4 hours proves the synthetic process is stable.",
+            "The observation window was between 4 and 9 hours without a stability conclusion.",
+            "What does the synthetic observation window establish?",
+        ),
+        (
+            "The synthetic trend proves deposition risk.",
+            "The synthetic trend may be associated with deposition risk when mixing occurs.",
+            "Does the synthetic trend prove deposition risk?",
+        ),
+        (
+            "The synthetic result of 11 mg/L confirms treatment effectiveness.",
+            "The sample result was 11 mg/L during the review period.",
+            "Does the synthetic result confirm treatment effectiveness?",
+        ),
+    ],
+)
+def test_format_answer_fails_closed_when_a_technical_claim_changes_evidence_meaning(
+    answer_text: str, excerpt: str, question: str
+) -> None:
+    answer = format_answer(
+        RagDraft(
+            answer=answer_text,
+            why_this_matters="Technical meaning must remain grounded.",
+            cited_source_ids=["Source 1"],
+            recommended_next_checks=["Review the method.", "Confirm the context.", "Review limits."],
+            limitations="Synthetic public regression coverage.",
+        ),
+        [replace(_source(), excerpt=excerpt)],
+        question=question,
+    )
+
+    assert answer.weak_evidence is True
+    assert answer.sources == []
+
+
+def test_format_answer_fails_closed_when_conflicting_evidence_is_presented_as_settled() -> None:
+    answer = format_answer(
+        RagDraft(
+            answer="The synthetic deposit is mineral scale.",
+            why_this_matters="Conflicting evidence must remain visible.",
+            cited_source_ids=["Source 1", "Source 2"],
+            recommended_next_checks=["Review both methods.", "Confirm the sample.", "Review limits."],
+            limitations="Synthetic public regression coverage.",
+        ),
+        [
+            replace(_source("Source 1"), excerpt="One examination noted mineral particles."),
+            replace(
+                _source("Source 2"),
+                excerpt="A second examination was insufficient and did not identify the deposit class.",
+            ),
+        ],
+        question="What deposit type do the synthetic examinations establish?",
+    )
+
+    assert answer.weak_evidence is True
+    assert answer.sources == []
 
 
 def test_selector_preserves_validated_model_citations() -> None:
