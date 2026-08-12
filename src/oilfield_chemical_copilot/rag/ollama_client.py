@@ -29,19 +29,29 @@ class OllamaAnswerClient:
         self.generation_options = generation_options
 
     def generate(self, *, system_prompt: str, user_prompt: str, allowed_source_ids: set[str]) -> RagDraft:
-        try:
-            kwargs = {
-                "model": self.model,
-                "system_prompt": system_prompt,
-                "user_prompt": user_prompt,
-                "response_schema": ANSWER_RESPONSE_SCHEMA,
-            }
-            if self.generation_options is not None:
-                kwargs["generation_options"] = self.generation_options
-            output_text = self.client.chat(**kwargs)
-            return _parse_and_validate_draft(output_text, allowed_source_ids)
-        except (OllamaClientError, RagGenerationError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
-            raise RagGenerationError("Ollama answer generation failed") from error
+        kwargs = {
+            "model": self.model,
+            "system_prompt": system_prompt,
+            "user_prompt": user_prompt,
+            "response_schema": ANSWER_RESPONSE_SCHEMA,
+        }
+        if self.generation_options is not None:
+            kwargs["generation_options"] = self.generation_options
+        failure: Exception | None = None
+        for _ in range(2):
+            try:
+                output_text = self.client.chat(**kwargs)
+                return _parse_and_validate_draft(output_text, allowed_source_ids)
+            except (
+                OllamaClientError,
+                RagGenerationError,
+                KeyError,
+                TypeError,
+                ValueError,
+                json.JSONDecodeError,
+            ) as error:
+                failure = error
+        raise RagGenerationError("Ollama answer generation failed") from failure
 
 
 class LazyOllamaAnswerClient:

@@ -65,6 +65,30 @@ def test_ollama_adapter_parses_and_validates_cited_draft() -> None:
     assert draft.cited_source_ids == ["Source 1"]
 
 
+def test_ollama_adapter_retries_one_malformed_structured_response() -> None:
+    class SequencedClient:
+        def __init__(self) -> None:
+            self.outputs = ['{"answer": "missing fields"}', _valid_draft_json()]
+            self.calls = 0
+
+        def chat(self, **_kwargs) -> str:
+            output = self.outputs[self.calls]
+            self.calls += 1
+            return output
+
+    client = SequencedClient()
+    adapter = OllamaAnswerClient(model="granite4.1:8b", client=client)
+
+    draft = adapter.generate(
+        system_prompt="system",
+        user_prompt="user",
+        allowed_source_ids={"Source 1"},
+    )
+
+    assert draft.cited_source_ids == ["Source 1"]
+    assert client.calls == 2
+
+
 def test_ollama_adapter_requests_schema_and_rejects_two_next_checks() -> None:
     payload = json.loads(_valid_draft_json())
     payload["recommended_next_checks"] = ["Check calcium", "Check sulfate"]

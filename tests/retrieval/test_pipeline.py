@@ -8,6 +8,7 @@ from oilfield_chemical_copilot.retrieval.pipeline import (
     BasicRetrievalPipeline,
     HybridRetrievalPipeline,
     RetrievalSettings,
+    _fit_context_budget,
     build_retrieval_pipeline,
 )
 
@@ -88,6 +89,20 @@ def test_pipeline_bounds_total_context_characters() -> None:
     )
 
     assert [hit.chunk_id for hit in pipeline.retrieve("bounded context")] == ["one"]
+
+
+def test_context_budget_selects_the_highest_scoring_combination_that_fits() -> None:
+    hits = [
+        _hit("one", 0.031, text="a" * 1199),
+        _hit("two", 0.016, text="b" * 1125),
+        _hit("three", 0.016, text="c" * 1192),
+        _hit("four", 0.016, text="d" * 712),
+        _hit("five", 0.016, text="e" * 738),
+    ]
+
+    selected = _fit_context_budget(hits, max_context_chars=4000)
+
+    assert [hit.chunk_id for hit in selected] == ["one", "two", "four", "five"]
 
 
 def test_hybrid_pipeline_fuses_keyword_and_vector_candidates() -> None:

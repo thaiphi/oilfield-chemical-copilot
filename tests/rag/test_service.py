@@ -83,6 +83,10 @@ def test_service_returns_fallback_without_openai_call_when_evidence_is_weak() ->
             "field-ready prescription",
         ),
         (
+            "What exact chemical dose should I inject for Well A tomorrow?",
+            "field-ready prescription",
+        ),
+        (
             "Can this replace a complete field analysis?",
             "replace a complete analysis",
         ),

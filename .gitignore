@@ -6,6 +6,7 @@ __pycache__/
 .ruff_cache/
 
 # Keep public sample data trackable; keep private corpus local only.
+.private/
 data/private/*
 !data/private/.gitkeep
 data/processed/

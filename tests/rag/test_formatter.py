@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 from oilfield_chemical_copilot.rag.formatter import (
     format_answer,
     select_supported_sources,
@@ -65,7 +67,88 @@ def test_format_answer_rejects_answer_without_any_supported_source() -> None:
         )
 
 
-def test_selector_replaces_unrelated_model_citations_with_the_best_supported_source() -> None:
+def test_format_answer_replaces_a_field_treatment_directive_in_next_checks() -> None:
+    answer = format_answer(
+        RagDraft(
+            answer="Oil-wet solids can restrict injectivity.",
+            why_this_matters="Restriction can reduce disposal capacity.",
+            cited_source_ids=["Source 1"],
+            recommended_next_checks=[
+                "Confirm the deposit composition.",
+                "Implement downhole scale inhibition measures.",
+                "Review the injection pressure trend.",
+            ],
+            limitations="General evidence only.",
+        ),
+        [_source()],
+        question="How can oil-wet iron sulfide solids affect water-disposal injectivity?",
+    )
+
+    assert "Implement downhole scale inhibition measures" not in answer.text
+    assert "Obtain qualified engineering review before any field treatment change." in answer.text
+
+
+def test_format_answer_replaces_a_plural_chemical_treatment_directive() -> None:
+    answer = format_answer(
+        RagDraft(
+            answer="Wax can deposit when equipment cools below the cloud point.",
+            why_this_matters="Deposits can restrict flow.",
+            cited_source_ids=["Source 1"],
+            recommended_next_checks=[
+                "Confirm the cloud point.",
+                "Monitor flowline temperatures.",
+                "Consider implementing hot oiling or chemical treatments if deposition is observed.",
+            ],
+            limitations="General evidence only.",
+        ),
+        [_source()],
+        question="What is the wax appearance temperature?",
+    )
+
+    assert "chemical treatments" not in answer.text
+    assert "Obtain qualified engineering review before any field treatment change." in answer.text
+
+
+def test_format_answer_fails_closed_for_an_unsupported_numeric_claim() -> None:
+    answer = format_answer(
+        RagDraft(
+            answer="A colloidal instability index above 0.9 proves instability.",
+            why_this_matters="Unsupported thresholds can drive incorrect conclusions.",
+            cited_source_ids=["Source 1"],
+            recommended_next_checks=[
+                "Review the cited analytical method.",
+                "Confirm the representative fluid sample.",
+                "Obtain qualified engineering review before any field treatment change.",
+            ],
+            limitations="The cited source does not define a numeric cutoff.",
+        ),
+        [_source()],
+        question="What does a colloidal instability index greater than 0.9 indicate?",
+    )
+
+    assert answer.weak_evidence is True
+    assert "numeric claim" in answer.text
+    assert answer.sources == []
+
+
+def test_format_answer_allows_a_numeric_claim_found_in_cited_evidence() -> None:
+    answer = format_answer(
+        RagDraft(
+            answer="The cited threshold is 0.9.",
+            why_this_matters="The value is grounded in the cited evidence.",
+            cited_source_ids=["Source 1"],
+            recommended_next_checks=["Review the cited method.", "Confirm the sample.", "Review limits."],
+            limitations="General evidence only.",
+        ),
+        [replace(_source(), excerpt="The cited threshold is 0.9.")],
+        question="What does the cited threshold mean?",
+    )
+
+    assert answer.weak_evidence is False
+    assert "The cited threshold is 0.9." in answer.text
+
+
+def test_selector_preserves_validated_model_citations() -> None:
     sources = [
         SourceEvidence(
             source_id="Source 1",
@@ -100,10 +183,10 @@ def test_selector_replaces_unrelated_model_citations_with_the_best_supported_sou
         sources=sources,
     )
 
-    assert [source.source_id for source in selected] == ["Source 1"]
+    assert [source.source_id for source in selected] == ["Source 2"]
 
 
-def test_selector_requires_a_topical_source_anchor_before_using_answer_overlap() -> None:
+def test_selector_preserves_a_validated_citation_even_when_terms_are_broad() -> None:
     sources = [
         SourceEvidence(
             source_id="Dosage",
@@ -138,10 +221,10 @@ def test_selector_requires_a_topical_source_anchor_before_using_answer_overlap()
         sources=sources,
     )
 
-    assert [source.source_id for source in selected] == ["Dosage"]
+    assert [source.source_id for source in selected] == ["README"]
 
 
-def test_selector_fails_closed_when_no_source_directly_supports_the_answer() -> None:
+def test_selector_preserves_a_validated_retrieved_source() -> None:
     draft = RagDraft(
         answer="Evaluate paraffin cloud point and crude composition.",
         why_this_matters="Those factors determine wax deposition behavior.",
@@ -156,4 +239,4 @@ def test_selector_fails_closed_when_no_source_directly_supports_the_answer() -> 
         sources=[_source()],
     )
 
-    assert selected == []
+    assert [source.source_id for source in selected] == ["Source 1"]

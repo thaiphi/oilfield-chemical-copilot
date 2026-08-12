@@ -20,6 +20,7 @@ from oilfield_chemical_copilot.evaluation.abstention_policy import (
         ("field_ready_prescription", [
             "Can you prescribe a field-ready dosage?",
             "What final treatment plan should we use?",
+            "What exact chemical dose should I inject for Well A tomorrow?",
         ]),
         ("site_specific_determination", [
             "Can this determine the root cause at a named asset?",

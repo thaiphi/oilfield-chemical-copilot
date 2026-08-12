@@ -129,14 +129,40 @@ def build_retrieval_pipeline(
 def _fit_context_budget(hits: list[RetrievalHit], max_context_chars: int) -> list[RetrievalHit]:
     if max_context_chars < 1:
         return []
-    selected: list[RetrievalHit] = []
-    used = 0
-    for hit in hits:
-        if used + len(hit.text) > max_context_chars:
-            break
-        selected.append(hit)
-        used += len(hit.text)
-    return selected
+    states: dict[int, tuple[float, tuple[int, ...]]] = {0: (0.0, ())}
+    for index, hit in enumerate(hits):
+        additions: dict[int, tuple[float, tuple[int, ...]]] = {}
+        for used, (score, selected_indices) in states.items():
+            total = used + len(hit.text)
+            if total > max_context_chars:
+                continue
+            candidate = (score + hit.score, (*selected_indices, index))
+            current = additions.get(total)
+            if current is None or candidate[0] > current[0]:
+                additions[total] = candidate
+        for total, candidate in additions.items():
+            current = states.get(total)
+            if current is None or candidate[0] > current[0]:
+                states[total] = candidate
+        states = _prune_dominated_context_states(states)
+
+    _, selected_indices = max(
+        states.values(), key=lambda state: (state[0], len(state[1]), -sum(state[1]))
+    )
+    return [hits[index] for index in selected_indices]
+
+
+def _prune_dominated_context_states(
+    states: dict[int, tuple[float, tuple[int, ...]]]
+) -> dict[int, tuple[float, tuple[int, ...]]]:
+    pruned: dict[int, tuple[float, tuple[int, ...]]] = {}
+    best_score = -1.0
+    for used in sorted(states):
+        state = states[used]
+        if state[0] > best_score:
+            pruned[used] = state
+            best_score = state[0]
+    return pruned
 
 
 def _env_int(name: str, default: int) -> int:

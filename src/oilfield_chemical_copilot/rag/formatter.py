@@ -7,32 +7,12 @@ from pathlib import PurePosixPath, PureWindowsPath
 from oilfield_chemical_copilot.rag.models import FALLBACK_MESSAGE, RagAnswer, RagDraft, SourceEvidence
 
 
-_STOP_WORDS = frozenset(
-    {
-        "about",
-        "after",
-        "and",
-        "are",
-        "before",
-        "can",
-        "check",
-        "for",
-        "from",
-        "general",
-        "how",
-        "into",
-        "only",
-        "public",
-        "review",
-        "should",
-        "the",
-        "this",
-        "use",
-        "what",
-        "which",
-        "with",
-    }
+_FIELD_TREATMENT_DIRECTIVE = re.compile(
+    r"\b(?:implement(?:s|ed|ing)?|inject(?:s|ed|ing)?|appl(?:y|ies|ied|ying)|select(?:s|ed|ing)?|dos(?:e|es|ed|ing)?)\b.*\b(?:treatments?|chemicals?|inhibitors?|dispersants?|dissolvers?|biocides?|scale\s+inhibition)\b",
+    re.IGNORECASE,
 )
+_NUMERIC_VALUE = re.compile(r"\b\d+(?:\.\d+)?\b")
+_ENGINEERING_REVIEW_CHECK = "Obtain qualified engineering review before any field treatment change."
 
 
 def format_answer(draft: RagDraft, sources: list[SourceEvidence], *, question: str) -> RagAnswer:
@@ -41,10 +21,17 @@ def format_answer(draft: RagDraft, sources: list[SourceEvidence], *, question: s
     source_by_id = {source.source_id: source for source in sources}
     selected_draft.validate(set(source_by_id))
     cited_sources = [source_by_id[source_id] for source_id in selected_draft.cited_source_ids]
+    if _has_unsupported_numeric_claim(selected_draft.answer, cited_sources):
+        return weak_evidence_answer(
+            limitations="Retrieved evidence did not support a numeric claim in the generated answer."
+        )
     evidence_lines = [_evidence_line(source) for source in cited_sources]
     if not evidence_lines:
         evidence_lines = ["- No retrieved source was cited."]
-    checks = [f"{index}. {check}" for index, check in enumerate(draft.recommended_next_checks, start=1)]
+    checks = [
+        f"{index}. {_safe_next_check(check)}"
+        for index, check in enumerate(draft.recommended_next_checks, start=1)
+    ]
     text = (
         f"Answer:\n{selected_draft.answer.strip()}\n\n"
         f"Why this matters:\n{selected_draft.why_this_matters.strip()}\n\n"
@@ -60,43 +47,29 @@ def format_answer(draft: RagDraft, sources: list[SourceEvidence], *, question: s
 def select_supported_sources(
     *, question: str, draft: RagDraft, sources: list[SourceEvidence]
 ) -> list[SourceEvidence]:
-    question_terms = _terms(question)
-    answer_terms = _terms(
-        " ".join(
-            (
-                draft.answer,
-                draft.why_this_matters,
-                *draft.recommended_next_checks,
-                draft.limitations,
-            )
-        )
-    )
-    candidates: list[tuple[int, float, str, SourceEvidence]] = []
-    for source in sources:
-        source_terms = _terms(f"{source.source_file} {source.topic} {source.excerpt}")
-        question_anchor_overlap = question_terms & _source_anchor_terms(source)
-        answer_overlap = answer_terms & source_terms
-        if not question_anchor_overlap or not answer_overlap:
+    del question
+    sources_by_id = {source.source_id: source for source in sources}
+    selected: list[SourceEvidence] = []
+    seen_ids: set[str] = set()
+    for source_id in draft.cited_source_ids:
+        if source_id in seen_ids:
             continue
-        support_score = 3 * len(question_anchor_overlap) + 2 * len(answer_overlap)
-        candidates.append((support_score, source.score, source.source_id, source))
-    if not candidates:
-        return []
-    candidates.sort(key=lambda item: (-item[0], -item[1], item[2]))
-    return [candidates[0][3]]
+        source = sources_by_id.get(source_id)
+        if source is not None:
+            selected.append(source)
+            seen_ids.add(source_id)
+    return selected
 
 
-def _terms(text: str) -> set[str]:
-    return {
-        term
-        for term in re.findall(r"[a-z0-9]+", text.lower())
-        if len(term) >= 3 and term not in _STOP_WORDS
-    }
+def _safe_next_check(check: str) -> str:
+    if _FIELD_TREATMENT_DIRECTIVE.search(check):
+        return _ENGINEERING_REVIEW_CHECK
+    return check
 
 
-def _source_anchor_terms(source: SourceEvidence) -> set[str]:
-    source_name = PurePosixPath(source.source_file.replace("\\", "/")).stem
-    return _terms(f"{source_name} {source.topic}")
+def _has_unsupported_numeric_claim(answer: str, sources: list[SourceEvidence]) -> bool:
+    cited_text = " ".join(source.excerpt for source in sources)
+    return any(value not in cited_text for value in _NUMERIC_VALUE.findall(answer))
 
 
 def weak_evidence_answer(*, limitations: str) -> RagAnswer:

@@ -13,7 +13,6 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 import psycopg
-from pgvector.psycopg import register_vector
 
 MIGRATIONS_DIR = PROJECT_ROOT / "db" / "migrations"
 
@@ -31,7 +30,6 @@ def apply_migrations(database_url: str, migrations_dir: Path = MIGRATIONS_DIR) -
         raise ValueError(f"No SQL migrations found in {migrations_dir}")
     applied: list[str] = []
     with psycopg.connect(database_url) as connection:
-        register_vector(connection)
         with connection.cursor() as cursor:
             cursor.execute(CREATE_LEDGER_SQL)
             cursor.execute("select filename from schema_migrations")

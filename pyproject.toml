@@ -5,6 +5,7 @@ description = "LLM Zoomcamp 2026 capstone scaffold for an oilfield production-ch
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "cryptography>=3.1",
     "dlt>=1.6.1",
     "minsearch>=0.0.4",
     "openai>=1.59.0",

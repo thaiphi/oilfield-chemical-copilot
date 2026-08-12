@@ -42,14 +42,36 @@ def generate_chunks(
         sources = sources[:max_files]
 
     chunks: list[LoadedChunk] = []
+    failures: list[dict[str, str]] = []
+    empty_sources: list[str] = []
     for source in sources:
         relative = source.resolve().relative_to(root)
         topic = infer_topic(relative)
-        chunks.extend(parse_document(source, source_root=root, topic=topic))
+        try:
+            source_chunks = parse_document(source, source_root=root, topic=topic)
+        except Exception as error:
+            failures.append(
+                {
+                    "source_file": relative.as_posix(),
+                    "parser_type": source.suffix.lower().lstrip("."),
+                    "error_type": type(error).__name__,
+                }
+            )
+            continue
+        if not source_chunks:
+            empty_sources.append(relative.as_posix())
+        chunks.extend(source_chunks)
 
     destination = Path(output_dir).expanduser().resolve()
     destination.mkdir(parents=True, exist_ok=True)
     _write_jsonl(destination / "chunks.jsonl", chunks)
+    _write_ingestion_report(
+        destination / "ingestion_report.json",
+        source_count=len(sources),
+        chunk_count=len(chunks),
+        failures=failures,
+        empty_sources=empty_sources,
+    )
     return chunks
 
 
@@ -57,6 +79,26 @@ def _write_jsonl(path: Path, chunks: Sequence[LoadedChunk]) -> None:
     with path.open("w", encoding="utf-8") as output:
         for chunk in chunks:
             output.write(json.dumps(_serialize_chunk(chunk), sort_keys=True) + "\n")
+
+
+def _write_ingestion_report(
+    path: Path,
+    *,
+    source_count: int,
+    chunk_count: int,
+    failures: list[dict[str, str]],
+    empty_sources: list[str],
+) -> None:
+    report = {
+        "source_files": source_count,
+        "parsed_files": source_count - len(failures),
+        "failed_files": len(failures),
+        "empty_files": len(empty_sources),
+        "chunks_written": chunk_count,
+        "failures": failures,
+        "empty_sources": empty_sources,
+    }
+    path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def _serialize_chunk(chunk: LoadedChunk) -> dict[str, object]:

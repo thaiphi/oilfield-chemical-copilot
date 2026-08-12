@@ -58,6 +58,15 @@ def _has_unresolved_scope_boundary(text: str) -> bool:
     )
 
 
+def _is_field_ready_dose_request(text: str) -> bool:
+    return (
+        _contains(text, "exact", "required", "specific")
+        and _contains(text, "dose", "dosage", "treatment")
+        and _contains(text, "inject", "apply", "pump", "treat")
+        and _contains(text, "well", "tomorrow", "today", "next shift")
+    )
+
+
 def classify_claim_scope(question: str) -> AbstentionPolicyDecision:
     """Classify normalized question text without evaluation or runtime inputs."""
     if not isinstance(question, str):
@@ -72,6 +81,8 @@ def classify_claim_scope(question: str) -> AbstentionPolicyDecision:
     if _contains(text, "field ready", "final", "prescribe") and _contains(
         text, "dosage", "dose", "treatment", "treatment plan"
     ):
+        return AbstentionPolicyDecision("abstain", "field_ready_prescription")
+    if _is_field_ready_dose_request(text):
         return AbstentionPolicyDecision("abstain", "field_ready_prescription")
     if _contains(text, "determine", "confirm", "predict", "diagnose", "establish") and _contains(
         text, "site specific", "named asset", "specific deposit", "mechanism", "root cause"
