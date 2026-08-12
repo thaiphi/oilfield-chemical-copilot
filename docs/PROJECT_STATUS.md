@@ -22,10 +22,13 @@
 
 ## Learning Progress
 
-- **Module 1: Core RAG fundamentals** - locked.
-- **Module 2: Evaluation** - locked.
-- **Module 3: Safety and claim scope** - locked.
-- **Module 4: Tool calling** - next lesson; the code remains preserved as implemented-early work.
+- **Module 1: Agentic RAG** - active lesson under the authoritative course mapping.
+- **Module 2: Vector Search** - implemented early; not yet reviewed and locked under the official objectives.
+- **Module 3: Orchestration** - scaffold only.
+- **Module 4: Evaluation** - implemented early; not yet reviewed and locked under the official objectives.
+- **Module 5: Monitoring** - scaffold only; the aggregate in-memory collector is not the complete monitoring module.
+- **Module 6: Best Practices** - hybrid RRF is implemented early; reranking and query rewriting remain deferred.
+- **Module 7: End-to-End Project** - scaffold only.
 
 ## Later Milestones
 
@@ -38,7 +41,7 @@ The completed baselines, diagnosis, and policy boundary do not select a retrieva
 
 ## Immediate Next Task
 
-Resume the **Module 4 tool-calling lesson** from the explicit product-ppm water-basis contract, validation, deterministic calculation, and scope-first route. No new implementation is required until the lesson exposes a verified gap.
+Resume the **Module 1 Agentic RAG lesson** from the official handout: keyword search, prompt construction, bounded function calling, and the routing design. The next task is to compare the current explicit route with the handout's agentic-loop expectation before adding or changing tools.
 
 ## Course Alignment
 

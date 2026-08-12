@@ -6,9 +6,7 @@
 
 This sequence aligns the project to the course while applying a project-specific quality gate. Official course ordering includes function calling earlier, but this project evaluates the already built baseline before expanding capability.
 
-For the learning sequence, use [LEARNING_ROADMAP.md](LEARNING_ROADMAP.md). A completed row below may be implemented early rather than part of the active lesson.
-
-Learning locks recorded on 2026-08-11: Module 1 (core RAG fundamentals), Module 2 (evaluation), and Module 3 (safety and claim scope). Module 4 tool calling is the next lesson.
+For the learning sequence, use [LEARNING_ROADMAP.md](LEARNING_ROADMAP.md). Its official module order follows the comprehensive external handout, `02_MODULE_MAPPING.md`; a completed row below may be implemented early rather than part of the active lesson.
 
 | Milestone | Learning objective | Observable deliverable | Validation evidence | Privacy boundary |
 | --- | --- | --- | --- | --- |

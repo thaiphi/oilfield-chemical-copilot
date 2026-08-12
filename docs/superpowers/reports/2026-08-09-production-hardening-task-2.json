@@ -1,0 +1,1 @@
+{"counts": {"test_count": 74}, "gates": {"classifier_exactly_once": true, "frozen_scope_manifest_verified": true, "one_shot_guard_passed": true, "policy_digest_verified": true, "preflight_digest_binding_verified": true, "privacy_guard_passed": true, "provider_free": true}, "status": "pass", "task": 2}

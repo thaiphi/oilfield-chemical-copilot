@@ -10,24 +10,23 @@
 - **Scaffold only:** a placeholder, schema, plan, or helper exists without the complete runtime behavior and acceptance evidence.
 - **Not started:** no meaningful implementation or scaffold exists yet.
 
-## Module Map
+## Authoritative Course Module Map
 
-| Module | Learning focus | Status | Existing evidence | Teaching boundary |
+This map follows the comprehensive handout at `C:\Users\Thai Phi\Documents\Codex\oilfield-chemical-copilot\docs\02_MODULE_MAPPING.md`. It supersedes the earlier local numbering, which incorrectly treated evaluation and safety work as Modules 2 and 3.
+
+| Official module | Learning focus | Status | Existing evidence | Remaining teaching or implementation boundary |
 | --- | --- | --- | --- | --- |
-| 1. Core RAG fundamentals | Inventory, parsing, chunking, embeddings, keyword/vector/hybrid retrieval, source-grounded Streamlit answers, and weak-evidence fallback. | Active lesson | Milestones 1-5 in `docs/PROJECT_STATUS.md`; local Ollama RAG and RRF tests. | Learn the retrieval-to-answer path before treating advanced controls as part of the lesson. |
-| 2. Evaluation | Retrieval metrics, synthetic-answer checks, live RAG comparison, and interpretation of aggregate results. | Implemented early | `eval/`, `src/oilfield_chemical_copilot/evaluation/`, and associated tests. | Preserve the evaluators; revisit their metrics, fixtures, and limitations as the evaluation lesson. |
-| 3. Safety and claim scope | Abstention policy, sealed holdout, production policy boundary, and citation-selection control. | Implemented early | `abstention_policy.py`, production-hardening materials, citation diagnostics, and service tests. | Revisit as a safety-boundary lesson; it does not establish chemistry correctness or field readiness. |
-| 4. Tool calling | Explicit product-ppm water-basis calculation, validation, and scope-first routing. | Implemented early | `tools/chemical_dosage.py`, Streamlit route tests, and tool contract tests. | Revisit as constrained deterministic tool use, not agentic or field-ready chemical treatment. |
-| 5. Monitoring | Aggregate response/routing outcomes and latency measurement; later persistence and dashboard design. | Implemented early | `observability/aggregate_monitoring.py` and its unit/route tests. | Revisit only after the monitoring lesson begins. The in-memory collector is not persistent telemetry. |
-| 6. Orchestration | Coordinate ingestion, retrieval, generation, tools, and safeguards. | Scaffold only | `flows/kestra/ingest.yml` and the project workflow-role configuration. | No claim of a complete runtime orchestration system. |
-| 7. Capstone readiness | End-to-end quality gates, deployment readiness, and documented operational limits. | Not started | Docker and deployment files are prerequisites, not readiness evidence. | Start only after the preceding modules are taught and locked. |
+| 1. Agentic RAG | Keyword search, prompt construction, function calling, and an agentic routing loop. | Active lesson | Source-grounded RAG and an explicit dosage contract exist. | Teach and decide the appropriate bounded routing design; the current explicit route is not an LLM-directed agentic loop. |
+| 2. Vector Search | Embeddings, semantic search, minsearch/sqlitesearch/PGVector, and metadata filtering. | Implemented early | Ollama embeddings, PGVector, keyword/vector/hybrid retrieval, and RRF tests. | Review the implementation against the official vector-search concepts. |
+| 3. Orchestration | Reliable multi-step ingestion and RAG workflows with Kestra. | Scaffold only | Ingestion scripts and a Kestra flow sketch exist. | Build and verify the inventory -> parse -> chunk -> embed -> load -> validate flow. |
+| 4. Evaluation | Ground truth, Hit Rate, MRR, answer evaluation, and LLM-as-a-judge. | Implemented early | Retrieval, synthetic answer, live RAG, diagnosis, and policy evaluation modules. | Teach the metrics and review evaluation boundaries under the official module number. |
+| 5. Monitoring | Streamlit chat, stored feedback, dashboards, Grafana, and Docker Compose. | Scaffold only | Database schema, Grafana material, feedback placeholders, and a process-local aggregate monitor exist. | Build persistent safe telemetry and the required dashboard evidence; the in-memory collector alone does not complete this module. |
+| 6. Best Practices | Hybrid search, reranking, RRF, and query rewriting. | Implemented early | Hybrid retrieval and RRF are complete. | Evaluate reranking and query rewriting only when the metrics identify a retrieval gap. |
+| 7. End-to-End Project | Reproducible application, ingestion, evaluation, monitoring, interface, and deployment evidence. | Scaffold only | Streamlit app, Docker Compose, sample corpus, and README exist. | Complete the remaining orchestration, monitoring, corpus, and reviewer-ready documentation evidence. |
 
-## Learning Locks
+## Learning Lock Rule
 
-- **Module 1: Core RAG fundamentals** - locked on 2026-08-11.
-- **Module 2: Evaluation** - locked on 2026-08-11.
-- **Module 3: Safety and claim scope** - locked on 2026-08-11.
-- **Module 4: Tool calling** - next lesson. Its implementation is preserved as implemented-early work; no new code is required before the lesson begins.
+No official module is locked merely because related code was implemented early. A module locks only after its official handout objectives, practical check, and acceptance evidence have been reviewed under this corrected mapping.
 
 ## Cross-Cutting Scaffolds
 

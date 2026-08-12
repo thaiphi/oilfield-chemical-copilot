@@ -1,0 +1,33 @@
+{
+  "description": "Terra-led subagent workflow guardrails.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$(git rev-parse --show-toplevel)/.codex/hooks/agent-policy.cjs\" session-start",
+            "commandWindows": "powershell -NoProfile -Command \"$root = git rev-parse --show-toplevel; & node (Join-Path $root '.codex\\hooks\\agent-policy.cjs') session-start\"",
+            "statusMessage": "Loading Terra workflow guidance",
+            "additionalContextLimit": 300
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "^Agent$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$(git rev-parse --show-toplevel)/.codex/hooks/agent-policy.cjs\" agent-dispatch",
+            "commandWindows": "powershell -NoProfile -Command \"$root = git rev-parse --show-toplevel; & node (Join-Path $root '.codex\\hooks\\agent-policy.cjs') agent-dispatch\"",
+            "statusMessage": "Checking subagent packet",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -21,3 +21,13 @@ outputs/
 pytest-cache-files-*
 
 eval/private/
+
+# Project-local Codex working memory. Durable decisions and aggregate evidence
+# belong under docs/, while generated task packets and detailed run logs stay local.
+.codex/briefs/*.md
+.codex/reports/*.md
+.agents/skills/subagent-cache-guard/
+
+# Test-runner scratch directories and locks.
+.pytest-*/
+.test-tmp-*/

@@ -1,0 +1,1 @@
+{"counts": {"action_exact": 35, "case_count": 36, "category_exact": 35, "classifier_calls": 36, "false_abstains": 0, "false_allows": 1, "strata_total": 3, "stratum_failures": 1}, "gates": {"approved_digests_bound": true, "evaluator_digest_verified": true, "holdout_digest_verified": true, "policy_digest_verified": true, "strict_pass": false}, "status": "fail", "task": 4}
