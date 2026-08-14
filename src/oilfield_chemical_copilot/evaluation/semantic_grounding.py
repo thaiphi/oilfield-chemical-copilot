@@ -24,6 +24,7 @@ Category = Literal[
     "no_established_threshold",
 ]
 ExpectedOutcome = Literal["allow", "fallback"]
+EvaluationScope = Literal["semantic-grounding-v4", "semantic-grounding-v5", "semantic-grounding-v6"]
 _CATEGORIES: tuple[Category, ...] = (
     "exact_value",
     "range_bound",
@@ -108,7 +109,7 @@ class SemanticGroundingSummary:
 
 @dataclass(frozen=True)
 class Approval:
-    scope: Literal["semantic-grounding-v4"]
+    scope: EvaluationScope
     approved: Literal[True]
     fixture_sha256: str
     formatter_sha256: str
@@ -116,14 +117,20 @@ class Approval:
     nonce: str
 
     @classmethod
-    def for_current_artifacts(cls, sealed_path: Path, formatter_path: Path) -> "Approval":
+    def for_current_artifacts(
+        cls,
+        sealed_path: Path,
+        formatter_path: Path,
+        *,
+        scope: EvaluationScope = "semantic-grounding-v4",
+    ) -> "Approval":
         return cls(
-            scope="semantic-grounding-v4",
+            scope=scope,
             approved=True,
             fixture_sha256=_sha256(sealed_path),
             formatter_sha256=_sha256(formatter_path),
             evaluator_sha256=_sha256(Path(__file__)),
-            nonce="semantic-grounding-v4-approved",
+            nonce=f"{scope}-approved",
         )
 
     def to_mapping(self) -> dict[str, object]:
@@ -158,8 +165,12 @@ def _require_text(value: object, code: str) -> None:
 
 def _require_safe_failure_class(value: object) -> None:
     _require_identifier(value, "FAILURE_CLASS_INVALID")
-    if any(unsafe_part in value.casefold() for unsafe_part in _UNSAFE_REPORT_KEY_PARTS):
+    if _has_unsafe_report_fragment(value):
         _fail("FAILURE_CLASS_PRIVACY_INVALID")
+
+
+def _has_unsafe_report_fragment(value: str) -> bool:
+    return any(unsafe_part in value.casefold() for unsafe_part in _UNSAFE_REPORT_KEY_PARTS)
 
 
 def _validate_case(case: SemanticCase) -> None:
@@ -427,7 +438,7 @@ def _load_approval(path: Path) -> Approval:
     except (OSError, TypeError, ValueError, UnicodeError, json.JSONDecodeError):
         _fail("APPROVAL_INVALID")
     if (
-        approval.scope != "semantic-grounding-v4"
+        approval.scope not in ("semantic-grounding-v4", "semantic-grounding-v5", "semantic-grounding-v6")
         or approval.approved is not True
         or not isinstance(approval.nonce, str)
         or not approval.nonce.strip()
@@ -483,6 +494,8 @@ def preflight(
     private_root: Path,
     private_result_path: Path,
     report_path: Path,
+    *,
+    expected_scope: EvaluationScope = "semantic-grounding-v4",
 ) -> PreflightSummary:
     _validate_run_paths(
         private_root,
@@ -494,6 +507,8 @@ def preflight(
     if tuple(sorted(cases, key=lambda item: item.case_id)) != sealed_cases:
         _fail("SEALED_CASES_MISMATCH")
     approval = _load_approval(approval_path)
+    if approval.scope != expected_scope:
+        _fail("APPROVAL_SCOPE_MISMATCH")
     if not _approval_matches(approval, sealed_path, formatter_path):
         _fail("APPROVAL_DIGEST_MISMATCH")
     if state_path.exists():
@@ -527,13 +542,27 @@ def _write_private_diagnostics(path: Path, observations: Sequence[CaseObservatio
         _fail("PRIVATE_DIAGNOSTIC_WRITE_FAILURE")
 
 
+def _validate_aggregate_payload(payload: object) -> None:
+    if isinstance(payload, Mapping):
+        for key, value in payload.items():
+            if not isinstance(key, str) or _has_unsafe_report_fragment(key):
+                _fail("AGGREGATE_REPORT_PRIVACY_VIOLATION")
+            _validate_aggregate_payload(value)
+        return
+    if isinstance(payload, (list, tuple)):
+        for value in payload:
+            _validate_aggregate_payload(value)
+        return
+    if isinstance(payload, str):
+        if _has_unsafe_report_fragment(payload):
+            _fail("AGGREGATE_REPORT_PRIVACY_VIOLATION")
+        return
+    if isinstance(payload, (bool, int, float)):
+        return
+    _fail("AGGREGATE_REPORT_PRIVACY_VIOLATION")
+
+
 def _write_aggregate_report(path: Path, summary: SemanticGroundingSummary) -> None:
-    if any(
-        unsafe_part in failure_class.casefold()
-        for failure_class in summary.failure_class_counts
-        for unsafe_part in _UNSAFE_REPORT_KEY_PARTS
-    ):
-        _fail("AGGREGATE_REPORT_PRIVACY_VIOLATION")
     payload = {
         "status": "pass" if summary.pass_count == summary.case_count else "fail",
         "counts": {
@@ -554,6 +583,7 @@ def _write_aggregate_report(path: Path, summary: SemanticGroundingSummary) -> No
             "one_shot_consumed": True,
         },
     }
+    _validate_aggregate_payload(payload)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
@@ -573,6 +603,7 @@ def evaluate_once(
     cases: Sequence[SemanticCase],
     prior_paths: Sequence[Path],
     private_root: Path = Path(".private"),
+    expected_scope: EvaluationScope = "semantic-grounding-v4",
 ) -> SemanticGroundingSummary:
     preflight(
         sealed_path,
@@ -585,9 +616,12 @@ def evaluate_once(
         private_root,
         private_result_path,
         report_path,
+        expected_scope=expected_scope,
     )
     cases = _load_sealed_cases(sealed_path, digest_path)
     approval = _load_approval(approval_path)
+    if approval.scope != expected_scope:
+        _fail("APPROVAL_SCOPE_MISMATCH")
     if not _approval_matches(approval, sealed_path, formatter_path):
         _fail("APPROVAL_DIGEST_MISMATCH")
     _consume(state_path, approval)

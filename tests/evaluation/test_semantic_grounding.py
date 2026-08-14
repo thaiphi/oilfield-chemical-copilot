@@ -16,6 +16,7 @@ from oilfield_chemical_copilot.evaluation.semantic_grounding import (
     preflight,
     seal_cases,
     validate_cases,
+    _validate_aggregate_payload,
     verify_no_prior_overlap,
 )
 
@@ -320,6 +321,18 @@ def test_sealing_rejects_sensitive_failure_class_name_before_one_shot_consumptio
     assert not report_path.exists()
 
 
+@pytest.mark.parametrize(
+    "payload",
+    (
+        {"counts": {"source": 1}},
+        {"counts": {"label": "private path"}},
+    ),
+)
+def test_aggregate_payload_rejects_nested_sensitive_content(payload: object) -> None:
+    with pytest.raises(EvaluationError, match="^AGGREGATE_REPORT_PRIVACY_VIOLATION$"):
+        _validate_aggregate_payload(payload)
+
+
 def test_evaluate_once_rejects_prior_overlap_before_consuming_state(tmp_path: Path) -> None:
     cases = _valid_cases()
     draft_path = tmp_path / "draft.jsonl"
@@ -359,4 +372,75 @@ def test_evaluate_once_rejects_prior_overlap_before_consuming_state(tmp_path: Pa
             private_root=private_root,
         )
 
+    assert not state_path.exists()
+
+
+def test_v5_approval_scope_is_accepted_only_for_a_v5_run(tmp_path: Path) -> None:
+    sealed_path = tmp_path / "sealed.jsonl"
+    formatter_path = Path("src/oilfield_chemical_copilot/rag/formatter.py")
+    sealed_path.write_text("sealed\n", encoding="utf-8")
+
+    approval = Approval.for_current_artifacts(
+        sealed_path,
+        formatter_path,
+        scope="semantic-grounding-v5",
+    )
+
+    assert approval.scope == "semantic-grounding-v5"
+
+
+def test_v6_approval_scope_requires_matching_preflight_scope(tmp_path: Path) -> None:
+    cases = _valid_cases()
+    draft_path = tmp_path / "draft.jsonl"
+    review_path = tmp_path / "review.jsonl"
+    private_root = tmp_path / ".private"
+    sealed_path = private_root / "sealed.jsonl"
+    digest_path = private_root / "sealed.sha256"
+    approval_path = private_root / "approval.json"
+    state_path = private_root / "state.json"
+    private_result_path = private_root / "diagnostics.json"
+    report_path = tmp_path / "aggregate.json"
+    formatter_path = Path("src/oilfield_chemical_copilot/rag/formatter.py")
+    _write_fixture(draft_path, cases)
+    review_path.write_text(
+        "\n".join(
+            json.dumps({"case_id": item.case_id, "reviewer_id": item.reviewer_id, "verdict": item.verdict})
+            for item in _reviews(cases)
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    seal_cases(draft_path, review_path, sealed_path, digest_path)
+    approval = Approval.for_current_artifacts(sealed_path, formatter_path, scope="semantic-grounding-v6")
+    approval_path.write_text(json.dumps(approval.to_mapping(), sort_keys=True) + "\n", encoding="utf-8")
+
+    summary = preflight(
+        sealed_path,
+        digest_path,
+        approval_path,
+        state_path,
+        formatter_path,
+        cases,
+        (),
+        private_root,
+        private_result_path,
+        report_path,
+        expected_scope="semantic-grounding-v6",
+    )
+
+    assert summary.attempt_available is True
+    with pytest.raises(EvaluationError, match="^APPROVAL_SCOPE_MISMATCH$"):
+        preflight(
+            sealed_path,
+            digest_path,
+            approval_path,
+            state_path,
+            formatter_path,
+            cases,
+            (),
+            private_root,
+            private_result_path,
+            report_path,
+            expected_scope="semantic-grounding-v5",
+        )
     assert not state_path.exists()

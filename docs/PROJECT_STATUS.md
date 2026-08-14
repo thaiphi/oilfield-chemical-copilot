@@ -1,7 +1,7 @@
 # Project Status
 
 **Project:** Oilfield Chemical Troubleshooting Copilot<br>
-**Last updated:** 2026-08-12
+**Last updated:** 2026-08-13
 
 ## Completed Milestones
 
@@ -20,6 +20,8 @@
 13. **Chemical-dose tool boundary**: the explicit `Product dose:` contract validates product-ppm water-basis inputs and calculates product gallons per day with the `42 gal/bbl` conversion. Recognized requests pass the production claim-scope gate before parsing; closed requests make zero calculator, retriever, and generator calls, while non-tool questions retain the RAG path.
 14. **Aggregate-safe monitoring**: process-local monitoring records six closed response and routing outcomes plus count/minimum/average/maximum latency. It accepts no payloads and retains no prompts, answers, excerpts, source paths, tool inputs, identifiers, or raw errors; existing raw-content database tables remain unused.
 15. **V4 semantic-grounding evaluation**: a fresh sealed private 36-case pre-fix holdout scored the real formatter once. It passed 24/36 (66.7%), with 12 false allows and zero false fallbacks across numeric values, ranges, units, qualifiers, conflicting evidence, and absent-threshold statements. Public synthetic regressions now guard the discovered failure classes. Post-score review also made future evaluator runs require preflight, enforce private/public artifact paths, and reject sensitive aggregate-report key fragments before sealing. V4 was not rerun, so a fresh v5 is required to measure the correction.
+16. **V5 semantic-grounding evaluation**: a fresh sealed private 36-case holdout scored the real formatter exactly once. It passed 28/36 (77.8%), with seven false allows and one false fallback. Aggregate failure classes were comparator change (2), condition omission (2), conflict erasure (2), unit substitution (1), and grounded claim (1). The fixture and diagnostics remain private and ignored; V5 will not be rerun. Public synthetic regressions now cover those aggregate-safe classes, and a fresh V6 is required to measure the correction.
+17. **V6 semantic-grounding evaluation**: a fresh sealed private 36-case holdout scored the real formatter exactly once after recursive aggregate-report privacy hardening and the V5 formatter correction. It passed 36/36 with zero false allows and zero false fallbacks across numeric values, ranges, units, conditions, conflicts, and absent-threshold statements. The V6 fixture and diagnostics remain private and ignored; V6 will not be rerun. This is a controlled formatter-boundary result, not proof of chemistry correctness, retrieval quality, LLM-answer quality, or production readiness.
 
 ## Learning Progress
 
@@ -42,7 +44,7 @@ The completed baselines, diagnosis, and policy boundary do not select a retrieva
 
 ## Immediate Next Task
 
-Resume the **Module 1 Agentic RAG lesson** from the official handout: keyword search, prompt construction, bounded function calling, and the routing design. The next task is to compare the current explicit route with the handout's agentic-loop expectation before adding or changing tools.
+Finish V6 public verification and readiness review. Then commit the approved public V5/V6 evaluator, formatter, test, report, status, and durable plan/spec changes before continuing the **Module 1 Agentic RAG lesson** from the official handout.
 
 ## Course Alignment
 

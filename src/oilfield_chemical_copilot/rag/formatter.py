@@ -13,11 +13,12 @@ _FIELD_TREATMENT_DIRECTIVE = re.compile(
 )
 _NUMERIC_VALUE = re.compile(r"\b\d+(?:\.\d+)?\b")
 _MEASUREMENT = re.compile(
-    r"\b(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>mg\s*/\s*l|ppm|ppb|psi|bbl\s*/\s*d|gal\s*/\s*d|percent|%|(?:degrees?\s*)?[fc])(?=$|\W)",
+    r"\b(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>mg\s*/\s*l|g\s*/\s*l|ug\s*/\s*l|ml\s*/\s*l|ppm|ppb|psi|kpa|bar|bbl\s*/\s*d|bpd|gal\s*/\s*d|gpd|m3\s*/\s*(?:d|day)|lb\s*/\s*bbl|percent|%|(?:degrees?|deg)\s*[fc]|celsius|fahrenheit|[fc])(?=$|\W)",
     re.IGNORECASE,
 )
 _COMPARATOR_PATTERNS = (
     ("range", re.compile(r"\bbetween\s+(\d+(?:\.\d+)?)\s+and\s+(\d+(?:\.\d+)?)\b", re.IGNORECASE)),
+    ("equal", re.compile(r"\b(?:equals?|equal to|exactly)\s+(\d+(?:\.\d+)?)\b", re.IGNORECASE)),
     ("above", re.compile(r"\b(?:above|greater than|more than)\s+(\d+(?:\.\d+)?)\b", re.IGNORECASE)),
     ("at_least", re.compile(r"\b(?:at least|no less than)\s+(\d+(?:\.\d+)?)\b", re.IGNORECASE)),
     ("below", re.compile(r"\b(?:below|less than|under)\s+(\d+(?:\.\d+)?)\b", re.IGNORECASE)),
@@ -36,9 +37,10 @@ _CONFLICT_EVIDENCE = re.compile(
     re.IGNORECASE,
 )
 _UNCERTAINTY_LANGUAGE = re.compile(
-    r"\b(?:may|might|could|possible|associated|conflict(?:ing)?|differ(?:s|ent|ing)?|mixed|uncertain|inconclusive|insufficient|cannot|does not establish|limited)\b",
+    r"\b(?:may|might|could|possible|associated|conflict(?:ing)?|differ(?:s|ent|ing)?|mixed|uncertain|inconclusive|insufficient|cannot|does not establish|no established|no validated|limited)\b",
     re.IGNORECASE,
 )
+_CONDITION_EVIDENCE = re.compile(r"\b(?:only when|only if|unless|provided that|subject to)\b", re.IGNORECASE)
 _ENGINEERING_REVIEW_CHECK = "Obtain qualified engineering review before any field treatment change."
 
 
@@ -113,9 +115,9 @@ def _has_unsupported_semantic_claim(answer: str, sources: list[SourceEvidence]) 
         return True
     if _LIMITING_EVIDENCE.search(cited_text) and _asserts_without_uncertainty(answer):
         return True
-    return len(sources) > 1 and bool(_CONFLICT_EVIDENCE.search(cited_text)) and not bool(
-        _UNCERTAINTY_LANGUAGE.search(answer)
-    )
+    if _CONDITION_EVIDENCE.search(cited_text) and not _CONDITION_EVIDENCE.search(answer):
+        return True
+    return bool(_CONFLICT_EVIDENCE.search(cited_text)) and not bool(_UNCERTAINTY_LANGUAGE.search(answer))
 
 
 def _measurements_supported(answer: str, cited_text: str) -> bool:

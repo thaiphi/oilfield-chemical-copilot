@@ -222,6 +222,84 @@ def test_format_answer_fails_closed_when_conflicting_evidence_is_presented_as_se
     assert answer.sources == []
 
 
+@pytest.mark.parametrize(
+    ("answer_text", "excerpt", "question"),
+    [
+        (
+            "The synthetic pressure equals 7 psi.",
+            "The synthetic pressure must remain below 7 psi.",
+            "What synthetic pressure limit is supported?",
+        ),
+        (
+            "The synthetic pressure is 2 bar.",
+            "The synthetic pressure was 2 psi during the inspection.",
+            "What pressure did the synthetic inspection report?",
+        ),
+        (
+            "The synthetic deposit forms at 14 ppm.",
+            "The synthetic deposit forms at 14 ppm only when the brine contains the stated tracer.",
+            "When can the synthetic deposit form?",
+        ),
+    ],
+)
+def test_format_answer_fails_closed_for_unpreserved_semantic_qualifiers(
+    answer_text: str, excerpt: str, question: str
+) -> None:
+    answer = format_answer(
+        RagDraft(
+            answer=answer_text,
+            why_this_matters="Synthetic public regression coverage.",
+            cited_source_ids=["Source 1"],
+            recommended_next_checks=["Review the method.", "Confirm the context.", "Review limits."],
+            limitations="Synthetic public regression coverage.",
+        ),
+        [replace(_source(), excerpt=excerpt)],
+        question=question,
+    )
+
+    assert answer.weak_evidence is True
+    assert answer.sources == []
+
+
+def test_format_answer_fails_closed_for_single_source_conflict_presented_as_settled() -> None:
+    answer = format_answer(
+        RagDraft(
+            answer="The synthetic deposit is mineral scale.",
+            why_this_matters="Conflicting evidence must remain visible.",
+            cited_source_ids=["Source 1"],
+            recommended_next_checks=["Review both methods.", "Confirm the sample.", "Review limits."],
+            limitations="Synthetic public regression coverage.",
+        ),
+        [
+            replace(
+                _source(),
+                excerpt="One synthetic examination noted mineral particles, but a second examination could not confirm the deposit class.",
+            ),
+        ],
+        question="What deposit type do the synthetic examinations establish?",
+    )
+
+    assert answer.weak_evidence is True
+    assert answer.sources == []
+
+
+def test_format_answer_allows_an_explicitly_grounded_absent_threshold_statement() -> None:
+    answer = format_answer(
+        RagDraft(
+            answer="There is no established synthetic cutoff.",
+            why_this_matters="The source leaves the cutoff undefined.",
+            cited_source_ids=["Source 1"],
+            recommended_next_checks=["Review the method.", "Confirm the context.", "Review limits."],
+            limitations="Synthetic public regression coverage.",
+        ),
+        [replace(_source(), excerpt="No established synthetic cutoff is defined by the evidence.")],
+        question="What synthetic cutoff does the evidence establish?",
+    )
+
+    assert answer.weak_evidence is False
+    assert [source.source_id for source in answer.sources] == ["Source 1"]
+
+
 def test_selector_preserves_validated_model_citations() -> None:
     sources = [
         SourceEvidence(
