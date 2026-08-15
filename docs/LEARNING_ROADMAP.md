@@ -16,7 +16,7 @@ This map follows the comprehensive handout at `C:\Users\Thai Phi\Documents\Codex
 
 | Official module | Learning focus | Status | Existing evidence | Remaining teaching or implementation boundary |
 | --- | --- | --- | --- | --- |
-| 1. Agentic RAG | Keyword search, prompt construction, function calling, and an agentic routing loop. | Active lesson | Source-grounded RAG and an explicit dosage contract exist. | Teach and decide the appropriate bounded routing design; the current explicit route is not an LLM-directed agentic loop. |
+| 1. Agentic RAG | Keyword search, prompt construction, function calling, and an agentic routing loop. | Locked | Source-grounded RAG, an explicit dosage contract, and an opt-in one-decision Ollama planner with two controller-owned tools are public-test verified. A local Granite smoke test returned exactly one tool call. | Teaching review completed on 2026-08-14. Future changes require a new scoped plan and verification. |
 | 2. Vector Search | Embeddings, semantic search, minsearch/sqlitesearch/PGVector, and metadata filtering. | Implemented early | Ollama embeddings, PGVector, keyword/vector/hybrid retrieval, and RRF tests. | Review the implementation against the official vector-search concepts. |
 | 3. Orchestration | Reliable multi-step ingestion and RAG workflows with Kestra. | Scaffold only | Ingestion scripts and a Kestra flow sketch exist. | Build and verify the inventory -> parse -> chunk -> embed -> load -> validate flow. |
 | 4. Evaluation | Ground truth, Hit Rate, MRR, answer evaluation, and LLM-as-a-judge. | Implemented early | Retrieval, synthetic answer, live RAG, diagnosis, and policy evaluation modules. | Teach the metrics and review evaluation boundaries under the official module number. |

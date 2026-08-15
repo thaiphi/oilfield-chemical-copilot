@@ -19,21 +19,26 @@ if str(SRC_DIR) not in sys.path:
 
 import streamlit as st
 
-from oilfield_chemical_copilot.ollama import OllamaClientError
+from oilfield_chemical_copilot.ollama import OllamaClient, OllamaClientError
 from oilfield_chemical_copilot.evaluation.abstention_policy import classify_claim_scope
 from oilfield_chemical_copilot.observability.aggregate_monitoring import (
     AggregateMonitor,
     MonitoringOutcome,
 )
 from oilfield_chemical_copilot.rag.formatter import scope_limited_answer
+from oilfield_chemical_copilot.rag.agentic_service import AgenticRagService, OllamaToolPlanner
 from oilfield_chemical_copilot.rag.generator_factory import build_answer_generator
 from oilfield_chemical_copilot.rag.models import RagAnswer, RagConfigurationError, SourceEvidence
+from oilfield_chemical_copilot.rag.ollama_client import (
+    DEFAULT_OLLAMA_BASE_URL,
+    DEFAULT_OLLAMA_MODEL,
+)
 from oilfield_chemical_copilot.rag.service import BasicRagService
 from oilfield_chemical_copilot.retrieval.embeddings import build_embedding_provider
 from oilfield_chemical_copilot.retrieval.keyword import KeywordSearchIndex
 from oilfield_chemical_copilot.retrieval.pipeline import RetrievalSettings, build_retrieval_pipeline
 from oilfield_chemical_copilot.storage.pgvector import PgVectorStore
-from oilfield_chemical_copilot.tools.chemical_dosage import calculate_dosage
+from oilfield_chemical_copilot.tools.chemical_dosage import calculate_dosage, product_dosage_answer
 from oilfield_chemical_copilot.tools.water_analysis import summarize_water_analysis
 
 REQUEST_MONITOR = AggregateMonitor()
@@ -41,6 +46,10 @@ REQUEST_MONITOR = AggregateMonitor()
 
 def _database_url() -> str:
     return os.getenv("DATABASE_URL") or LOCAL_DATABASE_URL
+
+
+def _agentic_routing_enabled() -> bool:
+    return os.getenv("AGENTIC_ROUTING_ENABLED", "").strip().lower() == "true"
 
 
 def _initialize_state() -> None:
@@ -83,6 +92,12 @@ def _build_rag_service(retrieval_mode: str) -> BasicRagService:
 def _answer_question(prompt: str, retrieval_mode: str) -> RagAnswer:
     service = _build_rag_service(retrieval_mode)
     try:
+        if _agentic_routing_enabled():
+            planner = OllamaToolPlanner(
+                model=os.getenv("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL),
+                client=OllamaClient(os.getenv("OLLAMA_BASE_URL", DEFAULT_OLLAMA_BASE_URL)),
+            )
+            return AgenticRagService(rag_service=service, planner=planner).answer(prompt)
         return service.answer(prompt)
     except OllamaClientError as error:
         raise RagConfigurationError("Ollama retrieval is unavailable. Check local Ollama configuration.") from error
@@ -113,7 +128,7 @@ def _route_prompt_with_outcome(
     if inputs is None:
         return _tool_input_guidance(), MonitoringOutcome.TOOL_INPUT_INVALID
     try:
-        return _dosage_answer(**inputs), MonitoringOutcome.TOOL_CALCULATED
+        return product_dosage_answer(**inputs), MonitoringOutcome.TOOL_CALCULATED
     except ValueError:
         return _tool_input_guidance(), MonitoringOutcome.TOOL_INPUT_INVALID
 
@@ -137,23 +152,6 @@ def _parse_product_dose_inputs(prompt: str) -> dict[str, float] | None:
         return {name: float(value) for name, value in values.items()}
     except ValueError:
         return None
-
-
-def _dosage_answer(water_bbl_per_day: float, product_ppm: float) -> RagAnswer:
-    result = calculate_dosage(water_bbl_per_day, product_ppm)
-    text = (
-        f"Answer:\n{result.label}.\n\n"
-        f"Calculation: {result.product_ppm:g} product ppm x {result.water_bbl_per_day:g} water bbl/day "
-        f"= {result.product_gallons_per_day:g} gallons/day.\n\n"
-        "Why this matters:\nA fixed unit contract makes the arithmetic reviewable without treating it as a treatment recommendation.\n\n"
-        "Evidence from retrieved sources:\n- No retrieval was run; this is a deterministic product-ppm water-basis calculation.\n\n"
-        "Recommended next checks:\n"
-        "1. Confirm that the requested ppm is a product-ppm target.\n"
-        "2. Confirm the current water rate in barrels per day.\n"
-        "3. Obtain qualified engineering review before applying a field treatment.\n\n"
-        "Limitations:\nThis general calculation does not establish a field-ready dose."
-    )
-    return RagAnswer(text=text, sources=[], weak_evidence=False)
 
 
 def _tool_input_guidance() -> RagAnswer:

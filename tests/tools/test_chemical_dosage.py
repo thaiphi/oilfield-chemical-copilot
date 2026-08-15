@@ -9,6 +9,7 @@ from oilfield_chemical_copilot.tools.chemical_dosage import (
     LABEL,
     VERSION,
     calculate_dosage,
+    product_dosage_answer,
 )
 
 
@@ -54,3 +55,13 @@ def test_calculate_dosage_rejects_invalid_contract_inputs(
 
 def test_calculate_dosage_does_not_expose_an_active_fraction_argument() -> None:
     assert tuple(signature(calculate_dosage).parameters) == ("water_bbl_per_day", "product_ppm")
+
+
+def test_product_dosage_answer_keeps_the_calculation_deterministic_and_non_prescriptive() -> None:
+    answer = product_dosage_answer(1_000, 100)
+
+    assert answer.sources == []
+    assert answer.weak_evidence is False
+    assert "4.2 gallons/day" in answer.text
+    assert LABEL in answer.text
+    assert "field-ready dose" in answer.text

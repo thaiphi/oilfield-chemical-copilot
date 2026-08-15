@@ -4,7 +4,11 @@ from urllib.request import Request
 
 import pytest
 
-from oilfield_chemical_copilot.ollama import OllamaClient, OllamaClientError
+from oilfield_chemical_copilot.ollama import (
+    OllamaClient,
+    OllamaClientError,
+    OllamaToolCall,
+)
 
 
 class _Response:
@@ -90,6 +94,69 @@ def test_chat_posts_optional_generation_options() -> None:
     )
 
     assert opener.request_payload["options"] == {"temperature": 0}
+
+
+def test_chat_with_tools_posts_tool_schema_and_parses_a_tool_call() -> None:
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "search_knowledge",
+                "parameters": {"type": "object", "required": ["query"]},
+            },
+        }
+    ]
+    opener = _fake_opener(
+        {
+            "message": {
+                "content": "",
+                "tool_calls": [
+                    {"function": {"name": "search_knowledge", "arguments": {"query": "scale risk"}}}
+                ],
+            }
+        },
+        "/api/chat",
+    )
+    client = OllamaClient("http://ollama.test", opener=opener)
+
+    response = client.chat_with_tools(
+        model="granite4.1:8b",
+        messages=[{"role": "user", "content": "Find scale evidence."}],
+        tools=tools,
+        generation_options={"temperature": 0},
+    )
+
+    assert response.content == ""
+    assert response.tool_calls == (OllamaToolCall("search_knowledge", {"query": "scale risk"}),)
+    assert opener.request_payload == {
+        "model": "granite4.1:8b",
+        "stream": False,
+        "messages": [{"role": "user", "content": "Find scale evidence."}],
+        "tools": tools,
+        "options": {"temperature": 0},
+    }
+
+
+@pytest.mark.parametrize(
+    "tool_calls",
+    (
+        {"function": {"name": "search_knowledge", "arguments": {"query": "scale"}}},
+        [{"function": {"name": 7, "arguments": {"query": "scale"}}}],
+        [{"function": {"name": "search_knowledge", "arguments": []}}],
+    ),
+)
+def test_chat_with_tools_rejects_malformed_tool_calls(tool_calls: object) -> None:
+    client = OllamaClient(
+        "http://ollama.test",
+        opener=_fake_opener({"message": {"content": "", "tool_calls": tool_calls}}, "/api/chat"),
+    )
+
+    with pytest.raises(OllamaClientError, match="^Invalid Ollama tool response$"):
+        client.chat_with_tools(
+            model="granite4.1:8b",
+            messages=[{"role": "user", "content": "Find scale evidence."}],
+            tools=[],
+        )
 @pytest.mark.parametrize("payload", [{}, {"embeddings": []}, {"embeddings": [[]]}, {"message": {}}])
 def test_client_rejects_invalid_payloads(payload: object) -> None:
     with pytest.raises(OllamaClientError):

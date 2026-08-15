@@ -1,7 +1,7 @@
 # Project Status
 
 **Project:** Oilfield Chemical Troubleshooting Copilot<br>
-**Last updated:** 2026-08-13
+**Last updated:** 2026-08-14
 
 ## Completed Milestones
 
@@ -22,10 +22,11 @@
 15. **V4 semantic-grounding evaluation**: a fresh sealed private 36-case pre-fix holdout scored the real formatter once. It passed 24/36 (66.7%), with 12 false allows and zero false fallbacks across numeric values, ranges, units, qualifiers, conflicting evidence, and absent-threshold statements. Public synthetic regressions now guard the discovered failure classes. Post-score review also made future evaluator runs require preflight, enforce private/public artifact paths, and reject sensitive aggregate-report key fragments before sealing. V4 was not rerun, so a fresh v5 is required to measure the correction.
 16. **V5 semantic-grounding evaluation**: a fresh sealed private 36-case holdout scored the real formatter exactly once. It passed 28/36 (77.8%), with seven false allows and one false fallback. Aggregate failure classes were comparator change (2), condition omission (2), conflict erasure (2), unit substitution (1), and grounded claim (1). The fixture and diagnostics remain private and ignored; V5 will not be rerun. Public synthetic regressions now cover those aggregate-safe classes, and a fresh V6 is required to measure the correction.
 17. **V6 semantic-grounding evaluation**: a fresh sealed private 36-case holdout scored the real formatter exactly once after recursive aggregate-report privacy hardening and the V5 formatter correction. It passed 36/36 with zero false allows and zero false fallbacks across numeric values, ranges, units, conditions, conflicts, and absent-threshold statements. The V6 fixture and diagnostics remain private and ignored; V6 will not be rerun. This is a controlled formatter-boundary result, not proof of chemistry correctness, retrieval quality, LLM-answer quality, or production readiness.
+18. **Module 1 bounded agentic-routing implementation**: the opt-in local route has a one-decision Ollama planner and exactly two controller-owned tools: knowledge search and deterministic product-dose calculation. Claim-scope abstention occurs before planning; unknown, malformed, multi-tool, and planner-error outcomes execute no tool and fall back to the existing RAG path. The public suite passed 518 tests (2 integration tests skipped), the workflow-contract suite passed 22 checks, and Ruff plus `git diff --check` passed. The local Granite smoke test passed on 2026-08-14: the service was reachable, `granite4.1:8b` was present, and the planner returned exactly one tool call. Only aggregate smoke status was recorded.
 
 ## Learning Progress
 
-- **Module 1: Agentic RAG** - active lesson under the authoritative course mapping.
+- **Module 1: Agentic RAG** - locked on 2026-08-14. The bounded implementation has public and local Granite evidence, and the practical teaching review is complete.
 - **Module 2: Vector Search** - implemented early; not yet reviewed and locked under the official objectives.
 - **Module 3: Orchestration** - scaffold only.
 - **Module 4: Evaluation** - implemented early; not yet reviewed and locked under the official objectives.
@@ -44,7 +45,7 @@ The completed baselines, diagnosis, and policy boundary do not select a retrieva
 
 ## Immediate Next Task
 
-Finish V6 public verification and readiness review. Then commit the approved public V5/V6 evaluator, formatter, test, report, status, and durable plan/spec changes before continuing the **Module 1 Agentic RAG lesson** from the official handout.
+Request commit approval for the public Module 1 implementation, tests, plan, design, report, roadmap, and status files. Then begin the Module 2 Vector Search teaching review, which revisits the existing embedding, vector-search, metadata-filtering, and RRF implementation.
 
 ## Course Alignment
 

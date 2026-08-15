@@ -12,9 +12,11 @@ class FakeRetriever:
     def __init__(self, hits: list[RetrievalHit]) -> None:
         self.hits = hits
         self.calls = 0
+        self.queries: list[tuple[str, str | None]] = []
 
     def retrieve(self, question: str, topic: str | None = None):
         self.calls += 1
+        self.queries.append((question, topic))
         return self.hits
 
 
@@ -23,11 +25,13 @@ class FakeGenerator:
         self.draft = draft
         self.error = error
         self.calls = 0
+        self.user_prompts: list[str] = []
 
     def generate(
         self, *, system_prompt: str, user_prompt: str, allowed_source_ids: set[str]
     ) -> RagDraft:
         self.calls += 1
+        self.user_prompts.append(user_prompt)
         if self.error:
             raise self.error
         assert self.draft is not None
@@ -133,6 +137,21 @@ def test_service_allows_general_review_through_unchanged_rag_path() -> None:
     assert answer.weak_evidence is False
     assert retriever.calls == 1
     assert generator.calls == 1
+
+
+def test_service_uses_retrieval_query_without_replacing_the_original_question() -> None:
+    retriever = FakeRetriever([_hit()])
+    generator = FakeGenerator(draft=_draft())
+    service = BasicRagService(retriever=retriever, generator=generator)
+
+    service.answer(
+        "How should I assess scale risk from produced water analysis?",
+        retrieval_query="produced-water scale screening",
+    )
+
+    assert retriever.queries == [("produced-water scale screening", None)]
+    assert "How should I assess scale risk from produced water analysis?" in generator.user_prompts[0]
+    assert "produced-water scale screening" not in generator.user_prompts[0]
 
 
 def test_service_formats_grounded_openai_answer_with_citations() -> None:

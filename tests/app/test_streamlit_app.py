@@ -3,6 +3,7 @@ import pytest
 
 from app.streamlit_app import (
     _answer_question,
+    _agentic_routing_enabled,
     _build_rag_service,
     _citation_display,
     _database_url,
@@ -163,16 +164,60 @@ def test_answer_question_hides_ollama_retrieval_error_details(monkeypatch) -> No
     assert "private corpus excerpt" not in str(error.value)
 
 
+def test_agentic_routing_flag_only_enables_case_insensitive_true(monkeypatch) -> None:
+    monkeypatch.delenv("AGENTIC_ROUTING_ENABLED", raising=False)
+    assert _agentic_routing_enabled() is False
+
+    monkeypatch.setenv("AGENTIC_ROUTING_ENABLED", "TRUE")
+    assert _agentic_routing_enabled() is True
+
+    monkeypatch.setenv("AGENTIC_ROUTING_ENABLED", "yes")
+    assert _agentic_routing_enabled() is False
+
+
+def test_answer_question_builds_agentic_service_only_when_enabled(monkeypatch) -> None:
+    expected = RagAnswer(text="Agentic response", sources=[], weak_evidence=False)
+    rag_service = object()
+    captured: dict[str, object] = {}
+
+    class FakePlanner:
+        def __init__(self, *, model: str, client: object) -> None:
+            captured["model"] = model
+            captured["client"] = client
+
+    class FakeAgenticService:
+        def __init__(self, *, rag_service: object, planner: object) -> None:
+            captured["rag_service"] = rag_service
+            captured["planner"] = planner
+
+        def answer(self, prompt: str) -> RagAnswer:
+            captured["prompt"] = prompt
+            return expected
+
+    monkeypatch.setenv("AGENTIC_ROUTING_ENABLED", "true")
+    monkeypatch.setenv("OLLAMA_MODEL", "test-granite")
+    monkeypatch.setenv("OLLAMA_BASE_URL", "http://ollama.test")
+    monkeypatch.setattr("app.streamlit_app._build_rag_service", lambda _mode: rag_service)
+    monkeypatch.setattr("app.streamlit_app.OllamaToolPlanner", FakePlanner, raising=False)
+    monkeypatch.setattr("app.streamlit_app.AgenticRagService", FakeAgenticService, raising=False)
+    monkeypatch.setattr("app.streamlit_app.OllamaClient", lambda base_url: {"base_url": base_url}, raising=False)
+
+    assert _answer_question("Find scale evidence", "hybrid") is expected
+    assert captured["rag_service"] is rag_service
+    assert captured["model"] == "test-granite"
+    assert captured["client"] == {"base_url": "http://ollama.test"}
+    assert captured["prompt"] == "Find scale evidence"
+
+
 def test_valid_product_dose_chat_request_uses_calculator_without_rag(monkeypatch) -> None:
     calculator_calls: list[tuple[float, float]] = []
+    expected = RagAnswer(text="Deterministic calculator result", sources=[], weak_evidence=False)
 
-    def calculate(water_bbl_per_day: float, product_ppm: float):
+    def calculate(water_bbl_per_day: float, product_ppm: float) -> RagAnswer:
         calculator_calls.append((water_bbl_per_day, product_ppm))
-        from oilfield_chemical_copilot.tools.chemical_dosage import calculate_dosage
+        return expected
 
-        return calculate_dosage(water_bbl_per_day, product_ppm)
-
-    monkeypatch.setattr("app.streamlit_app.calculate_dosage", calculate)
+    monkeypatch.setattr("app.streamlit_app.product_dosage_answer", calculate)
     monkeypatch.setattr(
         "app.streamlit_app._answer_question",
         lambda *_args: pytest.fail("RAG must not run for a valid product-dose request"),
@@ -183,9 +228,7 @@ def test_valid_product_dose_chat_request_uses_calculator_without_rag(monkeypatch
     )
 
     assert calculator_calls == [(1000.0, 100.0)]
-    assert answer.sources == []
-    assert "General product-dose calculation - not a field-ready prescription" in answer.text
-    assert "4.2 gallons/day" in answer.text
+    assert answer is expected
 
 
 def test_closed_product_dose_request_returns_scope_limit_without_calls(monkeypatch) -> None:
@@ -253,9 +296,9 @@ def test_unrecognized_dosage_text_cannot_invoke_the_calculator(monkeypatch) -> N
 
 
 def test_sidebar_and_chat_use_equivalent_calculator_output() -> None:
-    from app.streamlit_app import _dosage_answer
+    from oilfield_chemical_copilot.tools.chemical_dosage import product_dosage_answer
 
-    answer = _dosage_answer(1000, 100)
+    answer = product_dosage_answer(1000, 100)
 
     assert "4.2 gallons/day" in answer.text
     assert "General product-dose calculation - not a field-ready prescription" in answer.text

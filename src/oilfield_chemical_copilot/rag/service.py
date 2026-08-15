@@ -44,12 +44,17 @@ class BasicRagService:
             apply_claim_scope_policy=apply_claim_scope_policy,
         )
 
-    def answer(self, question: str, topic: str | None = None) -> RagAnswer:
+    def answer(
+        self,
+        question: str,
+        topic: str | None = None,
+        retrieval_query: str | None = None,
+    ) -> RagAnswer:
         if self.apply_claim_scope_policy:
             claim_scope = classify_claim_scope(question)
             if claim_scope.action == "abstain":
                 return scope_limited_answer(category=claim_scope.category)
-        hits = self.retriever.retrieve(question, topic=topic)
+        hits = self.retriever.retrieve(retrieval_query or question, topic=topic)
         if not hits or max(hit.score for hit in hits) < self.min_score:
             return weak_evidence_answer(
                 limitations="No retrieved chunks met the evidence threshold for this question."
