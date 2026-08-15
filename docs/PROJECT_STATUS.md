@@ -23,12 +23,13 @@
 16. **V5 semantic-grounding evaluation**: a fresh sealed private 36-case holdout scored the real formatter exactly once. It passed 28/36 (77.8%), with seven false allows and one false fallback. Aggregate failure classes were comparator change (2), condition omission (2), conflict erasure (2), unit substitution (1), and grounded claim (1). The fixture and diagnostics remain private and ignored; V5 will not be rerun. Public synthetic regressions now cover those aggregate-safe classes, and a fresh V6 is required to measure the correction.
 17. **V6 semantic-grounding evaluation**: a fresh sealed private 36-case holdout scored the real formatter exactly once after recursive aggregate-report privacy hardening and the V5 formatter correction. It passed 36/36 with zero false allows and zero false fallbacks across numeric values, ranges, units, conditions, conflicts, and absent-threshold statements. The V6 fixture and diagnostics remain private and ignored; V6 will not be rerun. This is a controlled formatter-boundary result, not proof of chemistry correctness, retrieval quality, LLM-answer quality, or production readiness.
 18. **Module 1 bounded agentic-routing implementation**: the opt-in local route has a one-decision Ollama planner and exactly two controller-owned tools: knowledge search and deterministic product-dose calculation. Claim-scope abstention occurs before planning; unknown, malformed, multi-tool, and planner-error outcomes execute no tool and fall back to the existing RAG path. The public suite passed 518 tests (2 integration tests skipped), the workflow-contract suite passed 22 checks, and Ruff plus `git diff --check` passed. The local Granite smoke test passed on 2026-08-14: the service was reachable, `granite4.1:8b` was present, and the planner returned exactly one tool call. Only aggregate smoke status was recorded.
+19. **Module 3 public Kestra orchestration**: a five-stage public-sample flow completed inventory, parse/chunk, local Granite embed/load, count validation, and dlt aggregate publication. The verified run recorded 10 source files, 11 chunks, 11 expected and actual indexed chunks, and one aggregate publication using `granite-embedding:latest`. The worker image excludes private build-context material, and the durable report contains no source text, source names, paths, credentials, or execution identifiers.
 
 ## Learning Progress
 
 - **Module 1: Agentic RAG** - locked on 2026-08-14. The bounded implementation has public and local Granite evidence, and the practical teaching review is complete.
 - **Module 2: Vector Search** - locked on 2026-08-15. The teaching review covered embedding-model coordinate systems, semantic ranking, topic filtering, and PGVector storage. Focused public checks passed 35 tests; the count-only live Granite-to-PGVector smoke check returned one result under the `scale` topic filter.
-- **Module 3: Orchestration** - scaffold only.
+- **Module 3: Orchestration** - locked on 2026-08-15. The practical teaching review covered task boundaries, artifact handoff, independent count validation, and aggregate-only dlt publication.
 - **Module 4: Evaluation** - implemented early; not yet reviewed and locked under the official objectives.
 - **Module 5: Monitoring** - scaffold only; the aggregate in-memory collector is not the complete monitoring module.
 - **Module 6: Best Practices** - hybrid RRF is implemented early; reranking and query rewriting remain deferred.
@@ -45,7 +46,7 @@ The completed baselines, diagnosis, and policy boundary do not select a retrieva
 
 ## Immediate Next Task
 
-Request commit approval for the public Module 2 teaching-status and review documentation. Then begin Module 3 Orchestration with Kestra, which is currently scaffold only.
+Begin the official Module 4 evaluation lesson, reviewing the evaluation features implemented early and connecting them to the live RAG boundary.
 
 ## Course Alignment
 

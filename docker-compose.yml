@@ -35,6 +35,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    image: oilfield-chemical-copilot:local
     env_file:
       - .env.example
     environment:
@@ -62,20 +63,68 @@ services:
     volumes:
       - ./data:/app/data:ro
 
+  kestra-db-init:
+    image: postgres:16
+    env_file:
+      - .env.example
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        until pg_isready -h postgres -U "$${POSTGRES_USER}" -d postgres; do sleep 1; done
+        psql -h postgres -U "$${POSTGRES_USER}" -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname = 'kestra'" | grep -q 1 ||
+          psql -h postgres -U "$${POSTGRES_USER}" -d postgres -c "CREATE DATABASE kestra"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   kestra:
     image: kestra/kestra:latest
     env_file:
       - .env.example
+    user: "root"
     command: server standalone
+    environment:
+      KESTRA_CONFIGURATION: |
+        datasources:
+          postgres:
+            url: jdbc:postgresql://postgres:5432/kestra
+            driver-class-name: org.postgresql.Driver
+            username: postgres
+            password: postgres
+        kestra:
+          server:
+            basic-auth:
+              enabled: false
+              username: ${KESTRA_USERNAME:-admin@kestra.io}
+              password: ${KESTRA_PASSWORD:-Kestra123}
+          repository:
+            type: postgres
+          storage:
+            type: local
+            local:
+              base-path: "/app/storage"
+          queue:
+            type: postgres
+          tasks:
+            tmp-dir:
+              path: /tmp/kestra-wd/tmp
+            scripts:
+              docker:
+                volume-enabled: true
+          url: http://localhost:8080/
     ports:
       - "${KESTRA_PORT:-8080}:8080"
     volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
       - kestra-data:/app/storage
+      - /tmp/kestra-wd:/tmp/kestra-wd
       - ./flows/kestra:/app/flows:ro
       - ./data:/app/data:ro
     depends_on:
-      postgres:
-        condition: service_healthy
+      kestra-db-init:
+        condition: service_completed_successfully
 
   grafana:
     image: grafana/grafana:latest

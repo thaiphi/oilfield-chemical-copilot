@@ -19,7 +19,7 @@ LLM Zoomcamp 2026 capstone project for an oilfield production-chemistry troubles
 - Expose tool-calling helpers for chemical dosage calculations and water-analysis interpretation.
 - Log conversations, feedback, latency, retrieved chunks, and tool calls.
 
-- Orchestrate ingestion with Kestra: parse -> chunk -> embed -> load_pgvector.
+- Orchestrate public-sample ingestion with Kestra: inventory -> parse/chunk -> embed/load -> validate -> publish aggregate metrics.
 - Monitor operational metrics with Grafana-compatible dashboards.
 
 ## Repo Layout
@@ -35,7 +35,7 @@ ingestion/index_chunks.py    Chunk embedding and PGVector indexing CLI
 ingestion/apply_migrations.py SQL migration runner for existing databases
 db/migrations/               PostgreSQL + PGVector schema migrations
 eval/                        Retrieval evaluator and public evaluation dataset
-flows/kestra/                Kestra ingestion flow scaffold
+flows/kestra/                Public-sample Kestra ingestion flow
 monitoring/grafana/          Grafana dashboard/provisioning plan
 src/oilfield_chemical_copilot/
   ingest/                    File discovery, parsing, and chunking helpers
@@ -139,6 +139,21 @@ uv run python ingestion/index_chunks.py --input data/processed/chunks.jsonl --da
 ```
 
 `docker compose run --rm migrate` applies all SQL migrations to existing volumes. Milestone 3 changes the embedding column to `vector(384)` and refuses to run when `chunks` already contains rows. For an old local volume with disposable sample data, reset the Docker volume and re-index from `chunks.jsonl`; for any non-disposable database, back it up and plan a controlled re-embedding migration.
+
+## Kestra Public-Sample Orchestration
+
+Kestra runs the same public ingestion commands as five explicit task boundaries: inventory, parse/chunk, embed/load, count validation, and aggregate-metrics publication. It is an ingestion coordinator, not part of the question-answering path.
+
+Start the local prerequisites and open Kestra at http://localhost:8080:
+
+```powershell
+docker build --tag oilfield-chemical-copilot:local .
+docker compose up -d postgres kestra
+```
+
+Register and execute `flows/kestra/ingest.yml` in the local Kestra UI. The flow embeds only `data/sample`, validates the indexed count against its generated public chunk manifest, and uses `granite-embedding:latest`. Its final dlt task appends only six aggregate fields to `orchestration.ingestion_runs`: status, source-file count, chunk counts, and embedding-model label.
+
+Private source material is outside this flow and is excluded from the worker-image build context. Do not substitute a private data directory or place private files in Kestra artifacts.
 
 Run the live PGVector integration test only when Docker Postgres is available. It defaults to a disposable `oilfield_copilot_test` database and rejects database names that do not end in `_test` before truncating test rows.
 

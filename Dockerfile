@@ -9,6 +9,7 @@ COPY app ./app
 COPY db ./db
 COPY ingestion ./ingestion
 COPY src ./src
+COPY data/sample ./data/sample
 
 RUN uv sync --locked --no-dev
 

@@ -1,30 +1,69 @@
 ﻿id: oilfield_copilot_ingest
 namespace: oilfield.chemical_copilot
 
-description: Scaffold ingestion flow for parse -> chunk -> embed -> load_pgvector.
-
-inputs:
-  - id: data_mode
-    type: STRING
-    defaults: sample
+description: Public-sample ingestion flow for inventory, indexing, validation, and dlt metrics.
 
 tasks:
-  - id: parse
+  - id: inventory
     type: io.kestra.plugin.scripts.shell.Commands
+    containerImage: oilfield-chemical-copilot:local
+    env:
+      DATABASE_URL: "postgresql://postgres:postgres@host.docker.internal:5432/oilfield_copilot"
+      OLLAMA_BASE_URL: "http://host.docker.internal:11434"
+      OLLAMA_EMBEDDING_MODEL: "granite-embedding:latest"
     commands:
-      - echo "TODO: parse PDFs, DOCX, XLSX, CSV, and nested folders for {{ inputs.data_mode }}"
+      - uv run --project /app python /app/ingestion/inventory.py --data-dir /app/data/sample --output-dir {{ workingDir }} --summary-only
+    outputFiles:
+      - inventory.csv
+      - inventory_summary.md
 
-  - id: chunk
+  - id: parse_chunk
     type: io.kestra.plugin.scripts.shell.Commands
+    containerImage: oilfield-chemical-copilot:local
+    env:
+      DATABASE_URL: "postgresql://postgres:postgres@host.docker.internal:5432/oilfield_copilot"
+      OLLAMA_BASE_URL: "http://host.docker.internal:11434"
+      OLLAMA_EMBEDDING_MODEL: "granite-embedding:latest"
     commands:
-      - echo "TODO: chunk parsed text with source_file, topic, page_or_sheet, chunk_id metadata"
+      - uv run --project /app python /app/ingestion/ingest.py --data-dir /app/data/sample --output-dir {{ workingDir }}
+    outputFiles:
+      - chunks.jsonl
+      - ingestion_report.json
 
-  - id: embed
+  - id: embed_load
     type: io.kestra.plugin.scripts.shell.Commands
+    containerImage: oilfield-chemical-copilot:local
+    env:
+      DATABASE_URL: "postgresql://postgres:postgres@host.docker.internal:5432/oilfield_copilot"
+      OLLAMA_BASE_URL: "http://host.docker.internal:11434"
+      OLLAMA_EMBEDDING_MODEL: "granite-embedding:latest"
+    inputFiles:
+      chunks.jsonl: "{{ outputs.parse_chunk.outputFiles['chunks.jsonl'] }}"
     commands:
-      - echo "TODO: create embeddings with OpenAI or sentence-transformers"
+      - uv run --project /app python /app/ingestion/index_chunks.py --input {{ workingDir }}/chunks.jsonl --database-url "$DATABASE_URL" --embedding-provider ollama --embedding-model "$OLLAMA_EMBEDDING_MODEL"
 
-  - id: load_pgvector
+  - id: validate_counts
     type: io.kestra.plugin.scripts.shell.Commands
+    containerImage: oilfield-chemical-copilot:local
+    env:
+      DATABASE_URL: "postgresql://postgres:postgres@host.docker.internal:5432/oilfield_copilot"
+      OLLAMA_BASE_URL: "http://host.docker.internal:11434"
+      OLLAMA_EMBEDDING_MODEL: "granite-embedding:latest"
+    inputFiles:
+      chunks.jsonl: "{{ outputs.parse_chunk.outputFiles['chunks.jsonl'] }}"
     commands:
-      - echo "TODO: load chunks and embeddings into PostgreSQL + PGVector"
+      - cd /app && uv run --project /app python -m ingestion.validate_index --input {{ workingDir }}/chunks.jsonl --database-url "$DATABASE_URL" --embedding-model "$OLLAMA_EMBEDDING_MODEL" --report {{ workingDir }}/orchestration_run.json
+    outputFiles:
+      - orchestration_run.json
+
+  - id: publish_metrics
+    type: io.kestra.plugin.scripts.shell.Commands
+    containerImage: oilfield-chemical-copilot:local
+    env:
+      DATABASE_URL: "postgresql://postgres:postgres@host.docker.internal:5432/oilfield_copilot"
+      OLLAMA_BASE_URL: "http://host.docker.internal:11434"
+      OLLAMA_EMBEDDING_MODEL: "granite-embedding:latest"
+    inputFiles:
+      orchestration_run.json: "{{ outputs.validate_counts.outputFiles['orchestration_run.json'] }}"
+    commands:
+      - uv run --project /app python /app/ingestion/publish_orchestration_metrics.py --input {{ workingDir }}/orchestration_run.json --database-url "$DATABASE_URL"
