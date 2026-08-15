@@ -27,7 +27,7 @@
 ## Learning Progress
 
 - **Module 1: Agentic RAG** - locked on 2026-08-14. The bounded implementation has public and local Granite evidence, and the practical teaching review is complete.
-- **Module 2: Vector Search** - implemented early; not yet reviewed and locked under the official objectives.
+- **Module 2: Vector Search** - locked on 2026-08-15. The teaching review covered embedding-model coordinate systems, semantic ranking, topic filtering, and PGVector storage. Focused public checks passed 35 tests; the count-only live Granite-to-PGVector smoke check returned one result under the `scale` topic filter.
 - **Module 3: Orchestration** - scaffold only.
 - **Module 4: Evaluation** - implemented early; not yet reviewed and locked under the official objectives.
 - **Module 5: Monitoring** - scaffold only; the aggregate in-memory collector is not the complete monitoring module.
@@ -45,7 +45,7 @@ The completed baselines, diagnosis, and policy boundary do not select a retrieva
 
 ## Immediate Next Task
 
-Request commit approval for the public Module 1 implementation, tests, plan, design, report, roadmap, and status files. Then begin the Module 2 Vector Search teaching review, which revisits the existing embedding, vector-search, metadata-filtering, and RRF implementation.
+Request commit approval for the public Module 2 teaching-status and review documentation. Then begin Module 3 Orchestration with Kestra, which is currently scaffold only.
 
 ## Course Alignment
 
