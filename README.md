@@ -294,6 +294,24 @@ uv run python eval/live_rag_answer_eval.py --dataset eval/public_answer_evaluati
 
 The aggregate-only comparison report records the `vector`/`hybrid` relationship and the numeric `top_k`, `min_score`, `max_context_chars`, `hybrid_candidate_limit`, `hybrid_rrf_k`, and `hybrid_min_rrf_score` settings used for the run. It does not record database or Ollama URLs.
 
+### Module 4 Evaluation Pack
+
+The Module 4 public pack exercises the active vector and hybrid RAG boundaries, including claim-scope abstention, using only the committed public answer fixture. It writes aggregate-only JSON and Markdown reports:
+
+```powershell
+$env:DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/oilfield_copilot"
+$env:LLM_PROVIDER = "ollama"
+$env:OLLAMA_BASE_URL = "http://localhost:11434"
+$env:OLLAMA_MODEL = "granite4.1:8b"
+$env:EMBEDDING_PROVIDER = "ollama"
+$env:OLLAMA_EMBEDDING_MODEL = "granite-embedding:latest"
+uv run python eval/module4_evaluation_pack.py --scope public --database-url $env:DATABASE_URL --output-dir data/processed/evaluation/module4-public
+```
+
+The 2026-08-15 public run measured six answerable public cases per mode. Vector achieved Hit Rate@5 `1.000`, MRR@5 `1.000`, citation `9/3`, and abstention `12/0`; hybrid achieved Hit Rate@5 `1.000`, MRR@5 `0.917`, citation `10/2`, and abstention `10/2`. Expected evidence appearing in the top five is retrieval evidence, not proof that the generated answer is chemically correct or operationally safe.
+
+Local handout evaluation is deliberately separate. It accepts only a reviewed, sealed dataset under `.private/evaluation/module4_handouts/`, requires controller approval matching the sealed SHA-256, consumes one-shot state before RAG initialization, and writes detailed statuses only under `.private`. Its durable Markdown report contains aggregates only. The first sealed local run on 2026-08-15 ended `unavailable` with the fixed `RUNTIME_UNAVAILABLE` category after state consumption, so it produced no valid score and cannot be retried under that hash. A fresh v2 fixture then completed: vector recorded Hit Rate@5/MRR@5 `0.500/0.500`, citation `7/5`, and abstention `8/4`; hybrid recorded `0.833/0.722`, citation `8/4`, and abstention `10/2`. Hybrid is a future improvement candidate, not a production winner.
+
 Completed small public baseline: both `vector` and `hybrid` ran 12 questions. In each mode, deterministic citations had 4 passes and 8 failures, abstention had 6 passes and 6 failures, and all 12 judge results were available. Judge aggregates were:
 
 | Mode | Groundedness | Relevance | Limitation awareness | Operational certainty |
@@ -334,7 +352,7 @@ Module 1 now includes a process-local aggregate monitor for six closed outcomes:
 - Search and retrieval: implemented keyword search with `minsearch`; vector retrieval uses PGVector and filters by embedding model.
 - Vector databases: PGVector migrations create durable chunk and 384-dimensional embedding storage.
 - LLM integration: OpenAI Responses API adapter generates structured drafts for source-grounded answers.
-- Evaluation: `eval/retrieval_eval.py` evaluates keyword, vector, and hybrid retrieval at fixed `k=5` with public/private report boundaries; `eval/answer_eval.py` completes synthetic-answer contract and judge evaluation; `eval/live_rag_answer_eval.py` completed a small public vector-versus-hybrid baseline without an oracle topic filter.
+- Evaluation: `eval/retrieval_eval.py` evaluates keyword, vector, and hybrid retrieval at fixed `k=5` with public/private report boundaries; `eval/answer_eval.py` completes synthetic-answer contract and judge evaluation; `eval/live_rag_answer_eval.py` completed a small public vector-versus-hybrid baseline without an oracle topic filter; `eval/module4_evaluation_pack.py` runs the course-aligned public or sealed-local vector/hybrid evaluation boundary.
 - Monitoring: `monitoring/grafana/README.md` documents the Grafana-compatible dashboard plan.
 - Orchestration: `flows/kestra/ingest.yml` sketches parse, chunk, embed, and load steps.
 - Capstone deployment: Docker Compose includes app, migration, Postgres/PGVector, Kestra, and Grafana services.
