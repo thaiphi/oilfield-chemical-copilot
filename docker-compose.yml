@@ -31,6 +31,20 @@ services:
       postgres:
         condition: service_healthy
 
+  monitoring-migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: oilfield-chemical-copilot:local
+    env_file:
+      - .env.example
+    environment:
+      DATABASE_URL: ${MONITORING_DATABASE_URL:-postgresql://postgres:postgres@postgres:5432/oilfield_copilot}
+    command: ["uv", "run", "python", "ingestion/apply_migrations.py"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   app:
     build:
       context: .
@@ -53,10 +67,14 @@ services:
       RAG_MAX_CONTEXT_CHARS: ${RAG_MAX_CONTEXT_CHARS:-4000}
       DATABASE_URL: ${DATABASE_URL:-postgresql://postgres:postgres@postgres:5432/oilfield_copilot}
       DATA_MODE: ${DATA_MODE:-sample}
+      MONITORING_PERSISTENCE_ENABLED: "true"
+      MONITORING_DATABASE_URL: ${MONITORING_DATABASE_URL:-postgresql://postgres:postgres@postgres:5432/oilfield_copilot}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
       migrate:
+        condition: service_completed_successfully
+      monitoring-migrate:
         condition: service_completed_successfully
     ports:
       - "${STREAMLIT_PORT:-8501}:8501"
@@ -78,6 +96,21 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+
+  grafana-role-init:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: oilfield-chemical-copilot:local
+    env_file:
+      - .env.example
+    environment:
+      DATABASE_URL: ${MONITORING_DATABASE_URL:-postgresql://postgres:postgres@postgres:5432/oilfield_copilot}
+      GRAFANA_DB_PASSWORD: ${GRAFANA_DB_PASSWORD:-grafana}
+    command: ["uv", "run", "python", "monitoring/bootstrap_grafana_role.py"]
+    depends_on:
+      monitoring-migrate:
+        condition: service_completed_successfully
 
   kestra:
     image: kestra/kestra:latest
@@ -130,14 +163,34 @@ services:
     image: grafana/grafana:latest
     env_file:
       - .env.example
+    environment:
+      MONITORING_POSTGRES_DB: ${MONITORING_POSTGRES_DB:-oilfield_copilot}
+      GRAFANA_DB_PASSWORD: ${GRAFANA_DB_PASSWORD:-grafana}
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
     ports:
-      - "${GRAFANA_PORT:-3000}:3000"
+      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"
     volumes:
       - grafana-data:/var/lib/grafana
       - ./monitoring/grafana:/etc/grafana/provisioning:ro
     depends_on:
-      postgres:
-        condition: service_healthy
+      grafana-role-init:
+        condition: service_completed_successfully
+
+  monitoring-demo-seed:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: oilfield-chemical-copilot:local
+    profiles: ["demo"]
+    env_file:
+      - .env.example
+    environment:
+      DATABASE_URL: ${MONITORING_DATABASE_URL:-postgresql://postgres:postgres@postgres:5432/oilfield_copilot}
+    command: ["uv", "run", "python", "monitoring/seed_demo_metrics.py"]
+    depends_on:
+      grafana-role-init:
+        condition: service_completed_successfully
 
 volumes:
   pgdata:

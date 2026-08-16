@@ -16,6 +16,17 @@ class MonitoringOutcome(str, Enum):
     RAG_CONFIGURATION_ERROR = "rag_configuration_error"
 
 
+class RetrievalMode(str, Enum):
+    VECTOR = "vector"
+    HYBRID = "hybrid"
+    NOT_APPLICABLE = "not_applicable"
+
+
+class FeedbackValue(str, Enum):
+    HELPFUL = "helpful"
+    NEEDS_WORK = "needs_work"
+
+
 @dataclass(frozen=True)
 class LatencySummary:
     count: int

@@ -7,13 +7,19 @@ from app.streamlit_app import (
     _build_rag_service,
     _citation_display,
     _database_url,
+    _monitoring_database_url,
     _route_prompt,
     _route_prompt_with_outcome,
+    _record_feedback,
     _record_request,
     _excerpt,
 )
 from oilfield_chemical_copilot.evaluation.abstention_policy import AbstentionPolicyDecision
-from oilfield_chemical_copilot.observability.aggregate_monitoring import MonitoringOutcome
+from oilfield_chemical_copilot.observability.aggregate_monitoring import (
+    FeedbackValue,
+    MonitoringOutcome,
+    RetrievalMode,
+)
 from oilfield_chemical_copilot.rag.models import RagAnswer
 from oilfield_chemical_copilot.ollama import OllamaClientError
 from oilfield_chemical_copilot.rag.models import RagConfigurationError
@@ -113,6 +119,16 @@ def test_database_url_preserves_explicit_environment_value(monkeypatch) -> None:
     monkeypatch.setenv("DATABASE_URL", "postgresql://custom/value")
 
     assert _database_url() == "postgresql://custom/value"
+
+
+def test_monitoring_database_url_is_independent_from_rag_database(monkeypatch) -> None:
+    monkeypatch.setenv("DATABASE_URL", "postgresql://rag/private")
+    monkeypatch.delenv("MONITORING_DATABASE_URL", raising=False)
+
+    assert _monitoring_database_url() == "postgresql://postgres:postgres@localhost:5432/oilfield_copilot"
+
+    monkeypatch.setenv("MONITORING_DATABASE_URL", "postgresql://monitoring/public")
+    assert _monitoring_database_url() == "postgresql://monitoring/public"
 
 
 def test_citation_display_hides_absolute_windows_path() -> None:
@@ -328,17 +344,68 @@ def test_closed_product_dose_route_reports_scope_abstention(monkeypatch) -> None
     assert outcome is MonitoringOutcome.SCOPE_ABSTAINED
 
 
-def test_record_request_emits_only_closed_outcome_and_elapsed_time(monkeypatch) -> None:
-    recorded: list[tuple[MonitoringOutcome, float]] = []
+def test_record_request_emits_closed_outcome_mode_and_elapsed_time(monkeypatch) -> None:
+    recorded: list[tuple[MonitoringOutcome, RetrievalMode, float]] = []
 
     class RecordingMonitor:
-        def record(self, outcome: MonitoringOutcome, latency_ms: float) -> None:
-            recorded.append((outcome, latency_ms))
+        def record_request(
+            self,
+            outcome: MonitoringOutcome,
+            retrieval_mode: RetrievalMode,
+            latency_ms: float,
+            _occurred_at: object,
+        ) -> None:
+            recorded.append((outcome, retrieval_mode, latency_ms))
 
-    monkeypatch.setattr("app.streamlit_app.REQUEST_MONITOR", RecordingMonitor())
+    monkeypatch.setattr("app.streamlit_app._build_monitoring_recorder", lambda *_args: RecordingMonitor())
     monkeypatch.setattr("app.streamlit_app.time.perf_counter", lambda: 12.75)
 
-    latency_ms = _record_request(MonitoringOutcome.TOOL_CALCULATED, started_at=10.0)
+    latency_ms = _record_request(
+        MonitoringOutcome.TOOL_CALCULATED,
+        retrieval_mode="hybrid",
+        tool_route=True,
+        started_at=10.0,
+    )
 
     assert latency_ms == 2750.0
-    assert recorded == [(MonitoringOutcome.TOOL_CALCULATED, 2750.0)]
+    assert recorded == [(MonitoringOutcome.TOOL_CALCULATED, RetrievalMode.NOT_APPLICABLE, 2750.0)]
+
+
+def test_record_request_keeps_rag_retrieval_mode_for_scope_abstention(monkeypatch) -> None:
+    recorded: list[RetrievalMode] = []
+
+    class RecordingMonitor:
+        def record_request(
+            self,
+            _outcome: MonitoringOutcome,
+            retrieval_mode: RetrievalMode,
+            _latency_ms: float,
+            _occurred_at: object,
+        ) -> None:
+            recorded.append(retrieval_mode)
+
+    monkeypatch.setattr("app.streamlit_app._build_monitoring_recorder", lambda *_args: RecordingMonitor())
+    monkeypatch.setattr("app.streamlit_app.time.perf_counter", lambda: 10.0)
+
+    _record_request(MonitoringOutcome.SCOPE_ABSTAINED, retrieval_mode="vector", started_at=10.0)
+
+    assert recorded == [RetrievalMode.VECTOR]
+
+
+def test_feedback_records_only_closed_value_and_retrieval_mode(monkeypatch) -> None:
+    recorded: list[tuple[FeedbackValue, RetrievalMode]] = []
+
+    class RecordingMonitor:
+        def record_feedback(
+            self,
+            value: FeedbackValue,
+            retrieval_mode: RetrievalMode,
+            _occurred_at: object,
+        ) -> None:
+            recorded.append((value, retrieval_mode))
+
+    monkeypatch.setattr("app.streamlit_app._build_monitoring_recorder", lambda *_args: RecordingMonitor())
+
+    _record_feedback(FeedbackValue.HELPFUL, RetrievalMode.HYBRID)
+
+    assert recorded == [(FeedbackValue.HELPFUL, RetrievalMode.HYBRID)]

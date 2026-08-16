@@ -1,14 +1,10 @@
-﻿# Grafana Monitoring Plan
+# Module 5 Grafana Monitoring
 
-This folder is reserved for Grafana provisioning and dashboard JSON.
+This directory contains Git-tracked provisioning for the local, privacy-safe monitoring dashboard:
 
-Planned dashboard panels:
+- `datasources/postgres.yml` connects Grafana through `grafana_reader`.
+- `dashboards/module5-monitoring.json` defines the six-panel synthetic dashboard.
+- `../bootstrap_grafana_role.py` grants the reader role `SELECT` only on the two hourly aggregate monitoring tables.
+- `../seed_demo_metrics.py` inserts a fixed synthetic aggregate demo only when explicitly run.
 
-- Conversation volume by hour and data mode.
-- End-to-end answer latency and retrieval latency.
-- Retrieved chunk count, retrieval method mix, and average retrieval score.
-- Feedback counts and helpful-rate trend.
-- Tool-call counts, latency, and error rate by tool.
-- Ingestion run status from Kestra logs or future ingestion tables.
-
-TODO: Add a PostgreSQL datasource provisioning file and dashboard JSON after the logging tables receive real data.
+The datasource and panels use only `monitoring_request_hourly` and `monitoring_feedback_hourly`. They never query raw conversation, source, retrieval, tool, or error data. Docker Compose binds Grafana to localhost and enables anonymous Viewer access so a reviewer can open the local dashboard without receiving credentials.

@@ -5,11 +5,13 @@ import re
 import sys
 import time
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = PROJECT_ROOT / "src"
 LOCAL_DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/oilfield_copilot"
+LOCAL_MONITORING_DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/oilfield_copilot"
 _PRODUCT_DOSE_REQUEST = re.compile(r"^\s*product\s+dose\s*:", re.IGNORECASE)
 _PRODUCT_DOSE_INPUT = re.compile(
     r"\b(water_bbl_per_day|product_ppm)\s*=\s*([^,;\s]+)", re.IGNORECASE
@@ -23,7 +25,13 @@ from oilfield_chemical_copilot.ollama import OllamaClient, OllamaClientError
 from oilfield_chemical_copilot.evaluation.abstention_policy import classify_claim_scope
 from oilfield_chemical_copilot.observability.aggregate_monitoring import (
     AggregateMonitor,
+    FeedbackValue,
     MonitoringOutcome,
+    RetrievalMode,
+)
+from oilfield_chemical_copilot.observability.persistence import (
+    PostgresMonitoringRepository,
+    SafeMonitoringRecorder,
 )
 from oilfield_chemical_copilot.rag.formatter import scope_limited_answer
 from oilfield_chemical_copilot.rag.agentic_service import AgenticRagService, OllamaToolPlanner
@@ -41,15 +49,29 @@ from oilfield_chemical_copilot.storage.pgvector import PgVectorStore
 from oilfield_chemical_copilot.tools.chemical_dosage import calculate_dosage, product_dosage_answer
 from oilfield_chemical_copilot.tools.water_analysis import summarize_water_analysis
 
-REQUEST_MONITOR = AggregateMonitor()
-
-
 def _database_url() -> str:
     return os.getenv("DATABASE_URL") or LOCAL_DATABASE_URL
 
 
+def _monitoring_database_url() -> str:
+    return os.getenv("MONITORING_DATABASE_URL") or LOCAL_MONITORING_DATABASE_URL
+
+
 def _agentic_routing_enabled() -> bool:
     return os.getenv("AGENTIC_ROUTING_ENABLED", "").strip().lower() == "true"
+
+
+def _monitoring_persistence_enabled() -> bool:
+    return os.getenv("MONITORING_PERSISTENCE_ENABLED", "").strip().lower() == "true"
+
+
+@st.cache_resource(show_spinner=False)
+def _build_monitoring_recorder(
+    database_url: str,
+    persistence_enabled: bool,
+) -> SafeMonitoringRecorder:
+    repository = PostgresMonitoringRepository(database_url) if persistence_enabled else None
+    return SafeMonitoringRecorder(AggregateMonitor(), repository)
 
 
 def _initialize_state() -> None:
@@ -133,10 +155,34 @@ def _route_prompt_with_outcome(
         return _tool_input_guidance(), MonitoringOutcome.TOOL_INPUT_INVALID
 
 
-def _record_request(outcome: MonitoringOutcome, *, started_at: float) -> float:
+def _record_request(
+    outcome: MonitoringOutcome,
+    *,
+    retrieval_mode: str,
+    started_at: float,
+    tool_route: bool = False,
+) -> float:
     latency_ms = max(0.0, (time.perf_counter() - started_at) * 1000)
-    REQUEST_MONITOR.record(outcome, latency_ms)
+    normalized_mode = RetrievalMode.NOT_APPLICABLE if tool_route else RetrievalMode(retrieval_mode)
+    _build_monitoring_recorder(
+        _monitoring_database_url(), _monitoring_persistence_enabled()
+    ).record_request(
+        outcome,
+        normalized_mode,
+        latency_ms,
+        datetime.now(timezone.utc),
+    )
     return latency_ms
+
+
+def _record_feedback(value: FeedbackValue, retrieval_mode: RetrievalMode) -> None:
+    _build_monitoring_recorder(
+        _monitoring_database_url(), _monitoring_persistence_enabled()
+    ).record_feedback(
+        value,
+        retrieval_mode,
+        datetime.now(timezone.utc),
+    )
 
 
 def _parse_product_dose_inputs(prompt: str) -> dict[str, float] | None:
@@ -215,7 +261,12 @@ def _render_tools_sidebar(default_retrieval_mode: str) -> str:
         if st.button("Estimate dosage"):
             start = time.perf_counter()
             result = calculate_dosage(water_bbl_per_day, product_ppm)
-            _record_request(MonitoringOutcome.TOOL_CALCULATED, started_at=start)
+            _record_request(
+                MonitoringOutcome.TOOL_CALCULATED,
+                retrieval_mode=retrieval_mode,
+                tool_route=True,
+                started_at=start,
+            )
             st.info(f"{result.label}: {result.product_gallons_per_day:g} gallons/day")
 
         st.subheader("Water Analysis")
@@ -265,7 +316,13 @@ def run_app() -> None:
     with st.chat_message("assistant"):
         try:
             answer, outcome = _route_prompt_with_outcome(prompt, retrieval_mode)
-            latency_ms = _record_request(outcome, started_at=start)
+            tool_route = bool(_PRODUCT_DOSE_REQUEST.match(prompt))
+            latency_ms = _record_request(
+                outcome,
+                retrieval_mode=retrieval_mode,
+                tool_route=tool_route,
+                started_at=start,
+            )
             st.write(answer.text)
             st.caption(f"Response latency: {latency_ms:.0f} ms")
             if answer.sources:
@@ -276,8 +333,17 @@ def run_app() -> None:
             st.session_state.messages.append(
                 {"role": "assistant", "content": answer.text, "sources": answer.sources}
             )
+            st.session_state.feedback_outcome = outcome.value
+            st.session_state.feedback_retrieval_mode = (
+                RetrievalMode.NOT_APPLICABLE.value if tool_route else retrieval_mode
+            )
+            st.session_state.feedback_recorded = False
         except (RagConfigurationError, ValueError) as error:
-            _record_request(MonitoringOutcome.RAG_CONFIGURATION_ERROR, started_at=start)
+            _record_request(
+                MonitoringOutcome.RAG_CONFIGURATION_ERROR,
+                retrieval_mode=retrieval_mode,
+                started_at=start,
+            )
             safe_message = f"Configuration needed before RAG can run: {error}"
             st.warning(safe_message)
             st.session_state.messages.append(
@@ -287,10 +353,22 @@ def run_app() -> None:
     feedback_cols = st.columns(2)
     with feedback_cols[0]:
         if st.button("Helpful", key=f"helpful-{len(st.session_state.messages)}"):
-            st.toast("Feedback logging starts in Milestone 8.")
+            if not st.session_state.get("feedback_recorded", True):
+                _record_feedback(
+                    FeedbackValue.HELPFUL,
+                    RetrievalMode(st.session_state.feedback_retrieval_mode),
+                )
+                st.session_state.feedback_recorded = True
+                st.toast("Feedback recorded.")
     with feedback_cols[1]:
         if st.button("Needs work", key=f"needs-work-{len(st.session_state.messages)}"):
-            st.toast("Feedback logging starts in Milestone 8.")
+            if not st.session_state.get("feedback_recorded", True):
+                _record_feedback(
+                    FeedbackValue.NEEDS_WORK,
+                    RetrievalMode(st.session_state.feedback_retrieval_mode),
+                )
+                st.session_state.feedback_recorded = True
+                st.toast("Feedback recorded.")
 
 
 if __name__ == "__main__":

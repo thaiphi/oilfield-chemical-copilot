@@ -8,6 +8,7 @@ COPY pyproject.toml uv.lock README.md ./
 COPY app ./app
 COPY db ./db
 COPY ingestion ./ingestion
+COPY monitoring ./monitoring
 COPY src ./src
 COPY data/sample ./data/sample
 
