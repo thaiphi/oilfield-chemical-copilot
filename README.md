@@ -1,6 +1,6 @@
 # Oilfield Chemical Troubleshooting Copilot
 
-LLM Zoomcamp 2026 capstone project for an oilfield production-chemistry troubleshooting RAG assistant. The repository now includes the local data inventory, sample parser/chunker, deterministic/local embedding providers, keyword, vector, and hybrid retrieval, PGVector storage/search, a retrieval evaluator, and a basic source-grounded RAG app needed for Milestones 1 through 4.
+LLM Zoomcamp 2026 capstone project for an oilfield production-chemistry troubleshooting RAG assistant. The repository includes local data inventory, sample parsing/chunking, deterministic/local embedding providers, keyword/vector/hybrid retrieval, PGVector storage/search, retrieval evaluation, a source-grounded RAG app, public-sample orchestration, and privacy-safe local monitoring.
 
 ## Implemented Capabilities
 
@@ -14,13 +14,11 @@ LLM Zoomcamp 2026 capstone project for an oilfield production-chemistry troubles
 - Evaluate keyword, vector, and hybrid retrieval with fixed `k=5`, provenance, and public/private privacy boundaries.
 - Ask questions in a Streamlit RAG app with a claim-scope gate before retrieval. Closed-scope questions return a safe response without retrieval or generation; general-review questions retrieve source chunks, call the configured provider (defaulting to local Ollama), and return cited answers or a weak-evidence fallback.
 
-## Planned Capabilities
+## Deferred Capabilities
 
-- Expose tool-calling helpers for chemical dosage calculations and water-analysis interpretation.
-- Log conversations, feedback, latency, retrieved chunks, and tool calls.
-
-- Orchestrate public-sample ingestion with Kestra: inventory -> parse/chunk -> embed/load -> validate -> publish aggregate metrics.
-- Monitor operational metrics with Grafana-compatible dashboards.
+- Expand narrowly validated tools beyond the existing general product-dose calculator.
+- Add retrieval improvements only when a future evaluation identifies a measured gap.
+- Consider production deployment only after a separate readiness review.
 
 ## Repo Layout
 
@@ -36,7 +34,7 @@ ingestion/apply_migrations.py SQL migration runner for existing databases
 db/migrations/               PostgreSQL + PGVector schema migrations
 eval/                        Retrieval evaluator and public evaluation dataset
 flows/kestra/                Public-sample Kestra ingestion flow
-monitoring/grafana/          Grafana dashboard/provisioning plan
+monitoring/                  Grafana role, datasource, dashboard, and explicit synthetic demo seed
 src/oilfield_chemical_copilot/
   ingest/                    File discovery, parsing, and chunking helpers
   observability/             Logging contracts for conversations and traces
@@ -75,6 +73,41 @@ Then open:
 - Kestra: http://localhost:8080
 - Grafana: http://localhost:3000
 - Postgres: `localhost:5432`
+
+## Capstone Review
+
+The public GitHub-reviewer walkthrough is in
+[docs/CAPSTONE_REVIEWER_GUIDE.md](docs/CAPSTONE_REVIEWER_GUIDE.md). It uses the
+tracked synthetic sample corpus, local Ollama, Docker Compose, Streamlit, and a
+fixed synthetic Grafana demo. The related
+[capstone evidence map](docs/CAPSTONE_EVIDENCE.md) connects each course review
+dimension to tracked code, reports, and an explicit limitation.
+
+## Module 5 Local Monitoring
+
+Module 5 stores only closed, hourly aggregate telemetry: response outcome, retrieval mode, request count, latency count/total/minimum/maximum, feedback value, and feedback count. It never persists prompts, answers, citations, source identifiers, session/user identifiers, tool values, raw errors, free text, or JSON payloads. The existing raw-content telemetry tables remain unused.
+
+Grafana is local-only and has anonymous Viewer access for reviewer convenience. Its database role can read only the two aggregate monitoring tables. It is not an internet-hosted dashboard.
+
+Start the local monitoring stack and add the explicit synthetic demo data:
+
+```powershell
+docker compose up -d --build postgres monitoring-migrate grafana-role-init grafana
+docker compose --profile demo run --rm monitoring-demo-seed
+```
+
+Then open http://localhost:3000. The dashboard starts on its fixed synthetic UTC window and has six panels:
+
+- Request volume by outcome
+- Average response latency by retrieval mode
+- Response latency minimum and maximum
+- Outcome mix
+- Retrieval mode volume
+- Helpful rate and feedback volume
+
+The seed is deterministic and runs only when explicitly invoked. It is reviewer-facing evidence, not production monitoring data. For real local app telemetry, set `MONITORING_PERSISTENCE_ENABLED=true`; use the time picker to inspect the current UTC hours. Stop local services with `docker compose down` when finished.
+
+![Synthetic Grafana dashboard](docs/images/module5-synthetic-monitoring-dashboard.png)
 
 ## Data Modes
 
@@ -345,7 +378,7 @@ The app classifies a recognized tool request before parsing or calculation. Clos
 
 ### Aggregate-Safe Monitoring
 
-Module 1 now includes a process-local aggregate monitor for six closed outcomes: successful and weak-evidence RAG responses, claim-scope abstentions, valid and invalid product-dose routes, and RAG configuration failures. It stores only outcome counts plus count/minimum/average/maximum response latency. The monitor has no event list or payload API and cannot retain prompts, answers, excerpts, source paths, tool inputs, identifiers, or raw error text. It is intentionally in-memory only; it does not write to the existing database logging tables because those tables permit raw content.
+The process-local monitor accepts six closed outcomes: successful and weak-evidence RAG responses, claim-scope abstentions, valid and invalid product-dose routes, and RAG configuration failures. Module 5 adds a persistence adapter that writes only hourly aggregate counts, latency summaries, and closed feedback values to dedicated monitoring tables. The monitor has no event list or payload API and cannot retain prompts, answers, excerpts, source paths, tool inputs, identifiers, or raw error text. Existing raw-content database logging tables remain unused.
 ## LLM Zoomcamp 2026 Mapping
 
 - Introduction and environment: Python project managed with `uv`, `.env.example`, `uv.lock`, and Docker Compose.
@@ -353,7 +386,7 @@ Module 1 now includes a process-local aggregate monitor for six closed outcomes:
 - Vector databases: PGVector migrations create durable chunk and 384-dimensional embedding storage.
 - LLM integration: OpenAI Responses API adapter generates structured drafts for source-grounded answers.
 - Evaluation: `eval/retrieval_eval.py` evaluates keyword, vector, and hybrid retrieval at fixed `k=5` with public/private report boundaries; `eval/answer_eval.py` completes synthetic-answer contract and judge evaluation; `eval/live_rag_answer_eval.py` completed a small public vector-versus-hybrid baseline without an oracle topic filter; `eval/module4_evaluation_pack.py` runs the course-aligned public or sealed-local vector/hybrid evaluation boundary.
-- Monitoring: `monitoring/grafana/README.md` documents the Grafana-compatible dashboard plan.
+- Monitoring: dedicated hourly aggregate tables, Streamlit feedback, least-privilege Grafana provisioning, six dashboard panels, and a fixed synthetic reviewer seed are implemented locally.
 - Orchestration: `flows/kestra/ingest.yml` sketches parse, chunk, embed, and load steps.
 - Capstone deployment: Docker Compose includes app, migration, Postgres/PGVector, Kestra, and Grafana services.
 
@@ -364,14 +397,14 @@ Module 1 now includes a process-local aggregate monitor for six closed outcomes:
 - Retrieval quality: keyword, vector, and hybrid retrieval are implemented with source metadata, test coverage, and a privacy-hardened retrieval evaluator.
 - LLM answer quality: public synthetic deterministic and structured-judge answer evaluation is complete; the live public vector-versus-hybrid baseline is complete; neither evaluation is chemistry validation or production readiness.
 - Tool use: a scope-gated, deterministic product-ppm water-basis dosage calculator is available through the sidebar and an explicit chat contract; water-analysis tooling remains deferred.
-- Monitoring: aggregate-safe, process-local response and routing signals are implemented; raw-content database logging remains unused by the runtime.
+- Monitoring: aggregate-safe response/feedback persistence, a six-panel local Grafana dashboard, and synthetic reviewer evidence are implemented; raw-content database logging remains unused by the runtime.
 - Reproducibility: `pyproject.toml`, `uv.lock`, `.env.example`, Dockerfile, and Docker Compose are included.
 
 ## Next Implementation Steps
 
-### Immediate Quality Task
+### Current Capstone State
 
-- Review the completed Module 1 boundary as a whole: claim-scope abstention, citation selection, deterministic dosage routing, and aggregate-safe monitoring. Do not add persistence or dashboards until a separate data-retention design is approved.
+- Modules 1 through 5 and Module 7 are locked. The public reviewer guide and local dashboard provide the reproducible capstone review path. Future capability work, including private-corpus onboarding, reranking, query rewriting, hosted deployment, or alerting, requires a separate approved scope.
 
 ### Later Deferred Branch
 

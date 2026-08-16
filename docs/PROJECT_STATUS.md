@@ -1,7 +1,7 @@
 # Project Status
 
 **Project:** Oilfield Chemical Troubleshooting Copilot<br>
-**Last updated:** 2026-08-14
+**Last updated:** 2026-08-15
 
 ## Completed Milestones
 
@@ -27,6 +27,8 @@
 20. **Module 4 public dual evaluation**: the active vector and hybrid RAG boundaries completed against the committed public answer pack with the claim-scope policy enabled. Across six answerable cases, vector recorded Hit Rate@5/MRR@5 `1.000/1.000`, citation `9/3`, and abstention `12/0`; hybrid recorded `1.000/0.917`, citation `10/2`, and abstention `10/2`. This public measurement demonstrates that successful retrieval does not alone prove correct citation or abstention behavior. It does not establish chemistry correctness, operational safety, private-corpus quality, or a mode winner.
 21. **Module 4 sealed local evaluation attempt**: the approved 12-case handout fixture was sealed and its one-shot state was consumed before RAG initialization. Runtime evaluation returned the fixed `RUNTIME_UNAVAILABLE` category, so an aggregate-only `unavailable` report with zero metrics was recorded. No score was produced, no fixture values entered durable project material, and the sealed hash will not be replayed. The sanitized category does not retain enough information to diagnose the underlying generation failure retrospectively.
 22. **Module 4 sealed local v2 evaluation**: after a separate non-scoring synthetic runtime smoke check succeeded, a fresh non-overlapping 12-case fixture was sealed and scored once. Across six answerable cases, vector recorded Hit Rate@5/MRR@5 `0.500/0.500`, citation `7/5`, and abstention `8/4`; hybrid recorded `0.833/0.722`, citation `8/4`, and abstention `10/2`. Hybrid performed better on all recorded aggregates, but neither mode is ready for operational use. The v2 fixture, detailed statuses, and one-shot state remain private and will not be replayed.
+23. **Module 5 privacy-safe local monitoring**: locked on 2026-08-16 after the live dashboard and teaching review. Streamlit records only closed hourly outcome, retrieval-mode, latency, and aggregate-feedback metrics. Dedicated migrations, a least-privilege Grafana reader role, a six-panel locally bound dashboard with panel information descriptions, and an explicit fixed synthetic seed were verified end-to-end. No raw question, answer, citation, source, identifier, credential, or private material entered the durable evidence.
+24. **Module 7 capstone reviewer package**: locked on 2026-08-16 after Module 5 approval. The public reviewer guide, rubric evidence map, and documentation contract are complete. The tracked sample path parsed/indexed 11 chunks with local Granite embeddings; Streamlit and Grafana returned HTTP 200; the explicit synthetic seed completed; and full verification passed 579 Python tests, 22 workflow-contract tests, and Ruff. The aggregate-only report records the additive demo-seed boundary. The package is local and reproducible, not hosted or production-ready.
 
 ## Learning Progress
 
@@ -34,13 +36,13 @@
 - **Module 2: Vector Search** - locked on 2026-08-15. The teaching review covered embedding-model coordinate systems, semantic ranking, topic filtering, and PGVector storage. Focused public checks passed 35 tests; the count-only live Granite-to-PGVector smoke check returned one result under the `scale` topic filter.
 - **Module 3: Orchestration** - locked on 2026-08-15. The practical teaching review covered task boundaries, artifact handoff, independent count validation, and aggregate-only dlt publication.
 - **Module 4: Evaluation** - locked on 2026-08-15. Public and fresh sealed-local v2 evaluation are complete, and the teaching review connects their different results to ground truth, Hit Rate@5, MRR@5, citations, and abstention. Any RAG change needs a separate approved experiment and a fresh fixture.
-- **Module 5: Monitoring** - scaffold only; the aggregate in-memory collector is not the complete monitoring module.
+- **Module 5: Monitoring** - locked on 2026-08-16. The teaching review covered outcome versus feedback, latency, privacy-safe hourly aggregation, Grafana's read-only role, synthetic telemetry, and local reviewer traffic.
 - **Module 6: Best Practices** - hybrid RRF is implemented early; reranking and query rewriting remain deferred.
-- **Module 7: End-to-End Project** - scaffold only.
+- **Module 7: End-to-End Project** - locked on 2026-08-16. The public reviewer package and live local path are verified with Module 5 as the dashboard/monitoring component.
 
 ## Later Milestones
 
-- Online monitoring
+- Alerting and production monitoring operations
 - Orchestration
 - Tool validation
 - Capstone readiness
@@ -49,7 +51,7 @@ The completed baselines, diagnosis, and policy boundary do not select a retrieva
 
 ## Immediate Next Task
 
-Begin Module 5 monitoring work. Use the Module 4 local hybrid result to define future evaluation hypotheses, not to alter RAG without a separate approved experiment.
+Audit the locked Module 5 and Module 7 changes, then create intentional commits. Future capability work requires a separate approved scope.
 
 ## Course Alignment
 

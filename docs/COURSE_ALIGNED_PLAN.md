@@ -2,7 +2,7 @@
 
 **Project:** Oilfield Chemical Troubleshooting Copilot<br>
 **Status:** Detailed milestone ledger; module-level curriculum status is in `LEARNING_ROADMAP.md`<br>
-**Last updated:** 2026-08-10
+**Last updated:** 2026-08-15
 
 This sequence aligns the project to the course while applying a project-specific quality gate. Official course ordering includes function calling earlier, but this project evaluates the already built baseline before expanding capability.
 
@@ -21,8 +21,9 @@ For the learning sequence, use [LEARNING_ROADMAP.md](LEARNING_ROADMAP.md). Its o
 | Tool calling — complete | Add narrowly scoped, validated tool use after approval. | Deterministic product-ppm water-basis calculator with explicit chat routing and scope-first validation. | Formula, invalid-input, restricted-metadata, routing, zero-call closed-scope, RAG-fallback, full Python, lint, and workflow-contract tests passed. | The calculator accepts only the approved labeled inputs; audit metadata excludes question and source content. |
 | Module 4 dual evaluation — locked | Measure the active RAG boundary with transparent public evidence and a separate sealed local handout score. | Aggregate-only public and local vector/hybrid reports. | Locked on 2026-08-15. The public pack recorded vector Hit Rate@5/MRR@5 `1.000/1.000` and hybrid `1.000/0.917`; fresh local v2 recorded vector `0.500/0.500` and hybrid `0.833/0.722`; answer-boundary failures remain in both modes. | Public output is aggregate-only; local handout cases, mappings, details, approval, and one-shot state stay under `.private`. The original failed hash and v2 hash are never replayed. |
 | Monitoring — Module 1 boundary complete | Define a minimal quality and safety signal boundary before persistent operations work. | Process-local aggregate counts for six closed outcomes plus latency count/minimum/average/maximum. | Unit and route tests prove monitoring accepts only closed outcomes and finite latency; full Python and lint verification required. | No prompt, answer, excerpt, source path, tool input, identifier, or raw error is retained; raw-content database tables are unused. |
+| Module 5 local monitoring — locked | Persist privacy-safe aggregate metrics, collect closed feedback, and make six dashboard panels reproducible for a GitHub reviewer. | Hourly aggregate tables, Streamlit instrumentation, aggregate feedback, least-privilege Grafana datasource, tracked six-panel dashboard with information descriptions, explicit synthetic seed, and a local screenshot. | Locked on 2026-08-16 after live dashboard review and teaching review. Final Python suite passed 579 tests with 2 expected integration skips; workflow contracts passed 22 checks; focused Grafana provisioning passed 8 tests; Ruff, Compose validation, and whitespace checks passed. | No prompt, answer, citation, source metadata, identifier, tool value, raw error, free text, or JSON is persisted. Grafana is localhost-only and reads only the two aggregate monitoring tables. |
 | Orchestration | Coordinate retrieval, generation, tools, and safeguards predictably. | Documented orchestration flow with bounded responsibilities. | Scenario-based validation of routing, fallbacks, and safety boundaries. | Preserve least-privilege data flow; do not log source content, local paths, or credentials. |
-| Capstone readiness | Demonstrate that the project meets its defined completion standard. | Readiness checklist and evidence package. | All preceding acceptance criteria reviewed and approved; readiness decision recorded. | Share only sanitized evidence and aggregate results. |
+| Capstone readiness — locked | Demonstrate that the project meets its defined completion standard. | Public reviewer guide, rubric evidence map, and privacy-safe readiness report. | Locked on 2026-08-16 after Module 5 approval. Public 11-chunk Granite indexing, local Streamlit/Grafana health, fixed demo seed, documentation contract, full tests, workflow tests, lint, and Git audit passed. | Share only sanitized evidence and aggregate results; use only the tracked public sample in the reviewer path. |
 
 ## Current State and Gate
 
@@ -44,7 +45,9 @@ These are bounded safety, routing, and citation-structure results. They do not e
 
 The approved tool boundary is complete. It accepts only explicit product-ppm water-basis requests, calculates product gallons per day with the `42 gal/bbl` conversion, and applies the existing claim-scope gate before tool parsing. Closed requests invoke neither the calculator nor RAG; unrecognized requests follow the normal RAG path. This is an auditable general calculation, not a field-ready treatment recommendation.
 
-The Module 1 monitoring boundary is complete. Persistent telemetry, dashboards, and retention policy are deferred until their own data-handling design is approved.
+The Module 1 monitoring boundary is complete, and the Module 5 implementation now extends it with privacy-safe hourly persistence and a local synthetic Grafana reviewer path. It is not hosted monitoring, alerting, production evidence, or a retention policy for raw application data.
+
+The Module 7 reviewer package maps the course rubric to the committed public sample, code, tests, and aggregate reports. It preserves the measured-gap policy: hybrid RRF is available, while reranking and query rewriting remain excluded until a separate experiment identifies a retrieval problem they can address.
 
 ## Improvement Policy
 
