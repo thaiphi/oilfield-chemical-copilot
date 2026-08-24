@@ -34,7 +34,7 @@
 - Produces: `CorpusReconciliationError`, `DriveFileRecord`, `LocalFileRecord`, `IndexSourceRecord`, `IndexLocatorRecord`, `ReconciliationStore`, and `require_private_reconciliation_root(path: Path, expected_root: Path) -> Path`.
 - Consumes: Python standard-library `sqlite3`, `dataclasses`, `Path`, and strict JSON-compatible mappings.
 
-- [ ] **Step 1: Write failing tests for strict records, private paths, schema creation, and resumable runs**
+- [x] **Step 1: Write failing tests for strict records, private paths, schema creation, and resumable runs**
 
 ```python
 def test_store_resumes_same_contract_bound_run(tmp_path: Path) -> None:
@@ -54,13 +54,13 @@ def test_store_resumes_same_contract_bound_run(tmp_path: Path) -> None:
 
 Also test unsupported schema versions, booleans where integers are required, unknown mapping keys, conflicting unfinished runs for the same contract pair, `PRAGMA foreign_keys=ON`, `journal_mode=WAL`, and rejection of paths outside the exact expected private root.
 
-- [ ] **Step 2: Run the focused tests and verify RED**
+- [x] **Step 2: Run the focused tests and verify RED**
 
 Run: `uv run pytest -q tests/evaluation/test_corpus_reconciliation.py`
 
 Expected: collection or import failure because `corpus_reconciliation` does not exist.
 
-- [ ] **Step 3: Implement strict records and `ReconciliationStore`**
+- [x] **Step 3: Implement strict records and `ReconciliationStore`**
 
 Use this public surface:
 
@@ -77,13 +77,13 @@ class ReconciliationStore:
 
 Create normalized tables `runs`, `checkpoints`, `drive_files`, `local_files`, `index_sources`, `index_locators`, `document_matches`, and `review_decisions` with foreign keys and uniqueness constraints from the spec. Use `INSERT ... ON CONFLICT DO UPDATE` only where the immutable identity fields are unchanged; otherwise raise a closed conflict code.
 
-- [ ] **Step 4: Run focused tests and Ruff**
+- [x] **Step 4: Run focused tests and Ruff**
 
 Run: `uv run pytest -q tests/evaluation/test_corpus_reconciliation.py`
 
 Run: `uv run ruff check src/oilfield_chemical_copilot/evaluation/corpus_reconciliation.py tests/evaluation/test_corpus_reconciliation.py`
 
-- [ ] **Step 5: Commit Task 1**
+- [x] **Step 5: Commit Task 1**
 
 ```powershell
 git add -- src/oilfield_chemical_copilot/evaluation/corpus_reconciliation.py tests/evaluation/test_corpus_reconciliation.py
@@ -359,4 +359,3 @@ Verify the private root is ignored, `git ls-files .private` is empty, no private
 git add -- docs/superpowers/plans/2026-08-19-e1a4-requirements-aware-evidence-gate.md docs/CURRICULUM_REMEDIATION_BACKLOG.md
 git commit -m "docs: record private corpus reconciliation gate"
 ```
-
