@@ -9,12 +9,21 @@ from pathlib import Path, PurePosixPath
 import sqlite3
 from typing import Iterable, Mapping
 
+from oilfield_chemical_copilot.evaluation.e1a3_sampling import (
+    E1A3SamplingError,
+    E1A3SlotAllocation,
+    E1A3SourceMetadata,
+    allocate_sampling_slots,
+    build_sampling_slots,
+)
+
 
 SCHEMA_VERSION = 1
 RUN_STATUSES = frozenset({"IN_PROGRESS", "BLOCKED", "COMPLETE", "INVALID"})
 CHECKPOINT_STATUSES = frozenset({"NOT_STARTED", "IN_PROGRESS", "COMPLETE", "BLOCKED"})
 TOPICS = frozenset({"iron_sulfide", "scale", "corrosion", "paraffin"})
 SOURCE_ROLES = frozenset({"foundational", "supporting"})
+SUBSTANTIVE_STATUSES = frozenset({"SUBSTANTIVE", "TITLE_ONLY", "INELIGIBLE"})
 
 
 class CorpusReconciliationError(RuntimeError):
@@ -306,14 +315,19 @@ class IndexLocatorRecord:
         )
         topic = _string(mapping["topic"], code)
         source_role = _string(mapping["source_role"], code)
-        if topic not in TOPICS or source_role not in SOURCE_ROLES:
+        substantive_status = _string(mapping["substantive_status"], code)
+        if (
+            topic not in TOPICS
+            or source_role not in SOURCE_ROLES
+            or substantive_status not in SUBSTANTIVE_STATUSES
+        ):
             _fail(code)
         return cls(
             source_id=_string(mapping["source_id"], code),
             locator=_string(mapping["locator"], code),
             topic=topic,
             source_role=source_role,
-            substantive_status=_string(mapping["substantive_status"], code),
+            substantive_status=substantive_status,
         )
 
     def to_mapping(self) -> dict[str, object]:
@@ -352,6 +366,41 @@ class MatchSummary:
     index_only: int
     ambiguous_review_required: int
     ineligible: int
+
+
+@dataclass(frozen=True)
+class CapacityStratum:
+    topic: str
+    source_role: str
+    fresh_locator_count: int
+    required_locators: int
+    sufficient: bool
+
+
+@dataclass(frozen=True)
+class CapacityReport:
+    strata: tuple[CapacityStratum, ...]
+    all_sufficient: bool
+
+    def to_public_mapping(self) -> dict[str, object]:
+        return {
+            "all_sufficient": self.all_sufficient,
+            "strata": [
+                {
+                    "topic": item.topic,
+                    "source_role": item.source_role,
+                    "sufficient": item.sufficient,
+                }
+                for item in self.strata
+            ],
+        }
+
+
+@dataclass(frozen=True)
+class DryRunResult:
+    status: str
+    error_code: str | None
+    allocations: tuple[E1A3SlotAllocation, ...]
 
 
 class ReconciliationStore:
@@ -440,6 +489,7 @@ class ReconciliationStore:
                 source_role text not null,
                 substantive_status text not null,
                 e1a3_used integer not null default 0,
+                e1a4_available integer not null default 0,
                 primary key(run_id, source_id, locator),
                 foreign key(run_id, source_id) references index_sources(run_id, source_id)
             );
@@ -1369,4 +1419,245 @@ def reconcile_document_matches(*, store: ReconciliationStore) -> MatchSummary:
         index_only=counts["INDEX_ONLY"],
         ambiguous_review_required=counts["AMBIGUOUS_REVIEW_REQUIRED"],
         ineligible=counts["INELIGIBLE"],
+    )
+
+
+def _locator_inventory_rows(store: ReconciliationStore) -> tuple[sqlite3.Row, ...]:
+    return tuple(
+        store._connection.execute(
+            """
+            select locator.source_id, locator.locator, locator.topic,
+                   locator.source_role, locator.substantive_status,
+                   source.parser_type
+            from index_locators as locator
+            join index_sources as source
+              on source.run_id = locator.run_id and source.source_id = locator.source_id
+            where locator.run_id = ?
+            order by locator.source_id, locator.locator, locator.topic,
+                     locator.source_role
+            """,
+            (store.run_id,),
+        ).fetchall()
+    )
+
+
+def _validated_prior_locator_keys(
+    prior_locator_keys: Iterable[str], *, inventory_keys: set[str]
+) -> frozenset[str]:
+    values = tuple(
+        _string(key, "CORPUS_RECONCILIATION_PRIOR_LOCATOR_INVALID")
+        for key in prior_locator_keys
+    )
+    if len(values) != len(set(values)):
+        _fail("CORPUS_RECONCILIATION_PRIOR_LOCATOR_INVALID")
+    prior = frozenset(values)
+    if not prior.issubset(inventory_keys):
+        _fail("CORPUS_RECONCILIATION_PRIOR_LOCATOR_MISSING")
+    return prior
+
+
+def _calculate_locator_capacity(
+    *, store: ReconciliationStore, prior_locator_keys: Iterable[str]
+) -> CapacityReport:
+    """Count fresh substantive locators in all eight E1a-4 strata."""
+    _require_complete_checkpoint(store, "index_inventory")
+    rows = _locator_inventory_rows(store)
+    inventory_keys = {f"{row['source_id']}:{row['locator']}" for row in rows}
+    prior = _validated_prior_locator_keys(
+        prior_locator_keys, inventory_keys=inventory_keys
+    )
+    counts = {
+        (topic, role): 0
+        for topic in ("iron_sulfide", "scale", "corrosion", "paraffin")
+        for role in ("foundational", "supporting")
+    }
+    available_keys: list[tuple[str, str]] = []
+    for row in rows:
+        locator = IndexLocatorRecord.from_mapping(
+            {
+                "source_id": row["source_id"],
+                "locator": row["locator"],
+                "topic": row["topic"],
+                "source_role": row["source_role"],
+                "substantive_status": row["substantive_status"],
+            }
+        )
+        locator_key = f"{locator.source_id}:{locator.locator}"
+        if locator.substantive_status != "SUBSTANTIVE" or locator_key in prior:
+            continue
+        counts[(locator.topic, locator.source_role)] += 1
+        available_keys.append((locator.source_id, locator.locator))
+
+    strata = tuple(
+        CapacityStratum(
+            topic=topic,
+            source_role=role,
+            fresh_locator_count=counts[(topic, role)],
+            required_locators=12,
+            sufficient=counts[(topic, role)] >= 12,
+        )
+        for topic in ("iron_sulfide", "scale", "corrosion", "paraffin")
+        for role in ("foundational", "supporting")
+    )
+    with store._connection:
+        store._connection.execute(
+            """
+            update index_locators
+            set e1a3_used = 0, e1a4_available = 0
+            where run_id = ?
+            """,
+            (store.run_id,),
+        )
+        for row in rows:
+            locator_key = f"{row['source_id']}:{row['locator']}"
+            if locator_key in prior:
+                store._connection.execute(
+                    """
+                    update index_locators set e1a3_used = 1
+                    where run_id = ? and source_id = ? and locator = ?
+                    """,
+                    (store.run_id, row["source_id"], row["locator"]),
+                )
+        store._connection.executemany(
+            """
+            update index_locators set e1a4_available = 1
+            where run_id = ? and source_id = ? and locator = ?
+            """,
+            (
+                (store.run_id, source_id, locator)
+                for source_id, locator in available_keys
+            ),
+        )
+        store._connection.execute(
+            """
+            insert into checkpoints(
+                run_id, stage, status, committed_records, error_code
+            ) values (?, 'locator_capacity', 'COMPLETE', ?, null)
+            on conflict(run_id, stage) do update set
+                status = 'COMPLETE',
+                committed_records = excluded.committed_records,
+                error_code = null,
+                updated_at = current_timestamp
+            """,
+            (store.run_id, len(available_keys)),
+        )
+    return CapacityReport(
+        strata=strata,
+        all_sufficient=all(item.sufficient for item in strata),
+    )
+
+
+def calculate_locator_capacity(
+    *, store: ReconciliationStore, prior_locator_keys: Iterable[str]
+) -> CapacityReport:
+    """Fail closed around the private capacity state boundary."""
+    try:
+        return _calculate_locator_capacity(
+            store=store, prior_locator_keys=prior_locator_keys
+        )
+    except CorpusReconciliationError:
+        raise
+    except sqlite3.Error as error:
+        code = "CORPUS_RECONCILIATION_CAPACITY_FAILED"
+        _block_stage(
+            store,
+            stage="locator_capacity",
+            table="index_locators",
+            error_code=code,
+        )
+        raise CorpusReconciliationError(code) from error
+
+
+def _available_sampling_sources(
+    *, rows: tuple[sqlite3.Row, ...], prior: frozenset[str]
+) -> tuple[E1A3SourceMetadata, ...]:
+    grouped: dict[tuple[str, str, str, str], list[str]] = {}
+    for row in rows:
+        locator = IndexLocatorRecord.from_mapping(
+            {
+                "source_id": row["source_id"],
+                "locator": row["locator"],
+                "topic": row["topic"],
+                "source_role": row["source_role"],
+                "substantive_status": row["substantive_status"],
+            }
+        )
+        locator_key = f"{locator.source_id}:{locator.locator}"
+        if locator.substantive_status != "SUBSTANTIVE" or locator_key in prior:
+            continue
+        grouped.setdefault(
+            (
+                locator.source_id,
+                locator.topic,
+                locator.source_role,
+                str(row["parser_type"]),
+            ),
+            [],
+        ).append(locator.locator)
+    return tuple(
+        E1A3SourceMetadata(
+            source_id=source_id,
+            topic=topic,  # type: ignore[arg-type]
+            source_role=source_role,  # type: ignore[arg-type]
+            parser_type=parser_type,
+            locators=tuple(sorted(locators)),
+            eligibility_status="eligible",
+        )
+        for (source_id, topic, source_role, parser_type), locators in sorted(
+            grouped.items()
+        )
+    )
+
+
+def dry_run_e1a4_allocation(
+    *, store: ReconciliationStore, prior_locator_keys: Iterable[str]
+) -> DryRunResult:
+    """Run the existing deterministic 96-slot allocator without publishing files."""
+    prior_values = tuple(prior_locator_keys)
+    report = calculate_locator_capacity(
+        store=store, prior_locator_keys=prior_values
+    )
+    if not report.all_sufficient:
+        error_code = "CORPUS_RECONCILIATION_E1A4_ALLOCATION_UNAVAILABLE"
+        store.set_checkpoint(
+            stage="e1a4_dry_run",
+            status="BLOCKED",
+            committed_records=0,
+            error_code=error_code,
+        )
+        return DryRunResult(
+            status="BLOCKED", error_code=error_code, allocations=()
+        )
+    rows = _locator_inventory_rows(store)
+    inventory_keys = {f"{row['source_id']}:{row['locator']}" for row in rows}
+    prior = _validated_prior_locator_keys(
+        prior_values, inventory_keys=inventory_keys
+    )
+    sources = _available_sampling_sources(rows=rows, prior=prior)
+    try:
+        allocations = allocate_sampling_slots(
+            slots=build_sampling_slots(), sources=sources
+        )
+    except E1A3SamplingError:
+        error_code = "CORPUS_RECONCILIATION_E1A4_ALLOCATION_UNAVAILABLE"
+        store.set_checkpoint(
+            stage="e1a4_dry_run",
+            status="BLOCKED",
+            committed_records=0,
+            error_code=error_code,
+        )
+        return DryRunResult(
+            status="BLOCKED", error_code=error_code, allocations=()
+        )
+    if len(allocations) != 96 or len(
+        {(item.source_id, item.locator) for item in allocations}
+    ) != 96:
+        _fail("CORPUS_RECONCILIATION_E1A4_DRY_RUN_INVALID")
+    store.set_checkpoint(
+        stage="e1a4_dry_run",
+        status="COMPLETE",
+        committed_records=96,
+    )
+    return DryRunResult(
+        status="COMPLETE", error_code=None, allocations=allocations
     )

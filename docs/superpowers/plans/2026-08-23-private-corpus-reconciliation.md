@@ -188,7 +188,7 @@ git commit -m "feat: reconcile exact corpus identities"
 - Consumes: `IndexLocatorRecord`, the verified E1a-3 allocation locator set, and existing `build_sampling_slots()` / `allocate_sampling_slots()`.
 - Produces: `calculate_locator_capacity(store, prior_locator_keys) -> CapacityReport` and `dry_run_e1a4_allocation(store, prior_locator_keys) -> DryRunResult`.
 
-- [ ] **Step 1: Write failing tests for eight-stratum coverage and exact allocation**
+- [x] **Step 1: Write failing tests for eight-stratum coverage and exact allocation**
 
 ```python
 def test_capacity_requires_twelve_fresh_locators_in_every_topic_role_cell(store: ReconciliationStore) -> None:
@@ -199,21 +199,21 @@ def test_capacity_requires_twelve_fresh_locators_in_every_topic_role_cell(store:
 
 Add tests for exact E1a-3 source/locator exclusion, locator-level topic overrides, title-only exclusion, duplicate locator rejection, one unavailable stratum, exact 96-slot success, and no sampling-frame writes.
 
-- [ ] **Step 2: Run capacity tests and verify RED**
+- [x] **Step 2: Run capacity tests and verify RED**
 
 Run: `uv run pytest -q tests/evaluation/test_corpus_reconciliation.py -k "capacity or locator or dry_run"`
 
-- [ ] **Step 3: Implement capacity and dry-run functions**
+- [x] **Step 3: Implement capacity and dry-run functions**
 
 Return private per-stratum counts in `CapacityReport`, but expose only `sufficient: bool` per public stratum through public serialization. Reuse the existing deterministic allocator without changing its ordering or eligibility rules.
 
-- [ ] **Step 4: Run focused tests and Ruff**
+- [x] **Step 4: Run focused tests and Ruff**
 
 Run: `uv run pytest -q tests/evaluation/test_corpus_reconciliation.py`
 
 Run: `uv run ruff check src/oilfield_chemical_copilot/evaluation/corpus_reconciliation.py tests/evaluation/test_corpus_reconciliation.py`
 
-- [ ] **Step 5: Commit Task 4**
+- [x] **Step 5: Commit Task 4**
 
 ```powershell
 git add -- src/oilfield_chemical_copilot/evaluation/corpus_reconciliation.py tests/evaluation/test_corpus_reconciliation.py

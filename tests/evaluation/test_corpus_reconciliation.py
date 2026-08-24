@@ -744,3 +744,221 @@ def test_ingestion_content_sha_binds_renamed_local_to_index(tmp_path: Path) -> N
     assert summary.local_only == 1
     assert summary.index_only == 0
     store.close()
+
+
+def _capacity_inventory(*, title_only_key: str | None = None):
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        IndexLocatorRecord,
+        IndexSourceRecord,
+    )
+
+    topics = ("iron_sulfide", "scale", "corrosion", "paraffin")
+    roles = ("foundational", "supporting")
+    sources = []
+    locators = []
+    for topic in topics:
+        for role in roles:
+            source_id = f"source-{topic}-{role}"
+            sources.append(
+                IndexSourceRecord.from_mapping(
+                    {
+                        "source_id": source_id,
+                        "source_path": f"approved/{source_id}.pdf",
+                        "parser_type": "pdf",
+                        "topic": topic,
+                        "chunk_count": 12,
+                        "embedding_model": "model",
+                        "index_contract_sha256": "a" * 64,
+                        "provenance_drive_file_id": None,
+                        "content_sha256": None,
+                    }
+                )
+            )
+            for index in range(1, 13):
+                locator = f"page:{index:02d}"
+                locator_key = f"{source_id}:{locator}"
+                locators.append(
+                    IndexLocatorRecord.from_mapping(
+                        {
+                            "source_id": source_id,
+                            "locator": locator,
+                            "topic": topic,
+                            "source_role": role,
+                            "substantive_status": (
+                                "TITLE_ONLY"
+                                if locator_key == title_only_key
+                                else "SUBSTANTIVE"
+                            ),
+                        }
+                    )
+                )
+    return tuple(sources), tuple(locators)
+
+
+def _store_with_capacity_inventory(
+    tmp_path: Path, *, title_only_key: str | None = None
+):
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        import_index_inventory,
+    )
+
+    store = _create_store(tmp_path)
+    sources, locators = _capacity_inventory(title_only_key=title_only_key)
+    import_index_inventory(
+        store=store,
+        sources=sources,
+        locators=locators,
+        expected_source_count=8,
+        expected_chunk_count=96,
+    )
+    return store
+
+
+def test_capacity_requires_twelve_fresh_locators_in_every_topic_role_cell(
+    tmp_path: Path,
+) -> None:
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        calculate_locator_capacity,
+    )
+
+    store = _store_with_capacity_inventory(tmp_path)
+
+    report = calculate_locator_capacity(store=store, prior_locator_keys=())
+
+    assert len(report.strata) == 8
+    assert all(item.required_locators == 12 for item in report.strata)
+    assert all(item.fresh_locator_count == 12 for item in report.strata)
+    assert report.all_sufficient is True
+    assert all("fresh_locator_count" not in item for item in report.to_public_mapping()["strata"])
+    store.close()
+
+
+def test_capacity_excludes_exact_prior_e1a3_locator_key(tmp_path: Path) -> None:
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        calculate_locator_capacity,
+    )
+
+    store = _store_with_capacity_inventory(tmp_path)
+    prior_key = "source-scale-supporting:page:01"
+
+    report = calculate_locator_capacity(
+        store=store, prior_locator_keys=(prior_key,)
+    )
+    target = next(
+        item
+        for item in report.strata
+        if item.topic == "scale" and item.source_role == "supporting"
+    )
+
+    assert target.fresh_locator_count == 11
+    assert target.sufficient is False
+    assert report.all_sufficient is False
+    store.close()
+
+
+def test_capacity_excludes_title_only_locator(tmp_path: Path) -> None:
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        calculate_locator_capacity,
+    )
+
+    title_only_key = "source-corrosion-foundational:page:12"
+    store = _store_with_capacity_inventory(
+        tmp_path, title_only_key=title_only_key
+    )
+
+    report = calculate_locator_capacity(store=store, prior_locator_keys=())
+    target = next(
+        item
+        for item in report.strata
+        if item.topic == "corrosion" and item.source_role == "foundational"
+    )
+
+    assert target.fresh_locator_count == 11
+    assert target.sufficient is False
+    store.close()
+
+
+def test_capacity_uses_locator_level_topic_assignment(tmp_path: Path) -> None:
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        IndexLocatorRecord,
+        calculate_locator_capacity,
+        import_index_inventory,
+    )
+
+    store = _create_store(tmp_path)
+    sources, locators = _capacity_inventory()
+    changed = tuple(
+        IndexLocatorRecord(
+            source_id=locator.source_id,
+            locator=locator.locator,
+            topic=(
+                "corrosion"
+                if locator.source_id == "source-scale-supporting"
+                and locator.locator == "page:12"
+                else locator.topic
+            ),
+            source_role=locator.source_role,
+            substantive_status=locator.substantive_status,
+        )
+        for locator in locators
+    )
+    import_index_inventory(
+        store=store,
+        sources=sources,
+        locators=changed,
+        expected_source_count=8,
+        expected_chunk_count=96,
+    )
+
+    report = calculate_locator_capacity(store=store, prior_locator_keys=())
+    scale = next(
+        item
+        for item in report.strata
+        if item.topic == "scale" and item.source_role == "supporting"
+    )
+    corrosion = next(
+        item
+        for item in report.strata
+        if item.topic == "corrosion" and item.source_role == "supporting"
+    )
+
+    assert scale.fresh_locator_count == 11
+    assert corrosion.fresh_locator_count == 13
+    store.close()
+
+
+def test_dry_run_produces_exact_96_slots_without_sampling_frame_write(
+    tmp_path: Path,
+) -> None:
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        dry_run_e1a4_allocation,
+    )
+
+    store = _store_with_capacity_inventory(tmp_path)
+
+    result = dry_run_e1a4_allocation(store=store, prior_locator_keys=())
+
+    assert result.status == "COMPLETE"
+    assert result.error_code is None
+    assert len(result.allocations) == 96
+    assert len({(item.source_id, item.locator) for item in result.allocations}) == 96
+    assert not list(store.root.rglob("*sampling-frame*"))
+    store.close()
+
+
+def test_dry_run_fails_closed_when_one_stratum_is_unavailable(tmp_path: Path) -> None:
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        dry_run_e1a4_allocation,
+    )
+
+    store = _store_with_capacity_inventory(tmp_path)
+
+    result = dry_run_e1a4_allocation(
+        store=store,
+        prior_locator_keys=("source-paraffin-supporting:page:01",),
+    )
+
+    assert result.status == "BLOCKED"
+    assert result.error_code == "CORPUS_RECONCILIATION_E1A4_ALLOCATION_UNAVAILABLE"
+    assert result.allocations == ()
+    store.close()
