@@ -100,7 +100,7 @@ git commit -m "feat: add resumable corpus reconciliation state"
 - Consumes: Task 1 records and `ReconciliationStore`.
 - Produces: `import_drive_page(store, records, next_page_token)`, `inventory_local_files(store, roots)`, `import_index_inventory(store, sources, locators)`, and aggregate `StageResult`.
 
-- [ ] **Step 1: Write failing tests for page commits, expired-token rescan, local hashing, index conflicts, and simulated disconnect recovery**
+- [x] **Step 1: Write failing tests for page commits, expired-token rescan, local hashing, index conflicts, and simulated disconnect recovery**
 
 ```python
 def test_drive_rescan_upserts_stable_ids_without_duplication(store: ReconciliationStore) -> None:
@@ -113,23 +113,23 @@ def test_drive_rescan_upserts_stable_ids_without_duplication(store: Reconciliati
 
 Simulate failure after one committed page, reopen the store, import the next page, and prove the first page remains. Verify local SHA-256 without storing bytes, exact index-contract binding, duplicate locator rejection, and no raw exception text in checkpoint errors.
 
-- [ ] **Step 2: Run the new tests and verify RED**
+- [x] **Step 2: Run the new tests and verify RED**
 
 Run: `uv run pytest -q tests/evaluation/test_corpus_reconciliation.py -k "drive or local or index or restart"`
 
 Expected: failures because the import functions do not exist.
 
-- [ ] **Step 3: Implement idempotent import functions**
+- [x] **Step 3: Implement idempotent import functions**
 
 Commit every Drive page and bounded local/index batch independently. Treat provider page tokens as hints. Normalize paths and locators before identity comparison. Calculate local SHA-256 in streaming blocks. Accept pre-existing parser metadata as input; do not invoke parsers.
 
-- [ ] **Step 4: Run focused tests and Ruff**
+- [x] **Step 4: Run focused tests and Ruff**
 
 Run: `uv run pytest -q tests/evaluation/test_corpus_reconciliation.py`
 
 Run: `uv run ruff check src/oilfield_chemical_copilot/evaluation/corpus_reconciliation.py tests/evaluation/test_corpus_reconciliation.py`
 
-- [ ] **Step 5: Commit Task 2**
+- [x] **Step 5: Commit Task 2**
 
 ```powershell
 git add -- src/oilfield_chemical_copilot/evaluation/corpus_reconciliation.py tests/evaluation/test_corpus_reconciliation.py

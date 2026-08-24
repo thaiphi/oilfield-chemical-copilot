@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -69,7 +70,7 @@ def test_local_and_index_records_are_metadata_only() -> None:
     source = IndexSourceRecord.from_mapping(
         {
             "source_id": "approved/private.pdf",
-            "source_path": "approved/private.pdf",
+            "source_path": " approved\\private.pdf ",
             "parser_type": "pdf",
             "topic": "scale",
             "chunk_count": 2,
@@ -88,6 +89,7 @@ def test_local_and_index_records_are_metadata_only() -> None:
     )
 
     assert local.page_or_sheet_count == 2
+    assert source.source_path == "approved/private.pdf"
     assert locator.source_role == "supporting"
     with pytest.raises(CorpusReconciliationError, match="CORPUS_RECONCILIATION_LOCAL_RECORD_INVALID"):
         LocalFileRecord.from_mapping({**local.to_mapping(), "text": "forbidden"})
@@ -171,3 +173,220 @@ def test_store_rejects_conflicting_run_for_same_contract_pair(tmp_path: Path) ->
             index_contract_sha256="a" * 64,
             e1a3_allocation_sha256="b" * 64,
         )
+
+
+def _create_store(tmp_path: Path):
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import ReconciliationStore
+
+    root = tmp_path / ".private" / "corpus-reconciliation" / "v1"
+    return ReconciliationStore.create(
+        root=root,
+        expected_root=root,
+        run_id="run-001",
+        index_contract_sha256="a" * 64,
+        e1a3_allocation_sha256="b" * 64,
+    )
+
+
+def _drive_record(*, drive_file_id: str = "drive-1", size_bytes: int = 10):
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import DriveFileRecord
+
+    return DriveFileRecord.from_mapping(
+        {
+            "drive_file_id": drive_file_id,
+            "name": f"{drive_file_id}.pdf",
+            "mime_type": "application/pdf",
+            "size_bytes": size_bytes,
+            "checksum_algorithm": "md5",
+            "checksum": "c" * 32,
+            "modified_time": "2026-08-23T00:00:00Z",
+            "parent_ids": ["folder-1"],
+        }
+    )
+
+
+def test_drive_rescan_upserts_stable_ids_without_duplication(tmp_path: Path) -> None:
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import import_drive_page
+
+    store = _create_store(tmp_path)
+    page = (_drive_record(),)
+
+    first = import_drive_page(store=store, records=page, next_page_token="token-2")
+    final = import_drive_page(store=store, records=page, next_page_token=None)
+
+    assert first.status == "IN_PROGRESS"
+    assert final.status == "COMPLETE"
+    assert store.count("drive_files") == 1
+    assert store.checkpoint("drive_inventory").committed_records == 1
+    store.close()
+
+
+def test_drive_conflict_is_blocked_with_closed_error_code(tmp_path: Path) -> None:
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        CorpusReconciliationError,
+        import_drive_page,
+    )
+
+    store = _create_store(tmp_path)
+    import_drive_page(store=store, records=(_drive_record(),), next_page_token="token-2")
+
+    with pytest.raises(CorpusReconciliationError, match="CORPUS_RECONCILIATION_DRIVE_CONFLICT"):
+        import_drive_page(
+            store=store,
+            records=(_drive_record(size_bytes=11),),
+            next_page_token=None,
+        )
+
+    checkpoint = store.checkpoint("drive_inventory")
+    assert checkpoint.status == "BLOCKED"
+    assert checkpoint.error_code == "CORPUS_RECONCILIATION_DRIVE_CONFLICT"
+    assert "11" not in checkpoint.error_code
+    store.close()
+
+
+def test_restart_keeps_committed_drive_pages(tmp_path: Path) -> None:
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        ReconciliationStore,
+        import_drive_page,
+    )
+
+    store = _create_store(tmp_path)
+    root = store.root
+    import_drive_page(store=store, records=(_drive_record(),), next_page_token="expired-token")
+    store.close()
+
+    resumed = ReconciliationStore.open(root=root, expected_root=root, run_id="run-001")
+    import_drive_page(
+        store=resumed,
+        records=(_drive_record(drive_file_id="drive-2"),),
+        next_page_token=None,
+    )
+
+    assert resumed.count("drive_files") == 2
+    assert resumed.checkpoint("drive_inventory").status == "COMPLETE"
+    resumed.close()
+
+
+def test_local_inventory_hashes_without_persisting_file_bytes(tmp_path: Path) -> None:
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        LocalParserMetadata,
+        inventory_local_files,
+    )
+
+    approved_root = tmp_path / "approved"
+    approved_root.mkdir()
+    content = b"unique-private-content-that-must-not-be-stored"
+    source_file = approved_root / "private.pdf"
+    source_file.write_bytes(content)
+    store = _create_store(tmp_path)
+
+    result = inventory_local_files(
+        store=store,
+        roots=(approved_root,),
+        parser_metadata={
+            "approved/private.pdf": LocalParserMetadata.from_mapping(
+                {"parser_status": "PARSED", "page_or_sheet_count": 2}
+            )
+        },
+    )
+    record = store.local_file("approved/private.pdf")
+
+    assert result.status == "COMPLETE"
+    assert record.sha256 == hashlib.sha256(content).hexdigest()
+    assert record.provider_checksum_algorithm == "md5"
+    assert record.size_bytes == len(content)
+    assert record.parser_status == "PARSED"
+    assert record.page_or_sheet_count == 2
+    store.close()
+    assert content not in (store.root / "reconciliation.sqlite").read_bytes()
+
+
+def test_index_inventory_requires_bound_contract_and_exact_totals(tmp_path: Path) -> None:
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        CorpusReconciliationError,
+        IndexLocatorRecord,
+        IndexSourceRecord,
+        import_index_inventory,
+    )
+
+    store = _create_store(tmp_path)
+    source = IndexSourceRecord.from_mapping(
+        {
+            "source_id": "source-1",
+            "source_path": "approved/private.pdf",
+            "parser_type": "pdf",
+            "topic": "scale",
+            "chunk_count": 2,
+            "embedding_model": "model",
+            "index_contract_sha256": "a" * 64,
+        }
+    )
+    locator = IndexLocatorRecord.from_mapping(
+        {
+            "source_id": "source-1",
+            "locator": "page:1",
+            "topic": "scale",
+            "source_role": "supporting",
+            "substantive_status": "SUBSTANTIVE",
+        }
+    )
+
+    result = import_index_inventory(
+        store=store,
+        sources=(source,),
+        locators=(locator,),
+        expected_source_count=1,
+        expected_chunk_count=2,
+    )
+
+    assert result.status == "COMPLETE"
+    assert store.count("index_sources") == 1
+    assert store.count("index_locators") == 1
+    with pytest.raises(CorpusReconciliationError, match="CORPUS_RECONCILIATION_INDEX_CONTRACT_MISMATCH"):
+        import_index_inventory(
+            store=store,
+            sources=(IndexSourceRecord(**{**source.__dict__, "index_contract_sha256": "d" * 64}),),
+            locators=(locator,),
+            expected_source_count=1,
+            expected_chunk_count=2,
+        )
+    store.close()
+
+
+def test_index_duplicate_locator_conflict_fails_closed(tmp_path: Path) -> None:
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        CorpusReconciliationError,
+        IndexLocatorRecord,
+        IndexSourceRecord,
+        import_index_inventory,
+    )
+
+    store = _create_store(tmp_path)
+    source = IndexSourceRecord(
+        source_id="source-1",
+        source_path="approved/private.pdf",
+        parser_type="pdf",
+        topic="scale",
+        chunk_count=2,
+        embedding_model="model",
+        index_contract_sha256="a" * 64,
+    )
+    locators = (
+        IndexLocatorRecord("source-1", "page:1", "scale", "supporting", "SUBSTANTIVE"),
+        IndexLocatorRecord("source-1", "page:1", "scale", "foundational", "SUBSTANTIVE"),
+    )
+
+    with pytest.raises(CorpusReconciliationError, match="CORPUS_RECONCILIATION_INDEX_LOCATOR_CONFLICT"):
+        import_index_inventory(
+            store=store,
+            sources=(source,),
+            locators=locators,
+            expected_source_count=1,
+            expected_chunk_count=2,
+        )
+
+    checkpoint = store.checkpoint("index_inventory")
+    assert checkpoint.status == "BLOCKED"
+    assert checkpoint.error_code == "CORPUS_RECONCILIATION_INDEX_LOCATOR_CONFLICT"
+    assert store.count("index_sources") == 0
+    store.close()

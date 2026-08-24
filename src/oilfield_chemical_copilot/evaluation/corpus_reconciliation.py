@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import json
 from pathlib import Path, PurePosixPath
 import sqlite3
-from typing import Mapping
+from typing import Iterable, Mapping
 
 
 SCHEMA_VERSION = 1
@@ -195,6 +197,27 @@ class LocalFileRecord:
 
 
 @dataclass(frozen=True)
+class LocalParserMetadata:
+    parser_status: str
+    page_or_sheet_count: int
+
+    @classmethod
+    def from_mapping(cls, mapping: Mapping[str, object]) -> LocalParserMetadata:
+        code = "CORPUS_RECONCILIATION_LOCAL_METADATA_INVALID"
+        _exact_keys(mapping, frozenset({"parser_status", "page_or_sheet_count"}), code)
+        return cls(
+            parser_status=_string(mapping["parser_status"], code),
+            page_or_sheet_count=_integer(mapping["page_or_sheet_count"], code),
+        )
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "parser_status": self.parser_status,
+            "page_or_sheet_count": self.page_or_sheet_count,
+        }
+
+
+@dataclass(frozen=True)
 class IndexSourceRecord:
     source_id: str
     source_path: str
@@ -227,7 +250,7 @@ class IndexSourceRecord:
             _fail(code)
         return cls(
             source_id=_string(mapping["source_id"], code),
-            source_path=_string(mapping["source_path"], code),
+            source_path=_relative_path(mapping["source_path"], code),
             parser_type=_string(mapping["parser_type"], code),
             topic=topic,
             chunk_count=_integer(mapping["chunk_count"], code, minimum=1),
@@ -275,6 +298,15 @@ class IndexLocatorRecord:
             substantive_status=_string(mapping["substantive_status"], code),
         )
 
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "source_id": self.source_id,
+            "locator": self.locator,
+            "topic": self.topic,
+            "source_role": self.source_role,
+            "substantive_status": self.substantive_status,
+        }
+
 
 @dataclass(frozen=True)
 class CheckpointRecord:
@@ -283,6 +315,13 @@ class CheckpointRecord:
     committed_records: int
     page_token: str | None
     error_code: str | None
+
+
+@dataclass(frozen=True)
+class StageResult:
+    stage: str
+    status: str
+    committed_records: int
 
 
 class ReconciliationStore:
@@ -527,5 +566,355 @@ class ReconciliationStore:
         ).fetchone()
         return int(row[0])
 
+    def index_contract_sha256(self) -> str:
+        row = self._connection.execute(
+            "select index_contract_sha256 from runs where run_id = ?", (self.run_id,)
+        ).fetchone()
+        if row is None:
+            _fail("CORPUS_RECONCILIATION_RUN_INVALID")
+        return str(row[0])
+
+    def local_file(self, relative_path: str) -> LocalFileRecord:
+        safe_path = _relative_path(relative_path, "CORPUS_RECONCILIATION_LOCAL_RECORD_INVALID")
+        row = self._connection.execute(
+            """
+            select relative_path, sha256, provider_checksum_algorithm, provider_checksum,
+                   size_bytes, file_type, parser_status, page_or_sheet_count
+            from local_files where run_id = ? and relative_path = ?
+            """,
+            (self.run_id, safe_path),
+        ).fetchone()
+        if row is None:
+            _fail("CORPUS_RECONCILIATION_LOCAL_RECORD_MISSING")
+        return LocalFileRecord.from_mapping(dict(row))
+
     def close(self) -> None:
         self._connection.close()
+
+
+def _table_count(connection: sqlite3.Connection, *, run_id: str, table: str) -> int:
+    row = connection.execute(
+        f"select count(*) from {table} where run_id = ?", (run_id,)
+    ).fetchone()
+    return int(row[0])
+
+
+def _block_stage(
+    store: ReconciliationStore, *, stage: str, table: str, error_code: str
+) -> None:
+    try:
+        committed = _table_count(store._connection, run_id=store.run_id, table=table)
+        store.set_checkpoint(
+            stage=stage,
+            status="BLOCKED",
+            committed_records=committed,
+            error_code=error_code,
+        )
+    except sqlite3.Error:
+        pass
+
+
+def import_drive_page(
+    *,
+    store: ReconciliationStore,
+    records: Iterable[DriveFileRecord],
+    next_page_token: str | None,
+) -> StageResult:
+    """Commit one metadata-only Drive page using stable file IDs."""
+    stage = "drive_inventory"
+    safe_records = tuple(DriveFileRecord.from_mapping(record.to_mapping()) for record in records)
+    token = _optional_string(
+        next_page_token, "CORPUS_RECONCILIATION_DRIVE_PAGE_INVALID"
+    )
+    status = "IN_PROGRESS" if token is not None else "COMPLETE"
+    try:
+        with store._connection:
+            for record in safe_records:
+                parent_ids_json = json.dumps(
+                    sorted(record.parent_ids), separators=(",", ":"), ensure_ascii=False
+                )
+                values = (
+                    store.run_id,
+                    record.drive_file_id,
+                    record.name,
+                    record.mime_type,
+                    record.size_bytes,
+                    record.checksum_algorithm,
+                    record.checksum,
+                    record.modified_time,
+                    parent_ids_json,
+                )
+                existing = store._connection.execute(
+                    """
+                    select name, mime_type, size_bytes, checksum_algorithm, checksum,
+                           modified_time, parent_ids_json
+                    from drive_files where run_id = ? and drive_file_id = ?
+                    """,
+                    (store.run_id, record.drive_file_id),
+                ).fetchone()
+                expected = values[2:]
+                if existing is not None and tuple(existing) != expected:
+                    _fail("CORPUS_RECONCILIATION_DRIVE_CONFLICT")
+                store._connection.execute(
+                    """
+                    insert into drive_files(
+                        run_id, drive_file_id, name, mime_type, size_bytes,
+                        checksum_algorithm, checksum, modified_time, parent_ids_json
+                    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    on conflict(run_id, drive_file_id) do nothing
+                    """,
+                    values,
+                )
+            committed = _table_count(
+                store._connection, run_id=store.run_id, table="drive_files"
+            )
+            store._connection.execute(
+                """
+                insert into checkpoints(
+                    run_id, stage, status, page_token, committed_records, error_code
+                ) values (?, ?, ?, ?, ?, null)
+                on conflict(run_id, stage) do update set
+                    status = excluded.status,
+                    page_token = excluded.page_token,
+                    committed_records = excluded.committed_records,
+                    error_code = null,
+                    updated_at = current_timestamp
+                """,
+                (store.run_id, stage, status, token, committed),
+            )
+    except CorpusReconciliationError as error:
+        code = str(error)
+        _block_stage(store, stage=stage, table="drive_files", error_code=code)
+        raise
+    except sqlite3.Error as error:
+        code = "CORPUS_RECONCILIATION_STORE_FAILED"
+        _block_stage(store, stage=stage, table="drive_files", error_code=code)
+        raise CorpusReconciliationError(code) from error
+    return StageResult(stage=stage, status=status, committed_records=committed)
+
+
+def _hash_local_file(path: Path) -> tuple[str, str, int]:
+    sha256 = hashlib.sha256()
+    md5 = hashlib.md5(usedforsecurity=False)
+    size_bytes = 0
+    with path.open("rb") as source:
+        while block := source.read(1024 * 1024):
+            sha256.update(block)
+            md5.update(block)
+            size_bytes += len(block)
+    return sha256.hexdigest(), md5.hexdigest(), size_bytes
+
+
+def inventory_local_files(
+    *,
+    store: ReconciliationStore,
+    roots: Iterable[Path],
+    parser_metadata: Mapping[str, LocalParserMetadata] | None = None,
+) -> StageResult:
+    """Hash approved local files without persisting or parsing their contents."""
+    stage = "local_inventory"
+    safe_roots = tuple(Path(root).resolve() for root in roots)
+    if not safe_roots or len({root.name for root in safe_roots}) != len(safe_roots):
+        _fail("CORPUS_RECONCILIATION_LOCAL_ROOT_INVALID")
+    safe_metadata: dict[str, LocalParserMetadata] = {}
+    for raw_path, raw_metadata in (parser_metadata or {}).items():
+        relative_path = _relative_path(
+            raw_path, "CORPUS_RECONCILIATION_LOCAL_METADATA_INVALID"
+        )
+        if relative_path in safe_metadata:
+            _fail("CORPUS_RECONCILIATION_LOCAL_METADATA_INVALID")
+        safe_metadata[relative_path] = LocalParserMetadata.from_mapping(
+            raw_metadata.to_mapping()
+        )
+    seen_paths: set[str] = set()
+    committed = store.count("local_files")
+    try:
+        for root in safe_roots:
+            if not root.is_dir():
+                _fail("CORPUS_RECONCILIATION_LOCAL_ROOT_INVALID")
+            for path in sorted(candidate for candidate in root.rglob("*") if candidate.is_file()):
+                if path.is_symlink():
+                    _fail("CORPUS_RECONCILIATION_LOCAL_ROOT_INVALID")
+                relative_path = PurePosixPath(root.name, *path.relative_to(root).parts).as_posix()
+                seen_paths.add(relative_path)
+                sha256, md5, size_bytes = _hash_local_file(path)
+                metadata = safe_metadata.get(
+                    relative_path,
+                    LocalParserMetadata(parser_status="UNKNOWN", page_or_sheet_count=0),
+                )
+                record = LocalFileRecord.from_mapping(
+                    {
+                        "relative_path": relative_path,
+                        "sha256": sha256,
+                        "provider_checksum_algorithm": "md5",
+                        "provider_checksum": md5,
+                        "size_bytes": size_bytes,
+                        "file_type": path.suffix.removeprefix(".").lower() or "unknown",
+                        "parser_status": metadata.parser_status,
+                        "page_or_sheet_count": metadata.page_or_sheet_count,
+                    }
+                )
+                values = (store.run_id, *record.to_mapping().values())
+                with store._connection:
+                    existing = store._connection.execute(
+                        """
+                        select relative_path, sha256, provider_checksum_algorithm,
+                               provider_checksum, size_bytes, file_type, parser_status,
+                               page_or_sheet_count
+                        from local_files where run_id = ? and relative_path = ?
+                        """,
+                        (store.run_id, record.relative_path),
+                    ).fetchone()
+                    if existing is not None and tuple(existing) != values[1:]:
+                        _fail("CORPUS_RECONCILIATION_LOCAL_CONFLICT")
+                    store._connection.execute(
+                        """
+                        insert into local_files(
+                            run_id, relative_path, sha256, provider_checksum_algorithm,
+                            provider_checksum, size_bytes, file_type, parser_status,
+                            page_or_sheet_count
+                        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        on conflict(run_id, relative_path) do nothing
+                        """,
+                        values,
+                    )
+                    committed = _table_count(
+                        store._connection, run_id=store.run_id, table="local_files"
+                    )
+                    store._connection.execute(
+                        """
+                        insert into checkpoints(
+                            run_id, stage, status, committed_records, error_code
+                        ) values (?, ?, 'IN_PROGRESS', ?, null)
+                        on conflict(run_id, stage) do update set
+                            status = 'IN_PROGRESS',
+                            committed_records = excluded.committed_records,
+                            error_code = null,
+                            updated_at = current_timestamp
+                        """,
+                        (store.run_id, stage, committed),
+                    )
+        if set(safe_metadata) != seen_paths.intersection(safe_metadata):
+            _fail("CORPUS_RECONCILIATION_LOCAL_METADATA_UNMATCHED")
+        store.set_checkpoint(
+            stage=stage, status="COMPLETE", committed_records=committed
+        )
+    except CorpusReconciliationError as error:
+        _block_stage(store, stage=stage, table="local_files", error_code=str(error))
+        raise
+    except (OSError, sqlite3.Error) as error:
+        code = "CORPUS_RECONCILIATION_LOCAL_INVENTORY_FAILED"
+        _block_stage(store, stage=stage, table="local_files", error_code=code)
+        raise CorpusReconciliationError(code) from error
+    return StageResult(stage=stage, status="COMPLETE", committed_records=committed)
+
+
+def import_index_inventory(
+    *,
+    store: ReconciliationStore,
+    sources: Iterable[IndexSourceRecord],
+    locators: Iterable[IndexLocatorRecord],
+    expected_source_count: int,
+    expected_chunk_count: int,
+) -> StageResult:
+    """Import a complete index metadata inventory bound to the run contract."""
+    stage = "index_inventory"
+    try:
+        safe_sources = tuple(
+            IndexSourceRecord.from_mapping(source.to_mapping()) for source in sources
+        )
+        safe_locators = tuple(
+            IndexLocatorRecord.from_mapping(locator.to_mapping()) for locator in locators
+        )
+        source_count = _integer(
+            expected_source_count, "CORPUS_RECONCILIATION_INDEX_TOTAL_INVALID", minimum=1
+        )
+        chunk_count = _integer(
+            expected_chunk_count, "CORPUS_RECONCILIATION_INDEX_TOTAL_INVALID", minimum=1
+        )
+        if len(safe_sources) != source_count or sum(
+            source.chunk_count for source in safe_sources
+        ) != chunk_count:
+            _fail("CORPUS_RECONCILIATION_INDEX_TOTAL_MISMATCH")
+        source_ids = [source.source_id for source in safe_sources]
+        if len(source_ids) != len(set(source_ids)):
+            _fail("CORPUS_RECONCILIATION_INDEX_SOURCE_CONFLICT")
+        locator_keys = [(locator.source_id, locator.locator) for locator in safe_locators]
+        if len(locator_keys) != len(set(locator_keys)):
+            _fail("CORPUS_RECONCILIATION_INDEX_LOCATOR_CONFLICT")
+        if any(locator.source_id not in set(source_ids) for locator in safe_locators):
+            _fail("CORPUS_RECONCILIATION_INDEX_LOCATOR_INVALID")
+        if len({source.embedding_model for source in safe_sources}) != 1:
+            _fail("CORPUS_RECONCILIATION_INDEX_MODEL_MIXED")
+        bound_digest = store.index_contract_sha256()
+        if any(source.index_contract_sha256 != bound_digest for source in safe_sources):
+            _fail("CORPUS_RECONCILIATION_INDEX_CONTRACT_MISMATCH")
+
+        with store._connection:
+            for source in safe_sources:
+                values = (store.run_id, *source.to_mapping().values())
+                existing = store._connection.execute(
+                    """
+                    select source_id, source_path, parser_type, topic, chunk_count,
+                           embedding_model, index_contract_sha256
+                    from index_sources where run_id = ? and source_id = ?
+                    """,
+                    (store.run_id, source.source_id),
+                ).fetchone()
+                if existing is not None and tuple(existing) != values[1:]:
+                    _fail("CORPUS_RECONCILIATION_INDEX_SOURCE_CONFLICT")
+                store._connection.execute(
+                    """
+                    insert into index_sources(
+                        run_id, source_id, source_path, parser_type, topic, chunk_count,
+                        embedding_model, index_contract_sha256
+                    ) values (?, ?, ?, ?, ?, ?, ?, ?)
+                    on conflict(run_id, source_id) do nothing
+                    """,
+                    values,
+                )
+            for locator in safe_locators:
+                values = (store.run_id, *locator.to_mapping().values())
+                existing = store._connection.execute(
+                    """
+                    select source_id, locator, topic, source_role, substantive_status
+                    from index_locators
+                    where run_id = ? and source_id = ? and locator = ?
+                    """,
+                    (store.run_id, locator.source_id, locator.locator),
+                ).fetchone()
+                if existing is not None and tuple(existing) != values[1:]:
+                    _fail("CORPUS_RECONCILIATION_INDEX_LOCATOR_CONFLICT")
+                store._connection.execute(
+                    """
+                    insert into index_locators(
+                        run_id, source_id, locator, topic, source_role, substantive_status
+                    ) values (?, ?, ?, ?, ?, ?)
+                    on conflict(run_id, source_id, locator) do nothing
+                    """,
+                    values,
+                )
+            committed = _table_count(
+                store._connection, run_id=store.run_id, table="index_sources"
+            )
+            store._connection.execute(
+                """
+                insert into checkpoints(
+                    run_id, stage, status, committed_records, error_code
+                ) values (?, ?, 'COMPLETE', ?, null)
+                on conflict(run_id, stage) do update set
+                    status = 'COMPLETE',
+                    committed_records = excluded.committed_records,
+                    error_code = null,
+                    updated_at = current_timestamp
+                """,
+                (store.run_id, stage, committed),
+            )
+    except CorpusReconciliationError as error:
+        _block_stage(store, stage=stage, table="index_sources", error_code=str(error))
+        raise
+    except sqlite3.Error as error:
+        code = "CORPUS_RECONCILIATION_STORE_FAILED"
+        _block_stage(store, stage=stage, table="index_sources", error_code=code)
+        raise CorpusReconciliationError(code) from error
+    return StageResult(stage=stage, status="COMPLETE", committed_records=committed)
