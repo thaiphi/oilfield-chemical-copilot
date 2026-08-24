@@ -321,27 +321,27 @@ git commit -m "feat: add private corpus reconciliation cli"
 - Consumes: verified CLI, connected Google Drive metadata, approved local roots, configured read-only PostgreSQL URL, index contract, and E1a-3 allocation.
 - Produces: private SQLite state, six sealed JSONL snapshots with manifests, aggregate blocker classification, and updated public plan status.
 
-- [ ] **Step 1: Run presence-only preflight and initialize the bound run**
+- [x] **Step 1: Run presence-only preflight and initialize the bound run**
 
 Verify Git ignore status, zero tracked private files, exact index contract, exact E1a-3 allocation manifest, and absent E1a-4 sampling frame. Initialize `run-2026-08-23-v1` only after all checks pass.
 
-- [ ] **Step 2: Import Google Drive metadata in resumable pages**
+- [x] **Step 2: Import Google Drive metadata in resumable pages**
 
 Use the connected Drive metadata search/list actions. Pass each provider page directly to `import-drive-page` through stdin without writing intermediary tracked files or printing private records. Continue until `next_page_token` is absent; if interrupted, resume the existing SQLite run.
 
-- [ ] **Step 3: Inventory approved local roots and import the verified index**
+- [x] **Step 3: Inventory approved local roots and import the verified index**
 
 Use only roots established by exact anchor provenance. If no approved local root can be derived without guessing, mark `DRIVE_TO_LOCAL_GAP` and stop that branch. Start PostgreSQL only for the read-only import and stop the service afterward if this task started it.
 
-- [ ] **Step 4: Run matching, eligibility reconciliation, capacity, and dry-run allocation**
+- [x] **Step 4: Run matching, eligibility reconciliation, capacity, and dry-run allocation**
 
 Do not make review decisions automatically. Seal a closed blocker when ambiguous matches remain. If the allocator succeeds, do not run the E1a-4 sampling-frame sealer in this task; report `READY_FOR_E1A4_SAMPLING_APPROVAL`.
 
-- [ ] **Step 5: Seal private snapshots and update aggregate-only tracked plans**
+- [x] **Step 5: Seal private snapshots and update aggregate-only tracked plans**
 
 Write only counts, safe status, blocker classes, verification evidence, and the next approval gate. Do not include reconstructive small-cell values or private identifiers.
 
-- [ ] **Step 6: Run final verification**
+- [x] **Step 6: Run final verification**
 
 Run: `uv run pytest -q tests/evaluation/test_corpus_reconciliation.py`
 
@@ -353,9 +353,19 @@ Run: `git diff --check`
 
 Verify the private root is ignored, `git ls-files .private` is empty, no private status entry is visible, all snapshot manifests validate, and tracked reports contain no private identifiers or paths.
 
-- [ ] **Step 7: Commit tracked Task 7 updates**
+- [x] **Step 7: Commit tracked Task 7 updates**
 
 ```powershell
 git add -- docs/superpowers/plans/2026-08-19-e1a4-requirements-aware-evidence-gate.md docs/CURRICULUM_REMEDIATION_BACKLOG.md
 git commit -m "docs: record private corpus reconciliation gate"
 ```
+
+## Execution Result — 2026-08-23
+
+- Status: `CORPUS_RECONCILIATION_COMPLETE`; the E1a-4 no-write dry run is intentionally `BLOCKED`.
+- Sealed private inventory: 385 topic-scoped Drive candidates, 232 local files, 198 contract-verified index sources, 1,874 locator records, and 815 closed match rows.
+- Identity result: 117 filename-and-size candidates require human review; no ambiguous candidate was promoted to an exact match.
+- Capacity result: all four supporting strata are sufficient and all four foundational strata are insufficient after exact E1a-3 locator exclusion.
+- Artifact result: six canonical private JSONL snapshots and six SHA-256 manifests verified, including no-rewrite restart verification.
+- Verification: 35 focused reconciliation tests passed; the full suite passed 810 tests with 2 skipped; full Ruff passed; whitespace, Git-ignore, tracked-private-file, and public privacy scans passed.
+- Decision: do not run the E1a-4 sampling-frame sealer, ingest/reindex documents, reuse E1a-3 locators, or weaken the exact grid. The next approval gate is a narrow, separately reviewed foundational-locator evidence audit of the already approved corpus.
