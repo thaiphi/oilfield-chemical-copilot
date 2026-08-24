@@ -104,8 +104,10 @@ class DriveFileRecord:
             ),
             code,
         )
-        algorithm = _optional_string(mapping["checksum_algorithm"], code)
-        checksum = _optional_string(mapping["checksum"], code)
+        raw_algorithm = _optional_string(mapping["checksum_algorithm"], code)
+        raw_checksum = _optional_string(mapping["checksum"], code)
+        algorithm = raw_algorithm.lower() if raw_algorithm is not None else None
+        checksum = raw_checksum.lower() if raw_checksum is not None else None
         if (algorithm is None) != (checksum is None):
             _fail(code)
         parents = mapping["parent_ids"]
@@ -168,8 +170,10 @@ class LocalFileRecord:
             ),
             code,
         )
-        algorithm = _optional_string(mapping["provider_checksum_algorithm"], code)
-        checksum = _optional_string(mapping["provider_checksum"], code)
+        raw_algorithm = _optional_string(mapping["provider_checksum_algorithm"], code)
+        raw_checksum = _optional_string(mapping["provider_checksum"], code)
+        algorithm = raw_algorithm.lower() if raw_algorithm is not None else None
+        checksum = raw_checksum.lower() if raw_checksum is not None else None
         if (algorithm is None) != (checksum is None):
             _fail(code)
         return cls(
@@ -226,6 +230,8 @@ class IndexSourceRecord:
     chunk_count: int
     embedding_model: str
     index_contract_sha256: str
+    provenance_drive_file_id: str | None
+    content_sha256: str | None
 
     @classmethod
     def from_mapping(cls, mapping: Mapping[str, object]) -> IndexSourceRecord:
@@ -241,6 +247,8 @@ class IndexSourceRecord:
                     "chunk_count",
                     "embedding_model",
                     "index_contract_sha256",
+                    "provenance_drive_file_id",
+                    "content_sha256",
                 }
             ),
             code,
@@ -256,6 +264,14 @@ class IndexSourceRecord:
             chunk_count=_integer(mapping["chunk_count"], code, minimum=1),
             embedding_model=_string(mapping["embedding_model"], code),
             index_contract_sha256=_digest(mapping["index_contract_sha256"], code),
+            provenance_drive_file_id=_optional_string(
+                mapping["provenance_drive_file_id"], code
+            ),
+            content_sha256=(
+                _digest(mapping["content_sha256"], code)
+                if mapping["content_sha256"] is not None
+                else None
+            ),
         )
 
     def to_mapping(self) -> dict[str, object]:
@@ -267,6 +283,8 @@ class IndexSourceRecord:
             "chunk_count": self.chunk_count,
             "embedding_model": self.embedding_model,
             "index_contract_sha256": self.index_contract_sha256,
+            "provenance_drive_file_id": self.provenance_drive_file_id,
+            "content_sha256": self.content_sha256,
         }
 
 
@@ -322,6 +340,18 @@ class StageResult:
     stage: str
     status: str
     committed_records: int
+
+
+@dataclass(frozen=True)
+class MatchSummary:
+    exact_match: int
+    duplicate_alias: int
+    drive_only: int
+    local_only: int
+    parsed_not_indexed: int
+    index_only: int
+    ambiguous_review_required: int
+    ineligible: int
 
 
 class ReconciliationStore:
@@ -398,6 +428,8 @@ class ReconciliationStore:
                 chunk_count integer not null,
                 embedding_model text not null,
                 index_contract_sha256 text not null,
+                provenance_drive_file_id text,
+                content_sha256 text,
                 primary key(run_id, source_id)
             );
             create table if not exists index_locators (
@@ -413,13 +445,16 @@ class ReconciliationStore:
             );
             create table if not exists document_matches (
                 run_id text not null references runs(run_id),
+                match_key text not null,
                 drive_file_id text,
                 relative_path text,
                 source_id text,
+                canonical_sha256 text,
                 match_method text not null,
                 match_status text not null,
                 reason_code text not null,
-                primary key(run_id, drive_file_id, relative_path, source_id)
+                primary key(run_id, match_key),
+                unique(run_id, drive_file_id)
             );
             create table if not exists review_decisions (
                 run_id text not null references runs(run_id),
@@ -587,6 +622,30 @@ class ReconciliationStore:
         if row is None:
             _fail("CORPUS_RECONCILIATION_LOCAL_RECORD_MISSING")
         return LocalFileRecord.from_mapping(dict(row))
+
+    def match_status(self, drive_file_id: str) -> str:
+        row = self._connection.execute(
+            """
+            select match_status from document_matches
+            where run_id = ? and drive_file_id = ?
+            """,
+            (self.run_id, drive_file_id),
+        ).fetchone()
+        if row is None:
+            _fail("CORPUS_RECONCILIATION_MATCH_MISSING")
+        return str(row[0])
+
+    def match_method(self, drive_file_id: str) -> str:
+        row = self._connection.execute(
+            """
+            select match_method from document_matches
+            where run_id = ? and drive_file_id = ?
+            """,
+            (self.run_id, drive_file_id),
+        ).fetchone()
+        if row is None:
+            _fail("CORPUS_RECONCILIATION_MATCH_MISSING")
+        return str(row[0])
 
     def close(self) -> None:
         self._connection.close()
@@ -856,7 +915,8 @@ def import_index_inventory(
                 existing = store._connection.execute(
                     """
                     select source_id, source_path, parser_type, topic, chunk_count,
-                           embedding_model, index_contract_sha256
+                           embedding_model, index_contract_sha256,
+                           provenance_drive_file_id, content_sha256
                     from index_sources where run_id = ? and source_id = ?
                     """,
                     (store.run_id, source.source_id),
@@ -867,8 +927,9 @@ def import_index_inventory(
                     """
                     insert into index_sources(
                         run_id, source_id, source_path, parser_type, topic, chunk_count,
-                        embedding_model, index_contract_sha256
-                    ) values (?, ?, ?, ?, ?, ?, ?, ?)
+                        embedding_model, index_contract_sha256,
+                        provenance_drive_file_id, content_sha256
+                    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     on conflict(run_id, source_id) do nothing
                     """,
                     values,
@@ -918,3 +979,394 @@ def import_index_inventory(
         _block_stage(store, stage=stage, table="index_sources", error_code=code)
         raise CorpusReconciliationError(code) from error
     return StageResult(stage=stage, status="COMPLETE", committed_records=committed)
+
+
+def _require_complete_checkpoint(store: ReconciliationStore, stage: str) -> None:
+    try:
+        checkpoint = store.checkpoint(stage)
+    except CorpusReconciliationError as error:
+        raise CorpusReconciliationError(
+            "CORPUS_RECONCILIATION_MATCH_INPUT_INCOMPLETE"
+        ) from error
+    if checkpoint.status != "COMPLETE":
+        _fail("CORPUS_RECONCILIATION_MATCH_INPUT_INCOMPLETE")
+
+
+def _load_drive_records(store: ReconciliationStore) -> tuple[DriveFileRecord, ...]:
+    rows = store._connection.execute(
+        """
+        select drive_file_id, name, mime_type, size_bytes, checksum_algorithm,
+               checksum, modified_time, parent_ids_json
+        from drive_files where run_id = ? order by drive_file_id
+        """,
+        (store.run_id,),
+    ).fetchall()
+    return tuple(
+        DriveFileRecord.from_mapping(
+            {
+                "drive_file_id": row["drive_file_id"],
+                "name": row["name"],
+                "mime_type": row["mime_type"],
+                "size_bytes": row["size_bytes"],
+                "checksum_algorithm": row["checksum_algorithm"],
+                "checksum": row["checksum"],
+                "modified_time": row["modified_time"],
+                "parent_ids": json.loads(row["parent_ids_json"]),
+            }
+        )
+        for row in rows
+    )
+
+
+def _load_local_records(store: ReconciliationStore) -> tuple[LocalFileRecord, ...]:
+    rows = store._connection.execute(
+        """
+        select relative_path, sha256, provider_checksum_algorithm, provider_checksum,
+               size_bytes, file_type, parser_status, page_or_sheet_count
+        from local_files where run_id = ? order by relative_path
+        """,
+        (store.run_id,),
+    ).fetchall()
+    return tuple(LocalFileRecord.from_mapping(dict(row)) for row in rows)
+
+
+def _load_index_sources(store: ReconciliationStore) -> tuple[IndexSourceRecord, ...]:
+    rows = store._connection.execute(
+        """
+        select source_id, source_path, parser_type, topic, chunk_count,
+               embedding_model, index_contract_sha256, provenance_drive_file_id,
+               content_sha256
+        from index_sources where run_id = ? order by source_id
+        """,
+        (store.run_id,),
+    ).fetchall()
+    return tuple(IndexSourceRecord.from_mapping(dict(row)) for row in rows)
+
+
+def _source_local_bindings(
+    *, sources: tuple[IndexSourceRecord, ...], locals_: tuple[LocalFileRecord, ...]
+) -> dict[str, str]:
+    local_by_path = {record.relative_path: record for record in locals_}
+    locals_by_sha: dict[str, list[LocalFileRecord]] = {}
+    for record in locals_:
+        locals_by_sha.setdefault(record.sha256, []).append(record)
+    bindings: dict[str, str] = {}
+    for source in sources:
+        path_match = local_by_path.get(source.source_path)
+        if source.content_sha256 is not None:
+            if path_match is not None and path_match.sha256 != source.content_sha256:
+                _fail("CORPUS_RECONCILIATION_INDEX_HASH_CONFLICT")
+            hash_matches = sorted(
+                locals_by_sha.get(source.content_sha256, ()),
+                key=lambda record: record.relative_path,
+            )
+            if path_match is not None:
+                bindings[source.source_id] = path_match.relative_path
+            elif hash_matches:
+                bindings[source.source_id] = hash_matches[0].relative_path
+        elif path_match is not None:
+            bindings[source.source_id] = path_match.relative_path
+    return bindings
+
+
+def _match_row(
+    *,
+    match_key: str,
+    drive_file_id: str | None,
+    relative_path: str | None,
+    source_id: str | None,
+    canonical_sha256: str | None,
+    match_method: str,
+    match_status: str,
+    reason_code: str,
+) -> tuple[object, ...]:
+    return (
+        match_key,
+        drive_file_id,
+        relative_path,
+        source_id,
+        canonical_sha256,
+        match_method,
+        match_status,
+        reason_code,
+    )
+
+
+def reconcile_document_matches(*, store: ReconciliationStore) -> MatchSummary:
+    """Reconcile exact identities without confidence scores or content access."""
+    stage = "document_matching"
+    for prerequisite in ("drive_inventory", "local_inventory", "index_inventory"):
+        _require_complete_checkpoint(store, prerequisite)
+    try:
+        drives = _load_drive_records(store)
+        locals_ = _load_local_records(store)
+        sources = _load_index_sources(store)
+        local_by_path = {record.relative_path: record for record in locals_}
+        source_to_local = _source_local_bindings(sources=sources, locals_=locals_)
+        sources_by_local: dict[str, list[str]] = {}
+        for source_id, relative_path in source_to_local.items():
+            sources_by_local.setdefault(relative_path, []).append(source_id)
+
+        checksum_to_locals: dict[tuple[str, str], list[LocalFileRecord]] = {}
+        for local in locals_:
+            if (
+                local.provider_checksum_algorithm is not None
+                and local.provider_checksum is not None
+            ):
+                checksum_to_locals.setdefault(
+                    (local.provider_checksum_algorithm, local.provider_checksum), []
+                ).append(local)
+
+        provenance_sources: dict[str, list[IndexSourceRecord]] = {}
+        for source in sources:
+            if source.provenance_drive_file_id is not None:
+                provenance_sources.setdefault(source.provenance_drive_file_id, []).append(source)
+
+        rows: list[tuple[object, ...]] = []
+        exact_local_paths: set[str] = set()
+        represented_sources: set[str] = set()
+        canonical_drive_by_identity: dict[str, str] = {}
+        for drive in drives:
+            provenance = sorted(
+                provenance_sources.get(drive.drive_file_id, ()),
+                key=lambda source: source.source_id,
+            )
+            provenance_paths = {
+                source_to_local[source.source_id]
+                for source in provenance
+                if source.source_id in source_to_local
+            }
+            provenance_hashes = {
+                local_by_path[path].sha256 for path in provenance_paths
+            }
+            if len(provenance_hashes) > 1:
+                _fail("CORPUS_RECONCILIATION_MATCH_CONFLICT")
+
+            checksum_matches: list[LocalFileRecord] = []
+            if drive.checksum_algorithm is not None and drive.checksum is not None:
+                checksum_matches = sorted(
+                    checksum_to_locals.get(
+                        (drive.checksum_algorithm, drive.checksum), ()
+                    ),
+                    key=lambda record: record.relative_path,
+                )
+                if len({record.sha256 for record in checksum_matches}) > 1:
+                    _fail("CORPUS_RECONCILIATION_MATCH_CONFLICT")
+
+            selected_local: LocalFileRecord | None = None
+            method: str | None = None
+            selected_source_id: str | None = None
+            if provenance:
+                if provenance_paths:
+                    selected_path = sorted(provenance_paths)[0]
+                    selected_local = local_by_path[selected_path]
+                if checksum_matches and selected_local is not None and all(
+                    match.sha256 != selected_local.sha256 for match in checksum_matches
+                ):
+                    _fail("CORPUS_RECONCILIATION_MATCH_CONFLICT")
+                if selected_local is None and checksum_matches:
+                    selected_local = checksum_matches[0]
+                selected_source_id = provenance[0].source_id
+                method = "DRIVE_ID_PROVENANCE"
+            elif checksum_matches:
+                selected_local = checksum_matches[0]
+                method = "PROVIDER_CHECKSUM"
+
+            if provenance and selected_local is None and selected_source_id is not None:
+                selected_source = provenance[0]
+                identity_key = selected_source.content_sha256 or f"source:{selected_source_id}"
+                canonical_drive = canonical_drive_by_identity.get(identity_key)
+                status = "EXACT_MATCH" if canonical_drive is None else "DUPLICATE_ALIAS"
+                reason = (
+                    "EXACT_IDENTITY_CONFIRMED"
+                    if canonical_drive is None
+                    else "DUPLICATE_CONTENT_ALIAS"
+                )
+                canonical_drive_by_identity.setdefault(identity_key, drive.drive_file_id)
+                represented_sources.add(selected_source_id)
+                rows.append(
+                    _match_row(
+                        match_key=f"drive:{drive.drive_file_id}",
+                        drive_file_id=drive.drive_file_id,
+                        relative_path=None,
+                        source_id=selected_source_id,
+                        canonical_sha256=selected_source.content_sha256,
+                        match_method="DRIVE_ID_PROVENANCE",
+                        match_status=status,
+                        reason_code=reason,
+                    )
+                )
+                continue
+
+            if selected_local is not None and method is not None:
+                if selected_source_id is None:
+                    linked_sources = sorted(
+                        sources_by_local.get(selected_local.relative_path, ())
+                    )
+                    selected_source_id = linked_sources[0] if linked_sources else None
+                exact_local_paths.add(selected_local.relative_path)
+                if selected_source_id is not None:
+                    represented_sources.add(selected_source_id)
+                canonical_drive = canonical_drive_by_identity.get(selected_local.sha256)
+                status = "EXACT_MATCH" if canonical_drive is None else "DUPLICATE_ALIAS"
+                reason = (
+                    "EXACT_IDENTITY_CONFIRMED"
+                    if canonical_drive is None
+                    else "DUPLICATE_CONTENT_ALIAS"
+                )
+                canonical_drive_by_identity.setdefault(
+                    selected_local.sha256, drive.drive_file_id
+                )
+                rows.append(
+                    _match_row(
+                        match_key=f"drive:{drive.drive_file_id}",
+                        drive_file_id=drive.drive_file_id,
+                        relative_path=selected_local.relative_path,
+                        source_id=selected_source_id,
+                        canonical_sha256=selected_local.sha256,
+                        match_method=method,
+                        match_status=status,
+                        reason_code=reason,
+                    )
+                )
+                continue
+
+            filename_candidates = sorted(
+                (
+                    local
+                    for local in locals_
+                    if PurePosixPath(local.relative_path).name.casefold()
+                    == drive.name.casefold()
+                    and local.size_bytes == drive.size_bytes
+                ),
+                key=lambda record: record.relative_path,
+            )
+            if filename_candidates:
+                candidate = filename_candidates[0]
+                rows.append(
+                    _match_row(
+                        match_key=f"drive:{drive.drive_file_id}",
+                        drive_file_id=drive.drive_file_id,
+                        relative_path=candidate.relative_path,
+                        source_id=None,
+                        canonical_sha256=None,
+                        match_method="FILENAME_AND_SIZE",
+                        match_status="AMBIGUOUS_REVIEW_REQUIRED",
+                        reason_code="FILENAME_SIZE_NOT_IDENTITY",
+                    )
+                )
+            else:
+                rows.append(
+                    _match_row(
+                        match_key=f"drive:{drive.drive_file_id}",
+                        drive_file_id=drive.drive_file_id,
+                        relative_path=None,
+                        source_id=None,
+                        canonical_sha256=None,
+                        match_method="NONE",
+                        match_status="DRIVE_ONLY",
+                        reason_code="NO_EXACT_LOCAL_MATCH",
+                    )
+                )
+
+        for local in locals_:
+            if local.relative_path in exact_local_paths:
+                continue
+            linked_sources = sorted(sources_by_local.get(local.relative_path, ()))
+            source_id = linked_sources[0] if linked_sources else None
+            if source_id is not None:
+                represented_sources.update(linked_sources)
+                status = "LOCAL_ONLY"
+                reason = "NO_EXACT_DRIVE_MATCH"
+            elif local.parser_status == "PARSED":
+                status = "PARSED_NOT_INDEXED"
+                reason = "PARSED_SOURCE_ABSENT_FROM_INDEX"
+            else:
+                status = "LOCAL_ONLY"
+                reason = "LOCAL_SOURCE_UNMATCHED"
+            rows.append(
+                _match_row(
+                    match_key=f"local:{local.relative_path}",
+                    drive_file_id=None,
+                    relative_path=local.relative_path,
+                    source_id=source_id,
+                    canonical_sha256=local.sha256,
+                    match_method="INGESTION_PROVENANCE" if source_id else "NONE",
+                    match_status=status,
+                    reason_code=reason,
+                )
+            )
+
+        for source in sources:
+            if source.source_id in represented_sources:
+                continue
+            rows.append(
+                _match_row(
+                    match_key=f"index:{source.source_id}",
+                    drive_file_id=None,
+                    relative_path=None,
+                    source_id=source.source_id,
+                    canonical_sha256=source.content_sha256,
+                    match_method="NONE",
+                    match_status="INDEX_ONLY",
+                    reason_code="INDEX_SOURCE_ABSENT_FROM_LOCAL_INVENTORY",
+                )
+            )
+
+        with store._connection:
+            store._connection.execute(
+                "delete from document_matches where run_id = ?", (store.run_id,)
+            )
+            store._connection.executemany(
+                """
+                insert into document_matches(
+                    run_id, match_key, drive_file_id, relative_path, source_id,
+                    canonical_sha256, match_method, match_status, reason_code
+                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                ((store.run_id, *row) for row in rows),
+            )
+            store._connection.execute(
+                """
+                insert into checkpoints(
+                    run_id, stage, status, committed_records, error_code
+                ) values (?, ?, 'COMPLETE', ?, null)
+                on conflict(run_id, stage) do update set
+                    status = 'COMPLETE',
+                    committed_records = excluded.committed_records,
+                    error_code = null,
+                    updated_at = current_timestamp
+                """,
+                (store.run_id, stage, len(rows)),
+            )
+    except CorpusReconciliationError as error:
+        _block_stage(store, stage=stage, table="document_matches", error_code=str(error))
+        raise
+    except (json.JSONDecodeError, sqlite3.Error) as error:
+        code = "CORPUS_RECONCILIATION_MATCH_FAILED"
+        _block_stage(store, stage=stage, table="document_matches", error_code=code)
+        raise CorpusReconciliationError(code) from error
+
+    counts = {
+        status: sum(1 for row in rows if row[6] == status)
+        for status in (
+            "EXACT_MATCH",
+            "DUPLICATE_ALIAS",
+            "DRIVE_ONLY",
+            "LOCAL_ONLY",
+            "PARSED_NOT_INDEXED",
+            "INDEX_ONLY",
+            "AMBIGUOUS_REVIEW_REQUIRED",
+            "INELIGIBLE",
+        )
+    }
+    return MatchSummary(
+        exact_match=counts["EXACT_MATCH"],
+        duplicate_alias=counts["DUPLICATE_ALIAS"],
+        drive_only=counts["DRIVE_ONLY"],
+        local_only=counts["LOCAL_ONLY"],
+        parsed_not_indexed=counts["PARSED_NOT_INDEXED"],
+        index_only=counts["INDEX_ONLY"],
+        ambiguous_review_required=counts["AMBIGUOUS_REVIEW_REQUIRED"],
+        ineligible=counts["INELIGIBLE"],
+    )

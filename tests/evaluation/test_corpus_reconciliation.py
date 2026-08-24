@@ -76,6 +76,8 @@ def test_local_and_index_records_are_metadata_only() -> None:
             "chunk_count": 2,
             "embedding_model": "model",
             "index_contract_sha256": "b" * 64,
+            "provenance_drive_file_id": None,
+            "content_sha256": None,
         }
     )
     locator = IndexLocatorRecord.from_mapping(
@@ -188,17 +190,23 @@ def _create_store(tmp_path: Path):
     )
 
 
-def _drive_record(*, drive_file_id: str = "drive-1", size_bytes: int = 10):
+def _drive_record(
+    *,
+    drive_file_id: str = "drive-1",
+    size_bytes: int = 10,
+    name: str | None = None,
+    checksum: str | None = "c" * 32,
+):
     from oilfield_chemical_copilot.evaluation.corpus_reconciliation import DriveFileRecord
 
     return DriveFileRecord.from_mapping(
         {
             "drive_file_id": drive_file_id,
-            "name": f"{drive_file_id}.pdf",
+            "name": name or f"{drive_file_id}.pdf",
             "mime_type": "application/pdf",
             "size_bytes": size_bytes,
-            "checksum_algorithm": "md5",
-            "checksum": "c" * 32,
+            "checksum_algorithm": "md5" if checksum is not None else None,
+            "checksum": checksum,
             "modified_time": "2026-08-23T00:00:00Z",
             "parent_ids": ["folder-1"],
         }
@@ -319,6 +327,8 @@ def test_index_inventory_requires_bound_contract_and_exact_totals(tmp_path: Path
             "chunk_count": 2,
             "embedding_model": "model",
             "index_contract_sha256": "a" * 64,
+            "provenance_drive_file_id": None,
+            "content_sha256": None,
         }
     )
     locator = IndexLocatorRecord.from_mapping(
@@ -370,6 +380,8 @@ def test_index_duplicate_locator_conflict_fails_closed(tmp_path: Path) -> None:
         chunk_count=2,
         embedding_model="model",
         index_contract_sha256="a" * 64,
+        provenance_drive_file_id=None,
+        content_sha256=None,
     )
     locators = (
         IndexLocatorRecord("source-1", "page:1", "scale", "supporting", "SUBSTANTIVE"),
@@ -389,4 +401,346 @@ def test_index_duplicate_locator_conflict_fails_closed(tmp_path: Path) -> None:
     assert checkpoint.status == "BLOCKED"
     assert checkpoint.error_code == "CORPUS_RECONCILIATION_INDEX_LOCATOR_CONFLICT"
     assert store.count("index_sources") == 0
+    store.close()
+
+
+def _source_record(
+    *,
+    source_id: str = "source-1",
+    source_path: str = "approved/private.pdf",
+    drive_file_id: str | None = None,
+    content_sha256: str | None = None,
+):
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import IndexSourceRecord
+
+    return IndexSourceRecord.from_mapping(
+        {
+            "source_id": source_id,
+            "source_path": source_path,
+            "parser_type": "pdf",
+            "topic": "scale",
+            "chunk_count": 1,
+            "embedding_model": "model",
+            "index_contract_sha256": "a" * 64,
+            "provenance_drive_file_id": drive_file_id,
+            "content_sha256": content_sha256,
+        }
+    )
+
+
+def _locator_record(*, source_id: str = "source-1"):
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import IndexLocatorRecord
+
+    return IndexLocatorRecord.from_mapping(
+        {
+            "source_id": source_id,
+            "locator": "page:1",
+            "topic": "scale",
+            "source_role": "supporting",
+            "substantive_status": "SUBSTANTIVE",
+        }
+    )
+
+
+def _write_local_file(tmp_path: Path, *, name: str, content: bytes) -> Path:
+    approved_root = tmp_path / "approved"
+    approved_root.mkdir(exist_ok=True)
+    (approved_root / name).write_bytes(content)
+    return approved_root
+
+
+def test_same_algorithm_checksum_creates_exact_match(tmp_path: Path) -> None:
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        import_drive_page,
+        import_index_inventory,
+        inventory_local_files,
+        reconcile_document_matches,
+    )
+
+    content = b"exact-document"
+    root = _write_local_file(tmp_path, name="private.pdf", content=content)
+    store = _create_store(tmp_path)
+    inventory_local_files(store=store, roots=(root,))
+    import_drive_page(
+        store=store,
+        records=(
+            _drive_record(
+                size_bytes=len(content),
+                name="private.pdf",
+                checksum=hashlib.md5(content, usedforsecurity=False).hexdigest(),
+            ),
+        ),
+        next_page_token=None,
+    )
+    import_index_inventory(
+        store=store,
+        sources=(_source_record(),),
+        locators=(_locator_record(),),
+        expected_source_count=1,
+        expected_chunk_count=1,
+    )
+
+    summary = reconcile_document_matches(store=store)
+
+    assert summary.exact_match == 1
+    assert store.match_status("drive-1") == "EXACT_MATCH"
+    assert store.match_method("drive-1") == "PROVIDER_CHECKSUM"
+    store.close()
+
+
+def test_filename_and_size_only_requires_review(tmp_path: Path) -> None:
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        import_drive_page,
+        import_index_inventory,
+        inventory_local_files,
+        reconcile_document_matches,
+    )
+
+    content = b"same-size"
+    root = _write_local_file(tmp_path, name="private.pdf", content=content)
+    store = _create_store(tmp_path)
+    inventory_local_files(store=store, roots=(root,))
+    import_drive_page(
+        store=store,
+        records=(
+            _drive_record(
+                size_bytes=len(content), name="private.pdf", checksum=None
+            ),
+        ),
+        next_page_token=None,
+    )
+    import_index_inventory(
+        store=store,
+        sources=(_source_record(),),
+        locators=(_locator_record(),),
+        expected_source_count=1,
+        expected_chunk_count=1,
+    )
+
+    summary = reconcile_document_matches(store=store)
+
+    assert summary.ambiguous_review_required == 1
+    assert store.match_status("drive-1") == "AMBIGUOUS_REVIEW_REQUIRED"
+    store.close()
+
+
+def test_exact_drive_id_provenance_outranks_absent_checksum(tmp_path: Path) -> None:
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        import_drive_page,
+        import_index_inventory,
+        inventory_local_files,
+        reconcile_document_matches,
+    )
+
+    content = b"provenance-document"
+    root = _write_local_file(tmp_path, name="private.pdf", content=content)
+    store = _create_store(tmp_path)
+    inventory_local_files(store=store, roots=(root,))
+    import_drive_page(
+        store=store,
+        records=(
+            _drive_record(size_bytes=len(content), name="renamed.pdf", checksum=None),
+        ),
+        next_page_token=None,
+    )
+    import_index_inventory(
+        store=store,
+        sources=(_source_record(drive_file_id="drive-1"),),
+        locators=(_locator_record(),),
+        expected_source_count=1,
+        expected_chunk_count=1,
+    )
+
+    reconcile_document_matches(store=store)
+
+    assert store.match_status("drive-1") == "EXACT_MATCH"
+    assert store.match_method("drive-1") == "DRIVE_ID_PROVENANCE"
+    store.close()
+
+
+def test_exact_drive_id_provenance_does_not_require_local_copy(tmp_path: Path) -> None:
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        import_drive_page,
+        import_index_inventory,
+        inventory_local_files,
+        reconcile_document_matches,
+    )
+
+    empty_root = tmp_path / "approved"
+    empty_root.mkdir()
+    store = _create_store(tmp_path)
+    inventory_local_files(store=store, roots=(empty_root,))
+    import_drive_page(
+        store=store,
+        records=(_drive_record(size_bytes=20, checksum=None),),
+        next_page_token=None,
+    )
+    import_index_inventory(
+        store=store,
+        sources=(
+            _source_record(
+                drive_file_id="drive-1", content_sha256="f" * 64
+            ),
+        ),
+        locators=(_locator_record(),),
+        expected_source_count=1,
+        expected_chunk_count=1,
+    )
+
+    summary = reconcile_document_matches(store=store)
+
+    assert summary.exact_match == 1
+    assert summary.index_only == 0
+    assert store.match_method("drive-1") == "DRIVE_ID_PROVENANCE"
+    store.close()
+
+
+def test_conflicting_high_and_lower_precedence_identity_fails_closed(tmp_path: Path) -> None:
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        CorpusReconciliationError,
+        import_drive_page,
+        import_index_inventory,
+        inventory_local_files,
+        reconcile_document_matches,
+    )
+
+    first = b"first-document"
+    second = b"second-document"
+    root = _write_local_file(tmp_path, name="first.pdf", content=first)
+    _write_local_file(tmp_path, name="second.pdf", content=second)
+    store = _create_store(tmp_path)
+    inventory_local_files(store=store, roots=(root,))
+    import_drive_page(
+        store=store,
+        records=(
+            _drive_record(
+                size_bytes=len(second),
+                name="second.pdf",
+                checksum=hashlib.md5(second, usedforsecurity=False).hexdigest(),
+            ),
+        ),
+        next_page_token=None,
+    )
+    import_index_inventory(
+        store=store,
+        sources=(
+            _source_record(
+                source_path="approved/first.pdf", drive_file_id="drive-1"
+            ),
+        ),
+        locators=(_locator_record(),),
+        expected_source_count=1,
+        expected_chunk_count=1,
+    )
+
+    with pytest.raises(CorpusReconciliationError, match="CORPUS_RECONCILIATION_MATCH_CONFLICT"):
+        reconcile_document_matches(store=store)
+
+    assert store.count("document_matches") == 0
+    store.close()
+
+
+def test_duplicate_drive_aliases_share_one_canonical_content_identity(tmp_path: Path) -> None:
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        import_drive_page,
+        import_index_inventory,
+        inventory_local_files,
+        reconcile_document_matches,
+    )
+
+    content = b"duplicate-content"
+    checksum = hashlib.md5(content, usedforsecurity=False).hexdigest()
+    root = _write_local_file(tmp_path, name="private.pdf", content=content)
+    store = _create_store(tmp_path)
+    inventory_local_files(store=store, roots=(root,))
+    import_drive_page(
+        store=store,
+        records=(
+            _drive_record(
+                drive_file_id="drive-1",
+                size_bytes=len(content),
+                checksum=checksum,
+            ),
+            _drive_record(
+                drive_file_id="drive-2",
+                size_bytes=len(content),
+                checksum=checksum,
+            ),
+        ),
+        next_page_token=None,
+    )
+    import_index_inventory(
+        store=store,
+        sources=(_source_record(),),
+        locators=(_locator_record(),),
+        expected_source_count=1,
+        expected_chunk_count=1,
+    )
+
+    summary = reconcile_document_matches(store=store)
+
+    assert summary.exact_match == 1
+    assert summary.duplicate_alias == 1
+    assert store.match_status("drive-2") == "DUPLICATE_ALIAS"
+    store.close()
+
+
+def test_index_source_cannot_map_to_conflicting_content_hash(tmp_path: Path) -> None:
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        CorpusReconciliationError,
+        import_drive_page,
+        import_index_inventory,
+        inventory_local_files,
+        reconcile_document_matches,
+    )
+
+    root = _write_local_file(tmp_path, name="private.pdf", content=b"actual-content")
+    store = _create_store(tmp_path)
+    inventory_local_files(store=store, roots=(root,))
+    import_drive_page(store=store, records=(), next_page_token=None)
+    import_index_inventory(
+        store=store,
+        sources=(_source_record(content_sha256="e" * 64),),
+        locators=(_locator_record(),),
+        expected_source_count=1,
+        expected_chunk_count=1,
+    )
+
+    with pytest.raises(CorpusReconciliationError, match="CORPUS_RECONCILIATION_INDEX_HASH_CONFLICT"):
+        reconcile_document_matches(store=store)
+
+    assert store.count("document_matches") == 0
+    store.close()
+
+
+def test_ingestion_content_sha_binds_renamed_local_to_index(tmp_path: Path) -> None:
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        import_drive_page,
+        import_index_inventory,
+        inventory_local_files,
+        reconcile_document_matches,
+    )
+
+    content = b"renamed-local-content"
+    root = _write_local_file(tmp_path, name="renamed.pdf", content=content)
+    store = _create_store(tmp_path)
+    inventory_local_files(store=store, roots=(root,))
+    import_drive_page(store=store, records=(), next_page_token=None)
+    import_index_inventory(
+        store=store,
+        sources=(
+            _source_record(
+                source_path="approved/original.pdf",
+                content_sha256=hashlib.sha256(content).hexdigest(),
+            ),
+        ),
+        locators=(_locator_record(),),
+        expected_source_count=1,
+        expected_chunk_count=1,
+    )
+
+    summary = reconcile_document_matches(store=store)
+
+    assert summary.local_only == 1
+    assert summary.index_only == 0
     store.close()

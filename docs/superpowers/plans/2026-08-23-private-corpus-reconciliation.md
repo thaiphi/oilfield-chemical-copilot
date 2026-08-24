@@ -146,7 +146,7 @@ git commit -m "feat: import resumable corpus metadata"
 - Consumes: imported Drive, local, and index records.
 - Produces: `reconcile_document_matches(store) -> MatchSummary` and closed statuses `EXACT_MATCH`, `DUPLICATE_ALIAS`, `DRIVE_ONLY`, `LOCAL_ONLY`, `PARSED_NOT_INDEXED`, `INDEX_ONLY`, `AMBIGUOUS_REVIEW_REQUIRED`, and `INELIGIBLE`.
 
-- [ ] **Step 1: Write failing tests for match precedence and conflicts**
+- [x] **Step 1: Write failing tests for match precedence and conflicts**
 
 ```python
 def test_filename_and_size_only_requires_review(store_with_three_layers: ReconciliationStore) -> None:
@@ -157,21 +157,21 @@ def test_filename_and_size_only_requires_review(store_with_three_layers: Reconci
 
 Test exact Drive-ID provenance, same-algorithm checksum equality, exact ingestion provenance, conflicting higher-precedence evidence, one canonical content identity for duplicate aliases, and rejection when one indexed source maps to conflicting hashes.
 
-- [ ] **Step 2: Run matching tests and verify RED**
+- [x] **Step 2: Run matching tests and verify RED**
 
 Run: `uv run pytest -q tests/evaluation/test_corpus_reconciliation.py -k "match or duplicate or ambiguous"`
 
-- [ ] **Step 3: Implement deterministic matching**
+- [x] **Step 3: Implement deterministic matching**
 
 Apply the exact precedence from the spec. Do not calculate confidence scores. Persist a match only when all higher-precedence evidence is absent or consistent. Use closed reason codes for review candidates.
 
-- [ ] **Step 4: Run focused tests and Ruff**
+- [x] **Step 4: Run focused tests and Ruff**
 
 Run: `uv run pytest -q tests/evaluation/test_corpus_reconciliation.py`
 
 Run: `uv run ruff check src/oilfield_chemical_copilot/evaluation/corpus_reconciliation.py tests/evaluation/test_corpus_reconciliation.py`
 
-- [ ] **Step 5: Commit Task 3**
+- [x] **Step 5: Commit Task 3**
 
 ```powershell
 git add -- src/oilfield_chemical_copilot/evaluation/corpus_reconciliation.py tests/evaluation/test_corpus_reconciliation.py
