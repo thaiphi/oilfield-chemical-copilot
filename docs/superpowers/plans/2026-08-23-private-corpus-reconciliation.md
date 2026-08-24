@@ -272,7 +272,7 @@ git commit -m "feat: seal corpus reconciliation snapshots"
 - Consumes: Tasks 1-5 APIs, existing `verify_e1_index_contract`, existing E1a-3 sealed allocation, JSON Drive pages on stdin, approved local roots, and read-only PostgreSQL metadata.
 - Produces CLI commands `init`, `import-drive-page`, `inventory-local`, `import-index`, `reconcile`, `capacity`, `seal`, and `status`.
 
-- [ ] **Step 1: Write failing CLI tests for safe status, stdin imports, read-only index import, and sanitized failure**
+- [x] **Step 1: Write failing CLI tests for safe status, stdin imports, read-only index import, and sanitized failure**
 
 ```python
 def test_cli_rejects_missing_prerequisites_without_traceback(monkeypatch, capsys) -> None:
@@ -285,15 +285,15 @@ def test_cli_rejects_missing_prerequisites_without_traceback(monkeypatch, capsys
 
 Test exact private root, no raw paths/IDs/hashes in stdout or stderr, invalid stdin schema, no model initialization, PostgreSQL `default_transaction_read_only=on`, exact contract verification before the first index query, and safe aggregate status keys.
 
-- [ ] **Step 2: Run CLI tests and verify RED**
+- [x] **Step 2: Run CLI tests and verify RED**
 
 Run: `uv run pytest -q tests/evaluation/test_corpus_reconciliation.py -k "cli"`
 
-- [ ] **Step 3: Implement the CLI**
+- [x] **Step 3: Implement the CLI**
 
 `import-drive-page` reads exactly one JSON object from stdin with keys `records` and `next_page_token`. `inventory-local` accepts only explicitly provided roots and never follows symlinks outside them. `import-index` selects only source metadata and locators from `chunks` after contract verification. Every command opens the existing run, executes one stage, commits, and emits aggregate JSON.
 
-- [ ] **Step 4: Run focused tests, Ruff, and CLI preflight**
+- [x] **Step 4: Run focused tests, Ruff, and CLI preflight**
 
 Run: `uv run pytest -q tests/evaluation/test_corpus_reconciliation.py`
 
@@ -303,7 +303,7 @@ Run: `uv run python eval/reconcile_private_corpus.py status`
 
 Expected before private initialization: one sanitized blocked object and exit code 1.
 
-- [ ] **Step 5: Commit Task 6**
+- [x] **Step 5: Commit Task 6**
 
 ```powershell
 git add -- src/oilfield_chemical_copilot/evaluation/corpus_reconciliation.py eval/reconcile_private_corpus.py tests/evaluation/test_corpus_reconciliation.py

@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import sqlite3
 import hashlib
+import importlib.util
+import io
 import json
 from pathlib import Path
+import sys
 
 import pytest
 
@@ -1100,3 +1103,154 @@ def test_snapshot_seal_rolls_back_complete_set_after_mid_publish_failure(
     assert not tuple(snapshots.glob("*.sha256"))
     assert not tuple(snapshots.glob(".*.tmp"))
     store.close()
+
+
+def _corpus_runner_module() -> object:
+    path = Path(__file__).resolve().parents[2] / "eval" / "reconcile_private_corpus.py"
+    spec = importlib.util.spec_from_file_location("test_reconcile_private_corpus", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_cli_rejects_missing_prerequisites_without_traceback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runner = _corpus_runner_module()
+    root = tmp_path / ".private" / "corpus-reconciliation" / "v1"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "reconcile_private_corpus.py",
+            "status",
+            "--private-root",
+            str(root),
+            "--run-id",
+            "run-001",
+        ],
+    )
+
+    assert runner.cli() == 1
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert json.loads(captured.err) == {
+        "status": "CORPUS_RECONCILIATION_BLOCKED",
+        "error_code": "CORPUS_RECONCILIATION_PREREQUISITES_MISSING",
+    }
+    assert "Traceback" not in captured.err
+    assert str(root) not in captured.err
+
+
+def test_cli_rejects_invalid_drive_stdin_without_echoing_private_fields(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runner = _corpus_runner_module()
+    store = _create_store(tmp_path)
+    root = store.root
+    store.close()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "reconcile_private_corpus.py",
+            "import-drive-page",
+            "--private-root",
+            str(root),
+            "--run-id",
+            "run-001",
+        ],
+    )
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        io.StringIO('{"records":[],"next_page_token":null,"content":"private"}'),
+    )
+
+    assert runner.cli() == 1
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    error = json.loads(captured.err)
+    assert error == {
+        "status": "CORPUS_RECONCILIATION_BLOCKED",
+        "error_code": "CORPUS_RECONCILIATION_DRIVE_STDIN_INVALID",
+    }
+    assert "private" not in captured.err
+    assert str(root) not in captured.err
+
+
+def test_cli_status_is_aggregate_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runner = _corpus_runner_module()
+    store = _create_store(tmp_path)
+    root = store.root
+    store.close()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "reconcile_private_corpus.py",
+            "status",
+            "--private-root",
+            str(root),
+            "--run-id",
+            "run-001",
+        ],
+    )
+
+    assert runner.cli() == 0
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert captured.err == ""
+    assert set(payload) == {"status", "counts", "stages", "snapshots_complete"}
+    assert set(payload["counts"]) == {
+        "drive_files",
+        "local_files",
+        "index_sources",
+        "index_locators",
+        "document_matches",
+        "review_decisions",
+    }
+    assert str(root) not in captured.out
+    assert "run-001" not in captured.out
+    assert "a" * 64 not in captured.out
+
+
+def test_index_connection_verifies_contract_before_read_only_connect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = _corpus_runner_module()
+    events = []
+    sentinel = object()
+    contract = tmp_path / "index-contract.json"
+
+    def verify(**kwargs):
+        events.append(("verify", kwargs))
+        return object()
+
+    def connect(database_url: str, **kwargs):
+        events.append(("connect", database_url, kwargs))
+        return sentinel
+
+    monkeypatch.setattr(runner, "verify_e1_index_contract", verify)
+    monkeypatch.setattr(runner.psycopg, "connect", connect)
+
+    connection = runner._verified_read_only_connection(
+        database_url="postgresql://private",
+        index_contract=contract,
+    )
+
+    assert connection is sentinel
+    assert [event[0] for event in events] == ["verify", "connect"]
+    assert events[1][2]["options"] == "-c default_transaction_read_only=on"

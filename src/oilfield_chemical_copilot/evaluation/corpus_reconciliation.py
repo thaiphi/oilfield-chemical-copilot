@@ -683,6 +683,18 @@ class ReconciliationStore:
             _fail("CORPUS_RECONCILIATION_RUN_INVALID")
         return str(row[0])
 
+    def contract_digests(self) -> tuple[str, str]:
+        row = self._connection.execute(
+            """
+            select index_contract_sha256, e1a3_allocation_sha256
+            from runs where run_id = ?
+            """,
+            (self.run_id,),
+        ).fetchone()
+        if row is None:
+            _fail("CORPUS_RECONCILIATION_RUN_INVALID")
+        return str(row[0]), str(row[1])
+
     def local_file(self, relative_path: str) -> LocalFileRecord:
         safe_path = _relative_path(relative_path, "CORPUS_RECONCILIATION_LOCAL_RECORD_INVALID")
         row = self._connection.execute(
