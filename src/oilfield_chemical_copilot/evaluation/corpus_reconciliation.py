@@ -5,8 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import os
 from pathlib import Path, PurePosixPath
 import sqlite3
+from tempfile import NamedTemporaryFile
 from typing import Iterable, Mapping
 
 from oilfield_chemical_copilot.evaluation.e1a3_sampling import (
@@ -24,6 +26,14 @@ CHECKPOINT_STATUSES = frozenset({"NOT_STARTED", "IN_PROGRESS", "COMPLETE", "BLOC
 TOPICS = frozenset({"iron_sulfide", "scale", "corrosion", "paraffin"})
 SOURCE_ROLES = frozenset({"foundational", "supporting"})
 SUBSTANTIVE_STATUSES = frozenset({"SUBSTANTIVE", "TITLE_ONLY", "INELIGIBLE"})
+SNAPSHOT_NAMES = (
+    "drive-inventory.jsonl",
+    "local-inventory.jsonl",
+    "index-inventory.jsonl",
+    "document-matches.jsonl",
+    "review-decisions.jsonl",
+    "locator-capacity.jsonl",
+)
 
 
 class CorpusReconciliationError(RuntimeError):
@@ -401,6 +411,20 @@ class DryRunResult:
     status: str
     error_code: str | None
     allocations: tuple[E1A3SlotAllocation, ...]
+
+
+@dataclass(frozen=True)
+class SnapshotArtifact:
+    name: str
+    path: Path
+    manifest_path: Path
+    sha256: str
+    record_count: int
+
+
+@dataclass(frozen=True)
+class SnapshotSet:
+    artifacts: tuple[SnapshotArtifact, ...]
 
 
 class ReconciliationStore:
@@ -1031,15 +1055,15 @@ def import_index_inventory(
     return StageResult(stage=stage, status="COMPLETE", committed_records=committed)
 
 
-def _require_complete_checkpoint(store: ReconciliationStore, stage: str) -> None:
+def _require_complete_checkpoint(
+    store: ReconciliationStore, stage: str, *, error_code: str
+) -> None:
     try:
         checkpoint = store.checkpoint(stage)
     except CorpusReconciliationError as error:
-        raise CorpusReconciliationError(
-            "CORPUS_RECONCILIATION_MATCH_INPUT_INCOMPLETE"
-        ) from error
+        raise CorpusReconciliationError(error_code) from error
     if checkpoint.status != "COMPLETE":
-        _fail("CORPUS_RECONCILIATION_MATCH_INPUT_INCOMPLETE")
+        _fail(error_code)
 
 
 def _load_drive_records(store: ReconciliationStore) -> tuple[DriveFileRecord, ...]:
@@ -1146,7 +1170,11 @@ def reconcile_document_matches(*, store: ReconciliationStore) -> MatchSummary:
     """Reconcile exact identities without confidence scores or content access."""
     stage = "document_matching"
     for prerequisite in ("drive_inventory", "local_inventory", "index_inventory"):
-        _require_complete_checkpoint(store, prerequisite)
+        _require_complete_checkpoint(
+            store,
+            prerequisite,
+            error_code="CORPUS_RECONCILIATION_MATCH_INPUT_INCOMPLETE",
+        )
     try:
         drives = _load_drive_records(store)
         locals_ = _load_local_records(store)
@@ -1460,7 +1488,11 @@ def _calculate_locator_capacity(
     *, store: ReconciliationStore, prior_locator_keys: Iterable[str]
 ) -> CapacityReport:
     """Count fresh substantive locators in all eight E1a-4 strata."""
-    _require_complete_checkpoint(store, "index_inventory")
+    _require_complete_checkpoint(
+        store,
+        "index_inventory",
+        error_code="CORPUS_RECONCILIATION_CAPACITY_INPUT_INCOMPLETE",
+    )
     rows = _locator_inventory_rows(store)
     inventory_keys = {f"{row['source_id']}:{row['locator']}" for row in rows}
     prior = _validated_prior_locator_keys(
@@ -1661,3 +1693,412 @@ def dry_run_e1a4_allocation(
     return DryRunResult(
         status="COMPLETE", error_code=None, allocations=allocations
     )
+
+
+def _snapshot_root(root: Path) -> Path:
+    resolved = root.resolve()
+    if not (
+        resolved.name == "v1"
+        and resolved.parent.name == "corpus-reconciliation"
+        and resolved.parent.parent.name == ".private"
+    ):
+        _fail("CORPUS_RECONCILIATION_PRIVATE_ROOT_INVALID")
+    return resolved
+
+
+def _canonical_jsonl(records: Iterable[Mapping[str, object]]) -> bytes:
+    lines = sorted(
+        json.dumps(dict(record), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        for record in records
+    )
+    if not lines:
+        return b""
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def _snapshot_payloads(store: ReconciliationStore) -> dict[str, bytes]:
+    for stage in (
+        "drive_inventory",
+        "local_inventory",
+        "index_inventory",
+        "document_matching",
+        "locator_capacity",
+    ):
+        _require_complete_checkpoint(
+            store,
+            stage,
+            error_code="CORPUS_RECONCILIATION_SNAPSHOT_INPUT_INCOMPLETE",
+        )
+
+    drives = tuple(record.to_mapping() for record in _load_drive_records(store))
+    locals_ = tuple(record.to_mapping() for record in _load_local_records(store))
+    source_rows = tuple(
+        {"record_type": "source", **record.to_mapping()}
+        for record in _load_index_sources(store)
+    )
+    locator_rows = tuple(
+        {
+            "record_type": "locator",
+            "source_id": row["source_id"],
+            "locator": row["locator"],
+            "topic": row["topic"],
+            "source_role": row["source_role"],
+            "substantive_status": row["substantive_status"],
+            "e1a3_used": bool(row["e1a3_used"]),
+            "e1a4_available": bool(row["e1a4_available"]),
+        }
+        for row in store._connection.execute(
+            """
+            select source_id, locator, topic, source_role, substantive_status,
+                   e1a3_used, e1a4_available
+            from index_locators where run_id = ?
+            """,
+            (store.run_id,),
+        ).fetchall()
+    )
+    matches = tuple(
+        dict(row)
+        for row in store._connection.execute(
+            """
+            select match_key, drive_file_id, relative_path, source_id,
+                   canonical_sha256, match_method, match_status, reason_code
+            from document_matches where run_id = ?
+            """,
+            (store.run_id,),
+        ).fetchall()
+    )
+    decisions = tuple(
+        dict(row)
+        for row in store._connection.execute(
+            """
+            select decision_id, match_key, decision, reviewer_id, reason_code,
+                   supersedes_decision_id, decided_at
+            from review_decisions where run_id = ?
+            """,
+            (store.run_id,),
+        ).fetchall()
+    )
+    capacity_counts = {
+        (topic, role): 0
+        for topic in ("iron_sulfide", "scale", "corrosion", "paraffin")
+        for role in ("foundational", "supporting")
+    }
+    for row in locator_rows:
+        if row["e1a4_available"] is True:
+            capacity_counts[(str(row["topic"]), str(row["source_role"]))] += 1
+    capacity = tuple(
+        {
+            "topic": topic,
+            "source_role": role,
+            "fresh_locator_count": capacity_counts[(topic, role)],
+            "required_locators": 12,
+            "sufficient": capacity_counts[(topic, role)] >= 12,
+        }
+        for topic in ("iron_sulfide", "scale", "corrosion", "paraffin")
+        for role in ("foundational", "supporting")
+    )
+    return {
+        "drive-inventory.jsonl": _canonical_jsonl(drives),
+        "local-inventory.jsonl": _canonical_jsonl(locals_),
+        "index-inventory.jsonl": _canonical_jsonl((*source_rows, *locator_rows)),
+        "document-matches.jsonl": _canonical_jsonl(matches),
+        "review-decisions.jsonl": _canonical_jsonl(decisions),
+        "locator-capacity.jsonl": _canonical_jsonl(capacity),
+    }
+
+
+_DRIVE_SNAPSHOT_KEYS = frozenset(
+    {
+        "drive_file_id",
+        "name",
+        "mime_type",
+        "size_bytes",
+        "checksum_algorithm",
+        "checksum",
+        "modified_time",
+        "parent_ids",
+    }
+)
+_LOCAL_SNAPSHOT_KEYS = frozenset(
+    {
+        "relative_path",
+        "sha256",
+        "provider_checksum_algorithm",
+        "provider_checksum",
+        "size_bytes",
+        "file_type",
+        "parser_status",
+        "page_or_sheet_count",
+    }
+)
+_INDEX_SOURCE_SNAPSHOT_KEYS = frozenset(
+    {
+        "record_type",
+        "source_id",
+        "source_path",
+        "parser_type",
+        "topic",
+        "chunk_count",
+        "embedding_model",
+        "index_contract_sha256",
+        "provenance_drive_file_id",
+        "content_sha256",
+    }
+)
+_INDEX_LOCATOR_SNAPSHOT_KEYS = frozenset(
+    {
+        "record_type",
+        "source_id",
+        "locator",
+        "topic",
+        "source_role",
+        "substantive_status",
+        "e1a3_used",
+        "e1a4_available",
+    }
+)
+_MATCH_SNAPSHOT_KEYS = frozenset(
+    {
+        "match_key",
+        "drive_file_id",
+        "relative_path",
+        "source_id",
+        "canonical_sha256",
+        "match_method",
+        "match_status",
+        "reason_code",
+    }
+)
+_DECISION_SNAPSHOT_KEYS = frozenset(
+    {
+        "decision_id",
+        "match_key",
+        "decision",
+        "reviewer_id",
+        "reason_code",
+        "supersedes_decision_id",
+        "decided_at",
+    }
+)
+_CAPACITY_SNAPSHOT_KEYS = frozenset(
+    {
+        "topic",
+        "source_role",
+        "fresh_locator_count",
+        "required_locators",
+        "sufficient",
+    }
+)
+
+
+def _validate_snapshot_record(name: str, record: object) -> None:
+    code = "CORPUS_RECONCILIATION_SNAPSHOT_SCHEMA_INVALID"
+    if not isinstance(record, Mapping):
+        _fail(code)
+    if name == "drive-inventory.jsonl":
+        _exact_keys(record, _DRIVE_SNAPSHOT_KEYS, code)
+        DriveFileRecord.from_mapping(record)
+        return
+    if name == "local-inventory.jsonl":
+        _exact_keys(record, _LOCAL_SNAPSHOT_KEYS, code)
+        LocalFileRecord.from_mapping(record)
+        return
+    if name == "index-inventory.jsonl":
+        record_type = record.get("record_type")
+        if record_type == "source":
+            _exact_keys(record, _INDEX_SOURCE_SNAPSHOT_KEYS, code)
+            IndexSourceRecord.from_mapping(
+                {key: value for key, value in record.items() if key != "record_type"}
+            )
+            return
+        if record_type == "locator":
+            _exact_keys(record, _INDEX_LOCATOR_SNAPSHOT_KEYS, code)
+            if type(record["e1a3_used"]) is not bool or type(
+                record["e1a4_available"]
+            ) is not bool:
+                _fail(code)
+            IndexLocatorRecord.from_mapping(
+                {
+                    key: value
+                    for key, value in record.items()
+                    if key not in {"record_type", "e1a3_used", "e1a4_available"}
+                }
+            )
+            return
+        _fail(code)
+    expected = {
+        "document-matches.jsonl": _MATCH_SNAPSHOT_KEYS,
+        "review-decisions.jsonl": _DECISION_SNAPSHOT_KEYS,
+        "locator-capacity.jsonl": _CAPACITY_SNAPSHOT_KEYS,
+    }.get(name)
+    if expected is None:
+        _fail(code)
+    _exact_keys(record, expected, code)
+    if name == "locator-capacity.jsonl":
+        topic = _string(record["topic"], code)
+        role = _string(record["source_role"], code)
+        fresh = _integer(record["fresh_locator_count"], code)
+        required = _integer(record["required_locators"], code, minimum=1)
+        if (
+            topic not in TOPICS
+            or role not in SOURCE_ROLES
+            or type(record["sufficient"]) is not bool
+            or record["sufficient"] != (fresh >= required)
+        ):
+            _fail(code)
+    else:
+        for key, value in record.items():
+            if value is not None and not isinstance(value, str):
+                _fail(code)
+
+
+def _verified_snapshot_records(name: str, content: bytes) -> int:
+    code = "CORPUS_RECONCILIATION_SNAPSHOT_SCHEMA_INVALID"
+    if content and not content.endswith(b"\n"):
+        _fail(code)
+    try:
+        text = content.decode("utf-8")
+        records = tuple(json.loads(line) for line in text.splitlines())
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise CorpusReconciliationError(code) from error
+    for record in records:
+        _validate_snapshot_record(name, record)
+    if _canonical_jsonl(records) != content:
+        _fail(code)
+    return len(records)
+
+
+def verify_reconciliation_snapshots(*, root: Path) -> SnapshotSet:
+    """Verify a complete canonical snapshot and manifest set without rewriting it."""
+    resolved = _snapshot_root(root)
+    snapshots = resolved / "snapshots"
+    expected_paths = tuple(snapshots / name for name in SNAPSHOT_NAMES)
+    expected_manifests = tuple(
+        path.with_name(f"{path.name}.sha256") for path in expected_paths
+    )
+    all_paths = (*expected_paths, *expected_manifests)
+    present = tuple(path.is_file() for path in all_paths)
+    if not any(present):
+        _fail("CORPUS_RECONCILIATION_SNAPSHOT_MISSING")
+    if not all(present):
+        _fail("CORPUS_RECONCILIATION_SNAPSHOT_PARTIAL")
+    artifacts: list[SnapshotArtifact] = []
+    for path, manifest in zip(expected_paths, expected_manifests, strict=True):
+        try:
+            content = path.read_bytes()
+            manifest_text = manifest.read_text(encoding="ascii")
+        except (OSError, UnicodeError) as error:
+            raise CorpusReconciliationError(
+                "CORPUS_RECONCILIATION_SNAPSHOT_VERIFY_FAILED"
+            ) from error
+        if (
+            len(manifest_text) != 65
+            or not manifest_text.endswith("\n")
+            or any(character not in "0123456789abcdef" for character in manifest_text[:64])
+        ):
+            _fail("CORPUS_RECONCILIATION_SNAPSHOT_MANIFEST_INVALID")
+        digest = hashlib.sha256(content).hexdigest()
+        if manifest_text[:64] != digest:
+            _fail("CORPUS_RECONCILIATION_SNAPSHOT_DIGEST_MISMATCH")
+        record_count = _verified_snapshot_records(path.name, content)
+        artifacts.append(
+            SnapshotArtifact(
+                name=path.name,
+                path=path,
+                manifest_path=manifest,
+                sha256=digest,
+                record_count=record_count,
+            )
+        )
+    return SnapshotSet(artifacts=tuple(artifacts))
+
+
+def _write_fsynced_temporary(*, destination: Path, content: bytes) -> Path:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with NamedTemporaryFile(
+        dir=destination.parent,
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+        delete=False,
+    ) as temporary:
+        temporary.write(content)
+        temporary.flush()
+        os.fsync(temporary.fileno())
+        return Path(temporary.name)
+
+
+def seal_reconciliation_snapshots(
+    *, store: ReconciliationStore, root: Path
+) -> SnapshotSet:
+    """Atomically publish the complete canonical reconciliation snapshot set."""
+    resolved = _snapshot_root(root)
+    if resolved != store.root.resolve():
+        _fail("CORPUS_RECONCILIATION_PRIVATE_ROOT_INVALID")
+    snapshots = resolved / "snapshots"
+    destinations = tuple(
+        destination
+        for name in SNAPSHOT_NAMES
+        for destination in (
+            snapshots / name,
+            snapshots / f"{name}.sha256",
+        )
+    )
+    presence = tuple(path.exists() for path in destinations)
+    if any(presence):
+        if not all(presence):
+            _fail("CORPUS_RECONCILIATION_SNAPSHOT_PARTIAL")
+        return verify_reconciliation_snapshots(root=resolved)
+
+    try:
+        payloads = _snapshot_payloads(store)
+    except CorpusReconciliationError:
+        raise
+    except (json.JSONDecodeError, sqlite3.Error) as error:
+        raise CorpusReconciliationError(
+            "CORPUS_RECONCILIATION_SNAPSHOT_BUILD_FAILED"
+        ) from error
+    prepared: list[tuple[Path, bytes]] = []
+    for name in SNAPSHOT_NAMES:
+        content = payloads[name]
+        _verified_snapshot_records(name, content)
+        snapshot_path = snapshots / name
+        prepared.append((snapshot_path, content))
+        prepared.append(
+            (
+                snapshots / f"{name}.sha256",
+                (hashlib.sha256(content).hexdigest() + "\n").encode("ascii"),
+            )
+        )
+
+    staged: list[tuple[Path, Path]] = []
+    published: list[Path] = []
+    try:
+        if any(destination.exists() for destination, _ in prepared):
+            _fail("CORPUS_RECONCILIATION_SNAPSHOT_PARTIAL")
+        for destination, content in prepared:
+            staged.append(
+                (
+                    _write_fsynced_temporary(
+                        destination=destination, content=content
+                    ),
+                    destination,
+                )
+            )
+        for temporary, destination in staged:
+            os.replace(temporary, destination)
+            published.append(destination)
+        return verify_reconciliation_snapshots(root=resolved)
+    except (CorpusReconciliationError, OSError) as error:
+        for temporary, _ in staged:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+        for destination in published:
+            try:
+                destination.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise CorpusReconciliationError(
+            "CORPUS_RECONCILIATION_SNAPSHOT_WRITE_FAILED"
+        ) from error

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -961,4 +962,141 @@ def test_dry_run_fails_closed_when_one_stratum_is_unavailable(tmp_path: Path) ->
     assert result.status == "BLOCKED"
     assert result.error_code == "CORPUS_RECONCILIATION_E1A4_ALLOCATION_UNAVAILABLE"
     assert result.allocations == ()
+    store.close()
+
+
+def _complete_snapshot_store(tmp_path: Path):
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        calculate_locator_capacity,
+        import_drive_page,
+        import_index_inventory,
+        inventory_local_files,
+        reconcile_document_matches,
+    )
+
+    empty_root = tmp_path / "approved"
+    empty_root.mkdir()
+    store = _create_store(tmp_path)
+    inventory_local_files(store=store, roots=(empty_root,))
+    import_drive_page(
+        store=store,
+        records=(
+            _drive_record(drive_file_id="drive-2", checksum=None),
+            _drive_record(drive_file_id="drive-1", checksum=None),
+        ),
+        next_page_token=None,
+    )
+    sources, locators = _capacity_inventory()
+    import_index_inventory(
+        store=store,
+        sources=sources,
+        locators=locators,
+        expected_source_count=8,
+        expected_chunk_count=96,
+    )
+    reconcile_document_matches(store=store)
+    calculate_locator_capacity(store=store, prior_locator_keys=())
+    return store
+
+
+def test_snapshot_set_is_canonical_complete_and_idempotent(tmp_path: Path) -> None:
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        seal_reconciliation_snapshots,
+        verify_reconciliation_snapshots,
+    )
+
+    store = _complete_snapshot_store(tmp_path)
+
+    sealed = seal_reconciliation_snapshots(store=store, root=store.root)
+    timestamps = {artifact.path.name: artifact.path.stat().st_mtime_ns for artifact in sealed.artifacts}
+    verified = verify_reconciliation_snapshots(root=store.root)
+    resealed = seal_reconciliation_snapshots(store=store, root=store.root)
+
+    assert len(sealed.artifacts) == 6
+    assert verified == sealed
+    assert resealed == sealed
+    assert {
+        path.name for path in (store.root / "snapshots").glob("*.sha256")
+    } == {f"{artifact.path.name}.sha256" for artifact in sealed.artifacts}
+    assert {
+        artifact.path.name: artifact.path.stat().st_mtime_ns
+        for artifact in resealed.artifacts
+    } == timestamps
+    drive_lines = (store.root / "snapshots" / "drive-inventory.jsonl").read_text(
+        encoding="utf-8"
+    )
+    assert drive_lines.endswith("\n")
+    assert [json.loads(line)["drive_file_id"] for line in drive_lines.splitlines()] == [
+        "drive-1",
+        "drive-2",
+    ]
+    store.close()
+
+
+def test_snapshot_verification_rejects_partial_set(tmp_path: Path) -> None:
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        CorpusReconciliationError,
+        verify_reconciliation_snapshots,
+    )
+
+    root = tmp_path / ".private" / "corpus-reconciliation" / "v1"
+    snapshots = root / "snapshots"
+    snapshots.mkdir(parents=True)
+    (snapshots / "drive-inventory.jsonl").write_text("", encoding="utf-8")
+
+    with pytest.raises(CorpusReconciliationError, match="CORPUS_RECONCILIATION_SNAPSHOT_PARTIAL"):
+        verify_reconciliation_snapshots(root=root)
+
+
+def test_snapshot_verification_rejects_forbidden_privacy_key(tmp_path: Path) -> None:
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        CorpusReconciliationError,
+        seal_reconciliation_snapshots,
+        verify_reconciliation_snapshots,
+    )
+
+    store = _complete_snapshot_store(tmp_path)
+    seal_reconciliation_snapshots(store=store, root=store.root)
+    snapshot = store.root / "snapshots" / "drive-inventory.jsonl"
+    payload = json.loads(snapshot.read_text(encoding="utf-8").splitlines()[0])
+    payload["content"] = "forbidden"
+    tampered = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    snapshot.write_bytes(tampered)
+    snapshot.with_name(f"{snapshot.name}.sha256").write_text(
+        hashlib.sha256(tampered).hexdigest() + "\n", encoding="ascii"
+    )
+
+    with pytest.raises(CorpusReconciliationError, match="CORPUS_RECONCILIATION_SNAPSHOT_SCHEMA_INVALID"):
+        verify_reconciliation_snapshots(root=store.root)
+    store.close()
+
+
+def test_snapshot_seal_rolls_back_complete_set_after_mid_publish_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import oilfield_chemical_copilot.evaluation.corpus_reconciliation as reconciliation
+
+    store = _complete_snapshot_store(tmp_path)
+    real_replace = reconciliation.os.replace
+    calls = 0
+
+    def fail_on_third_publish(source: Path, destination: Path) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            raise OSError("simulated private path that must not escape")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(reconciliation.os, "replace", fail_on_third_publish)
+
+    with pytest.raises(
+        reconciliation.CorpusReconciliationError,
+        match="CORPUS_RECONCILIATION_SNAPSHOT_WRITE_FAILED",
+    ):
+        reconciliation.seal_reconciliation_snapshots(store=store, root=store.root)
+
+    snapshots = store.root / "snapshots"
+    assert not tuple(snapshots.glob("*.jsonl"))
+    assert not tuple(snapshots.glob("*.sha256"))
+    assert not tuple(snapshots.glob(".*.tmp"))
     store.close()

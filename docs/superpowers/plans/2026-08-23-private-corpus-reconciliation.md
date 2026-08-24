@@ -230,7 +230,7 @@ git commit -m "feat: diagnose e1a4 locator capacity"
 - Consumes: completed SQLite stages.
 - Produces: `seal_reconciliation_snapshots(store, root) -> SnapshotSet` and `verify_reconciliation_snapshots(root) -> SnapshotSet`.
 
-- [ ] **Step 1: Write failing tests for canonical bytes, atomic publication, rollback, and privacy schema**
+- [x] **Step 1: Write failing tests for canonical bytes, atomic publication, rollback, and privacy schema**
 
 ```python
 def test_snapshot_seal_rolls_back_complete_set_after_mid_publish_failure(store: ReconciliationStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -241,21 +241,21 @@ def test_snapshot_seal_rolls_back_complete_set_after_mid_publish_failure(store: 
 
 Test all six JSONL files and manifests, sorted deterministic records, trailing newline, strict keys, existing-set verification without rewrite, partial-set rejection, and rejection of content/credential fields.
 
-- [ ] **Step 2: Run snapshot tests and verify RED**
+- [x] **Step 2: Run snapshot tests and verify RED**
 
 Run: `uv run pytest -q tests/evaluation/test_corpus_reconciliation.py -k "snapshot or manifest or privacy"`
 
-- [ ] **Step 3: Implement atomic sealing and verification**
+- [x] **Step 3: Implement atomic sealing and verification**
 
 Build every payload from committed SQLite rows. Validate all destinations before publication. Write and fsync same-directory temporary files, publish with `os.replace`, and remove every newly published file after a later failure. SHA-256 manifests contain lowercase 64-character digests plus newline.
 
-- [ ] **Step 4: Run focused tests and Ruff**
+- [x] **Step 4: Run focused tests and Ruff**
 
 Run: `uv run pytest -q tests/evaluation/test_corpus_reconciliation.py`
 
 Run: `uv run ruff check src/oilfield_chemical_copilot/evaluation/corpus_reconciliation.py tests/evaluation/test_corpus_reconciliation.py`
 
-- [ ] **Step 5: Commit Task 5**
+- [x] **Step 5: Commit Task 5**
 
 ```powershell
 git add -- src/oilfield_chemical_copilot/evaluation/corpus_reconciliation.py tests/evaluation/test_corpus_reconciliation.py
