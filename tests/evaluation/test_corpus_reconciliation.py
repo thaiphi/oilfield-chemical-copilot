@@ -103,6 +103,54 @@ def test_local_and_index_records_are_metadata_only() -> None:
         IndexSourceRecord.from_mapping({**source.to_mapping(), "embedding": [0.1]})
 
 
+def test_unassigned_topic_is_allowed_only_for_closed_ineligible_locator() -> None:
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        CorpusReconciliationError,
+        IndexLocatorRecord,
+        IndexSourceRecord,
+    )
+
+    source = IndexSourceRecord.from_mapping(
+        {
+            "source_id": "out-of-scope.pdf",
+            "source_path": "out-of-scope.pdf",
+            "parser_type": "pdf",
+            "topic": "unassigned",
+            "chunk_count": 1,
+            "embedding_model": "model",
+            "index_contract_sha256": "a" * 64,
+            "provenance_drive_file_id": None,
+            "content_sha256": None,
+        }
+    )
+
+    assert source.topic == "unassigned"
+    locator = IndexLocatorRecord.from_mapping(
+        {
+            "source_id": source.source_id,
+            "locator": "page:1",
+            "topic": "unassigned",
+            "source_role": "supporting",
+            "substantive_status": "INELIGIBLE",
+        }
+    )
+
+    assert locator.substantive_status == "INELIGIBLE"
+    with pytest.raises(
+        CorpusReconciliationError,
+        match="CORPUS_RECONCILIATION_INDEX_RECORD_INVALID",
+    ):
+        IndexLocatorRecord.from_mapping(
+            {
+                "source_id": source.source_id,
+                "locator": "page:1",
+                "topic": "unassigned",
+                "source_role": "supporting",
+                "substantive_status": "SUBSTANTIVE",
+            }
+        )
+
+
 def test_store_resumes_same_contract_bound_run(tmp_path: Path) -> None:
     from oilfield_chemical_copilot.evaluation.corpus_reconciliation import ReconciliationStore
 

@@ -24,6 +24,7 @@ SCHEMA_VERSION = 1
 RUN_STATUSES = frozenset({"IN_PROGRESS", "BLOCKED", "COMPLETE", "INVALID"})
 CHECKPOINT_STATUSES = frozenset({"NOT_STARTED", "IN_PROGRESS", "COMPLETE", "BLOCKED"})
 TOPICS = frozenset({"iron_sulfide", "scale", "corrosion", "paraffin"})
+INDEX_SOURCE_TOPICS = TOPICS | {"unassigned"}
 SOURCE_ROLES = frozenset({"foundational", "supporting"})
 SUBSTANTIVE_STATUSES = frozenset({"SUBSTANTIVE", "TITLE_ONLY", "INELIGIBLE"})
 SNAPSHOT_NAMES = (
@@ -273,7 +274,7 @@ class IndexSourceRecord:
             code,
         )
         topic = _string(mapping["topic"], code)
-        if topic not in TOPICS:
+        if topic not in INDEX_SOURCE_TOPICS:
             _fail(code)
         return cls(
             source_id=_string(mapping["source_id"], code),
@@ -326,8 +327,11 @@ class IndexLocatorRecord:
         topic = _string(mapping["topic"], code)
         source_role = _string(mapping["source_role"], code)
         substantive_status = _string(mapping["substantive_status"], code)
+        topic_is_closed_unassigned = (
+            topic == "unassigned" and substantive_status == "INELIGIBLE"
+        )
         if (
-            topic not in TOPICS
+            (topic not in TOPICS and not topic_is_closed_unassigned)
             or source_role not in SOURCE_ROLES
             or substantive_status not in SUBSTANTIVE_STATUSES
         ):

@@ -26,6 +26,7 @@ from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (  # noqa
     IndexSourceRecord,
     ReconciliationStore,
     SNAPSHOT_NAMES,
+    TOPICS,
     calculate_locator_capacity,
     dry_run_e1a4_allocation,
     import_drive_page,
@@ -383,7 +384,11 @@ def _read_index_inventory(
                 "source_id": row["source_file"],
                 "source_path": row["source_file"],
                 "parser_type": row["parser_type"],
-                "topic": row["topic"],
+                "topic": (
+                    str(row["topic"]).strip()
+                    if str(row["topic"]).strip() in TOPICS
+                    else "unassigned"
+                ),
                 "chunk_count": row["chunk_count"],
                 "embedding_model": row["embedding_model"],
                 "index_contract_sha256": contract_digest,
@@ -397,10 +402,11 @@ def _read_index_inventory(
     for row in locator_rows:
         source_id = str(row["source_file"]).strip()
         locator = str(row["page_or_sheet"]).strip()
+        database_topic = str(row["topic"]).strip()
         topic, role = eligibility.get(
             (source_id, locator),
             (
-                str(row["topic"]).strip(),
+                database_topic if database_topic in TOPICS else "unassigned",
                 "foundational" if source_id in foundational_sources else "supporting",
             ),
         )
@@ -433,7 +439,7 @@ def _read_index_inventory(
 def _read_drive_stdin() -> tuple[tuple[DriveFileRecord, ...], str | None]:
     code = "CORPUS_RECONCILIATION_DRIVE_STDIN_INVALID"
     try:
-        payload = json.load(sys.stdin)
+        payload = json.loads(sys.stdin.readline())
     except (UnicodeError, json.JSONDecodeError) as error:
         raise CorpusReconciliationError(code) from error
     if not isinstance(payload, Mapping) or set(payload) != {
