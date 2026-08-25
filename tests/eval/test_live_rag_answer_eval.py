@@ -191,6 +191,26 @@ def test_canonical_dataset_hash_mismatch_is_rejected_before_cases_are_loaded(
         live_rag_answer_eval.main()
 
 
+def test_approved_dataset_hash_is_stable_across_line_endings(tmp_path: Path) -> None:
+    dataset_bytes = (
+        live_rag_answer_eval.PROJECT_ROOT / "eval" / "public_answer_evaluation.jsonl"
+    ).read_bytes()
+    lf_bytes = dataset_bytes.replace(b"\r\n", b"\n")
+    lf_dataset = tmp_path / "lf.jsonl"
+    crlf_dataset = tmp_path / "crlf.jsonl"
+    lf_dataset.write_bytes(lf_bytes)
+    crlf_dataset.write_bytes(lf_bytes.replace(b"\n", b"\r\n"))
+
+    live_rag_answer_eval._require_approved_dataset(lf_dataset)
+    live_rag_answer_eval._require_approved_dataset(crlf_dataset)
+
+    assert (
+        live_rag_answer_eval._dataset_sha256(lf_dataset)
+        == live_rag_answer_eval._dataset_sha256(crlf_dataset)
+        == "0271efed1c11af594a6816ab4478632c84a4f630e64575c54f9856089f5fa4d2"
+    )
+
+
 @pytest.mark.parametrize(
     "settings",
     (
@@ -701,9 +721,9 @@ def test_public_runner_compares_modes_without_retaining_runtime_answer_data(
     report = json.loads((output_dir / "answer_eval_comparison.json").read_text(encoding="utf-8"))
     assert report["provenance"] == {
         "corpus_sha256": hashlib.sha256(b"public-chunk").hexdigest(),
-        "dataset_sha256": hashlib.sha256(
-            (live_rag_answer_eval.PROJECT_ROOT / "eval" / "public_answer_evaluation.jsonl").read_bytes()
-        ).hexdigest(),
+        "dataset_sha256": live_rag_answer_eval._dataset_sha256(
+            live_rag_answer_eval.PROJECT_ROOT / "eval" / "public_answer_evaluation.jsonl"
+        ),
         "embedding_provider": "ollama",
         "generation_model_sha256": hashlib.sha256(b"granite4.1:8b").hexdigest(),
         "generation_provider": "ollama",

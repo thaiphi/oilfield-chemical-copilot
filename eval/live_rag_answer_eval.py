@@ -99,6 +99,11 @@ def _sha256(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def _dataset_sha256(dataset_path: Path) -> str:
+    """Hash canonical LF bytes so Git and Windows identify the same JSONL dataset."""
+    return _sha256(dataset_path.read_bytes().replace(b"\r\n", b"\n"))
+
+
 def _require_private_diagnostic_destination(destination: Path, private_root: Path) -> Path:
     resolved_destination = destination.resolve()
     try:
@@ -120,7 +125,7 @@ def _deterministic_results_from_captures(cases, captures):
 
 
 def _require_approved_dataset(dataset_path: Path) -> None:
-    if _sha256(dataset_path.read_bytes()) != _BASELINE_DATASET_SHA256:
+    if _dataset_sha256(dataset_path) != _BASELINE_DATASET_SHA256:
         raise ValueError("approved canonical dataset hash is required for live evaluation")
 
 
@@ -140,7 +145,7 @@ def _comparison_provenance(
 ) -> dict[str, object]:
     model = _BASELINE_OLLAMA_MODEL
     return {
-        "dataset_sha256": _sha256(dataset_path.read_bytes()),
+        "dataset_sha256": _dataset_sha256(dataset_path),
         "corpus_sha256": _sha256("\n".join(sorted(public_chunk_ids)).encode("utf-8")),
         "embedding_provider": _BASELINE_EMBEDDING_PROVIDER,
         "generation_provider": _BASELINE_LLM_PROVIDER,

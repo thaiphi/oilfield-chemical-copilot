@@ -2,7 +2,7 @@
 
 Status: success
 
-The approved public evaluation pack ran against the active local vector and hybrid RAG boundaries with the claim-scope policy enabled. The committed public answer-evaluation dataset SHA-256 was `0271efed1c11af594a6816ab4478632c84a4f630e64575c54f9856089f5fa4d2`.
+The approved public evaluation pack ran against the active local vector and hybrid RAG boundaries with the claim-scope policy enabled. The committed public answer-evaluation dataset canonical LF SHA-256 was `0271efed1c11af594a6816ab4478632c84a4f630e64575c54f9856089f5fa4d2`. Canonicalizing line endings preserves this identity across platforms; the evaluation was not rerun and its content and metrics are unchanged.
 
 | Mode | Retrieval cases | Hit Rate@5 | MRR@5 | Citation pass/fail | Abstention pass/fail |
 | --- | ---: | ---: | ---: | ---: | ---: |
