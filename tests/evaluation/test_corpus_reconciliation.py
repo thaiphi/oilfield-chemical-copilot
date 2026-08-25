@@ -1099,26 +1099,46 @@ def test_dry_run_fails_closed_when_one_stratum_is_unavailable(tmp_path: Path) ->
     store.close()
 
 
-def _complete_snapshot_store(tmp_path: Path, *, include_dry_run: bool = True):
+def _complete_snapshot_store(
+    tmp_path: Path,
+    *,
+    include_dry_run: bool = True,
+    include_ambiguous_review: bool = False,
+):
     from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        ReviewDecisionRecord,
         calculate_locator_capacity,
         dry_run_e1a4_allocation,
         import_drive_page,
         import_index_inventory,
         inventory_local_files,
         reconcile_document_matches,
+        record_review_decision,
     )
 
     empty_root = tmp_path / "approved"
     empty_root.mkdir()
+    ambiguous_content = b"ambiguous-document"
+    if include_ambiguous_review:
+        (empty_root / "ambiguous.pdf").write_bytes(ambiguous_content)
     store = _create_store(tmp_path)
     inventory_local_files(store=store, roots=(empty_root,))
+    drive_records = [
+        _drive_record(drive_file_id="drive-2", checksum=None),
+        _drive_record(drive_file_id="drive-1", checksum=None),
+    ]
+    if include_ambiguous_review:
+        drive_records.append(
+            _drive_record(
+                drive_file_id="drive-ambiguous",
+                name="ambiguous.pdf",
+                size_bytes=len(ambiguous_content),
+                checksum=None,
+            )
+        )
     import_drive_page(
         store=store,
-        records=(
-            _drive_record(drive_file_id="drive-2", checksum=None),
-            _drive_record(drive_file_id="drive-1", checksum=None),
-        ),
+        records=tuple(drive_records),
         next_page_token=None,
     )
     sources, locators = _capacity_inventory()
@@ -1130,6 +1150,21 @@ def _complete_snapshot_store(tmp_path: Path, *, include_dry_run: bool = True):
         expected_chunk_count=96,
     )
     reconcile_document_matches(store=store)
+    if include_ambiguous_review:
+        record_review_decision(
+            store=store,
+            record=ReviewDecisionRecord.from_mapping(
+                {
+                    "decision_id": "decision-1",
+                    "match_key": "drive:drive-ambiguous",
+                    "decision": "ACCEPT",
+                    "reviewer_id": "reviewer-1",
+                    "reason_code": "REVIEWED",
+                    "supersedes_decision_id": None,
+                    "decided_at": "2026-08-24T00:00:00Z",
+                }
+            ),
+        )
     calculate_locator_capacity(store=store, prior_locator_keys=())
     if include_dry_run:
         dry_run = dry_run_e1a4_allocation(store=store, prior_locator_keys=())
@@ -1173,12 +1208,16 @@ def test_snapshot_set_is_canonical_complete_and_idempotent(tmp_path: Path) -> No
             encoding="utf-8"
         )
     )
+    state_digest = binding.pop("snapshot_state_sha256")
     assert binding == {
         "schema_version": 1,
         "run_id": "run-001",
         "index_contract_sha256": "a" * 64,
         "e1a3_allocation_sha256": "b" * 64,
     }
+    assert isinstance(state_digest, str)
+    assert len(state_digest) == 64
+    assert state_digest == state_digest.lower()
     assert verified == sealed
     assert resealed == sealed
     assert {
@@ -1231,6 +1270,43 @@ def test_status_rejects_snapshots_bound_to_a_different_run(tmp_path: Path) -> No
         runner._status_payload(current)
 
     current.close()
+
+
+def test_status_rejects_a_seal_after_a_review_decision_changes(
+    tmp_path: Path,
+) -> None:
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        CorpusReconciliationError,
+        ReviewDecisionRecord,
+        record_review_decision,
+        seal_reconciliation_snapshots,
+    )
+
+    runner = _corpus_runner_module()
+    store = _complete_snapshot_store(tmp_path, include_ambiguous_review=True)
+    seal_reconciliation_snapshots(store=store, root=store.root)
+    record_review_decision(
+        store=store,
+        record=ReviewDecisionRecord.from_mapping(
+            {
+                "decision_id": "decision-2",
+                "match_key": "drive:drive-ambiguous",
+                "decision": "REJECT",
+                "reviewer_id": "reviewer-2",
+                "reason_code": "REVIEWED",
+                "supersedes_decision_id": "decision-1",
+                "decided_at": "2026-08-24T01:00:00Z",
+            }
+        ),
+    )
+
+    with pytest.raises(
+        CorpusReconciliationError,
+        match="CORPUS_RECONCILIATION_SNAPSHOT_BINDING_MISMATCH",
+    ):
+        runner._status_payload(store)
+
+    store.close()
 
 
 def test_status_does_not_declare_completion_when_an_active_stage_is_blocked(
@@ -1292,6 +1368,46 @@ def test_snapshot_verification_rejects_forbidden_privacy_key(tmp_path: Path) -> 
 
     with pytest.raises(CorpusReconciliationError, match="CORPUS_RECONCILIATION_SNAPSHOT_SCHEMA_INVALID"):
         verify_reconciliation_snapshots(root=store.root)
+    store.close()
+
+
+def test_snapshot_verification_rejects_content_not_bound_to_state_digest(
+    tmp_path: Path,
+) -> None:
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        CorpusReconciliationError,
+        seal_reconciliation_snapshots,
+        verify_reconciliation_snapshots,
+    )
+
+    store = _complete_snapshot_store(tmp_path)
+    seal_reconciliation_snapshots(store=store, root=store.root)
+    snapshot = store.root / "snapshots" / "drive-inventory.jsonl"
+    records = [
+        json.loads(line)
+        for line in snapshot.read_text(encoding="utf-8").splitlines()
+    ]
+    records[0]["modified_time"] = "2026-08-24T00:00:00Z"
+    tampered = (
+        "\n".join(
+            sorted(
+                json.dumps(record, sort_keys=True, separators=(",", ":"))
+                for record in records
+            )
+        )
+        + "\n"
+    ).encode()
+    snapshot.write_bytes(tampered)
+    snapshot.with_name(f"{snapshot.name}.sha256").write_text(
+        hashlib.sha256(tampered).hexdigest() + "\n", encoding="ascii"
+    )
+
+    with pytest.raises(
+        CorpusReconciliationError,
+        match="CORPUS_RECONCILIATION_SNAPSHOT_BINDING_MISMATCH",
+    ):
+        verify_reconciliation_snapshots(root=store.root)
+
     store.close()
 
 

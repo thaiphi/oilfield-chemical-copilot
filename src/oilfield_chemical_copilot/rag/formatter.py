@@ -144,9 +144,9 @@ def _comparators_supported(answer: str, cited_text: str) -> bool:
     return _comparators(answer).issubset(cited_comparators)
 
 
-def _comparators(text: str) -> set[tuple[str, ...]]:
+def _comparators(text: str) -> set[tuple[str | Decimal, ...]]:
     return {
-        (kind, *match.groups())
+        (kind, *(Decimal(value) for value in match.groups()))
         for kind, pattern in _COMPARATOR_PATTERNS
         for match in pattern.finditer(text)
     }

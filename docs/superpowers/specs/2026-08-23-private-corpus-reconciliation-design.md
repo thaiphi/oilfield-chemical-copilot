@@ -98,10 +98,11 @@ Successful checkpoints export canonical JSONL files:
 Each export is written to a same-directory temporary file, flushed, closed,
 validated, and atomically replaced. Every snapshot receives a SHA-256 manifest
 beside it under `.private/corpus-reconciliation/v1/snapshots/`. The binding
-artifact seals the run ID, schema version, index-contract digest, and E1a-3
-allocation digest. A snapshot set is valid only when all six JSONL files, the
-binding artifact, and all seven manifests exist, validate, and match the active
-SQLite run.
+artifact seals the run ID, schema version, index-contract digest, E1a-3
+allocation digest, and a digest over all six canonical snapshot payloads. A
+snapshot set is valid only when all six JSONL files, the binding artifact, and
+all seven manifests exist, validate, and match the active SQLite run's current
+canonical state.
 
 ### Tracked Public Output
 

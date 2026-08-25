@@ -202,6 +202,23 @@ def test_format_answer_allows_equivalent_decimal_measurements() -> None:
     assert "50.0 ppm" in answer.text
 
 
+def test_format_answer_allows_equivalent_decimal_comparators() -> None:
+    answer = format_answer(
+        RagDraft(
+            answer="The cited concentration was above 50.0 ppm.",
+            why_this_matters="Equivalent comparator values should remain grounded.",
+            cited_source_ids=["Source 1"],
+            recommended_next_checks=["Review the method.", "Confirm the sample.", "Review limits."],
+            limitations="General evidence only.",
+        ),
+        [replace(_source(), excerpt="The cited concentration was above 50 ppm.")],
+        question="What concentration threshold was cited?",
+    )
+
+    assert answer.weak_evidence is False
+    assert "above 50.0 ppm" in answer.text
+
+
 @pytest.mark.parametrize(
     ("answer_text", "excerpt", "question"),
     [

@@ -1967,13 +1967,29 @@ def _canonical_jsonl(records: Iterable[Mapping[str, object]]) -> bytes:
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
-def _snapshot_binding(store: ReconciliationStore) -> dict[str, object]:
+def _snapshot_state_sha256(payloads: Mapping[str, bytes]) -> str:
+    digests = {
+        name: hashlib.sha256(payloads[name]).hexdigest() for name in SNAPSHOT_NAMES
+    }
+    canonical = json.dumps(
+        digests, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _snapshot_binding(
+    store: ReconciliationStore, *, snapshot_state_sha256: str
+) -> dict[str, object]:
     index_digest, allocation_digest = store.contract_digests()
     return {
         "schema_version": SCHEMA_VERSION,
         "run_id": store.run_id,
         "index_contract_sha256": index_digest,
         "e1a3_allocation_sha256": allocation_digest,
+        "snapshot_state_sha256": _digest(
+            snapshot_state_sha256,
+            "CORPUS_RECONCILIATION_SNAPSHOT_BINDING_INVALID",
+        ),
     }
 
 
@@ -1986,23 +2002,7 @@ def _canonical_snapshot_binding(binding: Mapping[str, object]) -> bytes:
     ).encode("utf-8")
 
 
-def _snapshot_payloads(store: ReconciliationStore) -> dict[str, bytes]:
-    for stage in (
-        "drive_inventory",
-        "local_inventory",
-        "index_inventory",
-        "document_matching",
-        "locator_capacity",
-        "e1a4_dry_run",
-    ):
-        _require_complete_checkpoint(
-            store,
-            stage,
-            error_code="CORPUS_RECONCILIATION_SNAPSHOT_INPUT_INCOMPLETE",
-        )
-    if _unresolved_ambiguous_matches(store):
-        _fail("CORPUS_RECONCILIATION_SNAPSHOT_INPUT_INCOMPLETE")
-
+def _snapshot_record_payloads(store: ReconciliationStore) -> dict[str, bytes]:
     drives = tuple(record.to_mapping() for record in _load_drive_records(store))
     locals_ = tuple(record.to_mapping() for record in _load_local_records(store))
     source_rows = tuple(
@@ -2077,8 +2077,34 @@ def _snapshot_payloads(store: ReconciliationStore) -> dict[str, bytes]:
         "document-matches.jsonl": _canonical_jsonl(matches),
         "review-decisions.jsonl": _canonical_jsonl(decisions),
         "locator-capacity.jsonl": _canonical_jsonl(capacity),
-        SNAPSHOT_BINDING_NAME: _canonical_snapshot_binding(_snapshot_binding(store)),
     }
+
+
+def _snapshot_payloads(store: ReconciliationStore) -> dict[str, bytes]:
+    for stage in (
+        "drive_inventory",
+        "local_inventory",
+        "index_inventory",
+        "document_matching",
+        "locator_capacity",
+        "e1a4_dry_run",
+    ):
+        _require_complete_checkpoint(
+            store,
+            stage,
+            error_code="CORPUS_RECONCILIATION_SNAPSHOT_INPUT_INCOMPLETE",
+        )
+    if _unresolved_ambiguous_matches(store):
+        _fail("CORPUS_RECONCILIATION_SNAPSHOT_INPUT_INCOMPLETE")
+
+    payloads = _snapshot_record_payloads(store)
+    payloads[SNAPSHOT_BINDING_NAME] = _canonical_snapshot_binding(
+        _snapshot_binding(
+            store,
+            snapshot_state_sha256=_snapshot_state_sha256(payloads),
+        )
+    )
+    return payloads
 
 
 _DRIVE_SNAPSHOT_KEYS = frozenset(
@@ -2331,6 +2357,7 @@ def _verified_snapshot_binding(content: bytes) -> dict[str, object]:
                 "run_id",
                 "index_contract_sha256",
                 "e1a3_allocation_sha256",
+                "snapshot_state_sha256",
             }
         ),
         code,
@@ -2340,6 +2367,7 @@ def _verified_snapshot_binding(content: bytes) -> dict[str, object]:
         "run_id": _string(binding["run_id"], code),
         "index_contract_sha256": _digest(binding["index_contract_sha256"], code),
         "e1a3_allocation_sha256": _digest(binding["e1a3_allocation_sha256"], code),
+        "snapshot_state_sha256": _digest(binding["snapshot_state_sha256"], code),
     }
     if (
         verified["schema_version"] != SCHEMA_VERSION
@@ -2500,6 +2528,7 @@ def verify_reconciliation_snapshots(
         _fail("CORPUS_RECONCILIATION_SNAPSHOT_PARTIAL")
     artifacts: list[SnapshotArtifact] = []
     records_by_name: dict[str, tuple[Mapping[str, object], ...]] = {}
+    snapshot_payloads: dict[str, bytes] = {}
     binding: dict[str, object] | None = None
     for path, manifest in zip(expected_paths, expected_manifests, strict=True):
         try:
@@ -2524,6 +2553,7 @@ def verify_reconciliation_snapshots(
         else:
             records = _verified_snapshot_records(path.name, content)
             records_by_name[path.name] = records
+            snapshot_payloads[path.name] = content
             record_count = len(records)
         artifacts.append(
             SnapshotArtifact(
@@ -2537,10 +2567,19 @@ def verify_reconciliation_snapshots(
     _validate_snapshot_relationships(records_by_name)
     if binding is None:
         _fail("CORPUS_RECONCILIATION_SNAPSHOT_BINDING_INVALID")
+    if binding["snapshot_state_sha256"] != _snapshot_state_sha256(
+        snapshot_payloads
+    ):
+        _fail("CORPUS_RECONCILIATION_SNAPSHOT_BINDING_MISMATCH")
     if store is not None:
         if store.root.resolve() != resolved:
             _fail("CORPUS_RECONCILIATION_SNAPSHOT_BINDING_MISMATCH")
-        if binding != _snapshot_binding(store):
+        current_payloads = _snapshot_record_payloads(store)
+        current_binding = _snapshot_binding(
+            store,
+            snapshot_state_sha256=_snapshot_state_sha256(current_payloads),
+        )
+        if binding != current_binding:
             _fail("CORPUS_RECONCILIATION_SNAPSHOT_BINDING_MISMATCH")
     return SnapshotSet(artifacts=tuple(artifacts))
 

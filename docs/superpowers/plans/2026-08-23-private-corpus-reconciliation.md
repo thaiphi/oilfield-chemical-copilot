@@ -247,7 +247,7 @@ Run: `uv run pytest -q tests/evaluation/test_corpus_reconciliation.py -k "snapsh
 
 - [x] **Step 3: Implement atomic sealing and verification**
 
-Build every payload from committed SQLite rows and bind the sealed set to the run ID, schema version, index-contract digest, and E1a-3 allocation digest. Validate all destinations before publication. Write and fsync same-directory temporary files, publish with `os.replace`, and remove every newly published file after a later failure. SHA-256 manifests contain lowercase 64-character digests plus newline.
+Build every payload from committed SQLite rows and bind the sealed set to the run ID, schema version, index-contract digest, E1a-3 allocation digest, and a digest over all six canonical database-derived snapshot payloads. Validate all destinations before publication. Write and fsync same-directory temporary files, publish with `os.replace`, and remove every newly published file after a later failure. SHA-256 manifests contain lowercase 64-character digests plus newline.
 
 - [x] **Step 4: Run focused tests and Ruff**
 
