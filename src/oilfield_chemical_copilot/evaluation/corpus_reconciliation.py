@@ -27,6 +27,30 @@ TOPICS = frozenset({"iron_sulfide", "scale", "corrosion", "paraffin"})
 INDEX_SOURCE_TOPICS = TOPICS | {"unassigned"}
 SOURCE_ROLES = frozenset({"foundational", "supporting"})
 SUBSTANTIVE_STATUSES = frozenset({"SUBSTANTIVE", "TITLE_ONLY", "INELIGIBLE"})
+MATCH_CONTRACTS = frozenset(
+    {
+        ("DRIVE_ID_PROVENANCE", "EXACT_MATCH", "EXACT_IDENTITY_CONFIRMED"),
+        ("DRIVE_ID_PROVENANCE", "DUPLICATE_ALIAS", "DUPLICATE_CONTENT_ALIAS"),
+        ("PROVIDER_CHECKSUM", "EXACT_MATCH", "EXACT_IDENTITY_CONFIRMED"),
+        ("PROVIDER_CHECKSUM", "DUPLICATE_ALIAS", "DUPLICATE_CONTENT_ALIAS"),
+        ("FILENAME_AND_SIZE", "AMBIGUOUS_REVIEW_REQUIRED", "FILENAME_SIZE_NOT_IDENTITY"),
+        ("NONE", "DRIVE_ONLY", "NO_EXACT_LOCAL_MATCH"),
+        ("INGESTION_PROVENANCE", "LOCAL_ONLY", "NO_EXACT_DRIVE_MATCH"),
+        ("NONE", "LOCAL_ONLY", "LOCAL_SOURCE_UNMATCHED"),
+        ("NONE", "PARSED_NOT_INDEXED", "PARSED_SOURCE_ABSENT_FROM_INDEX"),
+        ("NONE", "INDEX_ONLY", "INDEX_SOURCE_ABSENT_FROM_LOCAL_INVENTORY"),
+        ("NONE", "INELIGIBLE", "INELIGIBLE_SOURCE"),
+    }
+)
+REVIEW_DECISION_CONTRACTS = frozenset(
+    {
+        ("ACCEPT", "REVIEWED"),
+        ("REJECT", "REVIEWED"),
+        ("DUPLICATE_ALIAS", "DUPLICATE_CONTENT_ALIAS"),
+        ("INELIGIBLE", "INELIGIBLE_SOURCE"),
+        ("NEEDS_SOURCE_OWNER_REVIEW", "SOURCE_OWNER_REVIEW_REQUIRED"),
+    }
+)
 SNAPSHOT_NAMES = (
     "drive-inventory.jsonl",
     "local-inventory.jsonl",
@@ -768,6 +792,7 @@ def import_drive_page(
     store: ReconciliationStore,
     records: Iterable[DriveFileRecord],
     next_page_token: str | None,
+    page_token: str | None = None,
 ) -> StageResult:
     """Commit one metadata-only Drive page using stable file IDs."""
     stage = "drive_inventory"
@@ -775,9 +800,30 @@ def import_drive_page(
     token = _optional_string(
         next_page_token, "CORPUS_RECONCILIATION_DRIVE_PAGE_INVALID"
     )
+    current_token = _optional_string(
+        page_token, "CORPUS_RECONCILIATION_DRIVE_PAGE_INVALID"
+    )
     status = "IN_PROGRESS" if token is not None else "COMPLETE"
     try:
         with store._connection:
+            checkpoint = store._connection.execute(
+                """
+                select status, page_token from checkpoints
+                where run_id = ? and stage = ?
+                """,
+                (store.run_id, stage),
+            ).fetchone()
+            if (
+                (checkpoint is None and current_token is not None)
+                or (
+                    checkpoint is not None
+                    and (
+                        checkpoint["status"] != "IN_PROGRESS"
+                        or checkpoint["page_token"] != current_token
+                    )
+                )
+            ):
+                _fail("CORPUS_RECONCILIATION_DRIVE_PAGE_SEQUENCE_INVALID")
             for record in safe_records:
                 parent_ids_json = json.dumps(
                     sorted(record.parent_ids), separators=(",", ":"), ensure_ascii=False
@@ -1960,7 +2006,11 @@ def _validate_snapshot_record(name: str, record: object) -> None:
     if expected is None:
         _fail(code)
     _exact_keys(record, expected, code)
-    if name == "locator-capacity.jsonl":
+    if name == "document-matches.jsonl":
+        _validate_match_snapshot_record(record, code=code)
+    elif name == "review-decisions.jsonl":
+        _validate_decision_snapshot_record(record, code=code)
+    elif name == "locator-capacity.jsonl":
         topic = _string(record["topic"], code)
         role = _string(record["source_role"], code)
         fresh = _integer(record["fresh_locator_count"], code)
@@ -1972,10 +2022,77 @@ def _validate_snapshot_record(name: str, record: object) -> None:
             or record["sufficient"] != (fresh >= required)
         ):
             _fail(code)
-    else:
-        for key, value in record.items():
-            if value is not None and not isinstance(value, str):
-                _fail(code)
+
+
+def _validate_match_snapshot_record(record: Mapping[str, object], *, code: str) -> None:
+    match_key = _string(record["match_key"], code)
+    drive_file_id = _optional_string(record["drive_file_id"], code)
+    relative_path = _optional_string(record["relative_path"], code)
+    source_id = _optional_string(record["source_id"], code)
+    canonical_sha256 = (
+        _digest(record["canonical_sha256"], code)
+        if record["canonical_sha256"] is not None
+        else None
+    )
+    method = _string(record["match_method"], code)
+    status = _string(record["match_status"], code)
+    reason = _string(record["reason_code"], code)
+    if not match_key or (method, status, reason) not in MATCH_CONTRACTS:
+        _fail(code)
+    if status in {"EXACT_MATCH", "DUPLICATE_ALIAS"}:
+        if drive_file_id is None:
+            _fail(code)
+        if method == "PROVIDER_CHECKSUM" and (
+            relative_path is None or canonical_sha256 is None
+        ):
+            _fail(code)
+        if method == "DRIVE_ID_PROVENANCE" and source_id is None:
+            _fail(code)
+        return
+    if status == "AMBIGUOUS_REVIEW_REQUIRED":
+        if (
+            drive_file_id is None
+            or relative_path is None
+            or source_id is not None
+            or canonical_sha256 is not None
+        ):
+            _fail(code)
+        return
+    if status == "DRIVE_ONLY":
+        if drive_file_id is None or any(
+            value is not None for value in (relative_path, source_id, canonical_sha256)
+        ):
+            _fail(code)
+        return
+    if status == "LOCAL_ONLY":
+        if drive_file_id is not None or relative_path is None or canonical_sha256 is None:
+            _fail(code)
+        if (method == "INGESTION_PROVENANCE") != (source_id is not None):
+            _fail(code)
+        return
+    if status == "PARSED_NOT_INDEXED":
+        if (
+            drive_file_id is not None
+            or relative_path is None
+            or source_id is not None
+            or canonical_sha256 is None
+        ):
+            _fail(code)
+        return
+    if status in {"INDEX_ONLY", "INELIGIBLE"} and (
+        drive_file_id is not None or relative_path is not None or source_id is None
+    ):
+        _fail(code)
+
+
+def _validate_decision_snapshot_record(record: Mapping[str, object], *, code: str) -> None:
+    for key in ("decision_id", "match_key", "reviewer_id", "decided_at"):
+        _string(record[key], code)
+    decision = _string(record["decision"], code)
+    reason = _string(record["reason_code"], code)
+    _optional_string(record["supersedes_decision_id"], code)
+    if (decision, reason) not in REVIEW_DECISION_CONTRACTS:
+        _fail(code)
 
 
 def _verified_snapshot_records(

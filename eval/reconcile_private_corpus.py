@@ -442,7 +442,7 @@ def _read_index_inventory(
     )
 
 
-def _read_drive_stdin() -> tuple[tuple[DriveFileRecord, ...], str | None]:
+def _read_drive_stdin() -> tuple[tuple[DriveFileRecord, ...], str | None, str | None]:
     code = "CORPUS_RECONCILIATION_DRIVE_STDIN_INVALID"
     try:
         payload = json.loads(sys.stdin.readline())
@@ -450,15 +450,25 @@ def _read_drive_stdin() -> tuple[tuple[DriveFileRecord, ...], str | None]:
         raise CorpusReconciliationError(code) from error
     if not isinstance(payload, Mapping) or set(payload) != {
         "records",
+        "page_token",
         "next_page_token",
     }:
         raise CorpusReconciliationError(code)
     records = payload["records"]
+    page_token = payload["page_token"]
     token = payload["next_page_token"]
-    if not isinstance(records, list) or (token is not None and not isinstance(token, str)):
+    if (
+        not isinstance(records, list)
+        or (page_token is not None and not isinstance(page_token, str))
+        or (token is not None and not isinstance(token, str))
+    ):
         raise CorpusReconciliationError(code)
     try:
-        return tuple(DriveFileRecord.from_mapping(item) for item in records), token
+        return (
+            tuple(DriveFileRecord.from_mapping(item) for item in records),
+            page_token,
+            token,
+        )
     except (CorpusReconciliationError, TypeError) as error:
         raise CorpusReconciliationError(code) from error
 
@@ -482,7 +492,7 @@ def main() -> int:
         return 0
 
     if args.command == "import-drive-page":
-        records, token = _read_drive_stdin()
+        records, page_token, token = _read_drive_stdin()
         store = _open_store(args)
         _validate_store_bindings(
             store=store,
@@ -490,7 +500,10 @@ def main() -> int:
             e1a3_root=args.e1a3_root,
         )
         result = import_drive_page(
-            store=store, records=records, next_page_token=token
+            store=store,
+            records=records,
+            page_token=page_token,
+            next_page_token=token,
         )
         store.close()
         print(

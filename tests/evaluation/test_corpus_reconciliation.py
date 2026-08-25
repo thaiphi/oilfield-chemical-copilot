@@ -272,12 +272,48 @@ def test_drive_rescan_upserts_stable_ids_without_duplication(tmp_path: Path) -> 
     page = (_drive_record(),)
 
     first = import_drive_page(store=store, records=page, next_page_token="token-2")
-    final = import_drive_page(store=store, records=page, next_page_token=None)
+    final = import_drive_page(
+        store=store,
+        records=page,
+        page_token="token-2",
+        next_page_token=None,
+    )
 
     assert first.status == "IN_PROGRESS"
     assert final.status == "COMPLETE"
     assert store.count("drive_files") == 1
     assert store.checkpoint("drive_inventory").committed_records == 1
+    store.close()
+
+
+@pytest.mark.parametrize("page_token", (None, "wrong-token"))
+def test_drive_resume_rejects_page_without_saved_token(
+    tmp_path: Path, page_token: str | None
+) -> None:
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        CorpusReconciliationError,
+        import_drive_page,
+    )
+
+    store = _create_store(tmp_path)
+    import_drive_page(
+        store=store,
+        records=(_drive_record(),),
+        next_page_token="token-2",
+    )
+
+    with pytest.raises(
+        CorpusReconciliationError,
+        match="CORPUS_RECONCILIATION_DRIVE_PAGE_SEQUENCE_INVALID",
+    ):
+        import_drive_page(
+            store=store,
+            records=(_drive_record(drive_file_id="drive-2"),),
+            page_token=page_token,
+            next_page_token=None,
+        )
+
+    assert store.checkpoint("drive_inventory").status == "BLOCKED"
     store.close()
 
 
@@ -294,6 +330,7 @@ def test_drive_conflict_is_blocked_with_closed_error_code(tmp_path: Path) -> Non
         import_drive_page(
             store=store,
             records=(_drive_record(size_bytes=11),),
+            page_token="token-2",
             next_page_token=None,
         )
 
@@ -319,6 +356,7 @@ def test_restart_keeps_committed_drive_pages(tmp_path: Path) -> None:
     import_drive_page(
         store=resumed,
         records=(_drive_record(drive_file_id="drive-2"),),
+        page_token="expired-token",
         next_page_token=None,
     )
 
@@ -1311,6 +1349,136 @@ def test_snapshot_verification_rejects_decision_without_match(tmp_path: Path) ->
     store.close()
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("match_status", "MADE_UP"),
+        ("match_method", "MADE_UP"),
+        ("reason_code", "MADE_UP"),
+    ),
+)
+def test_snapshot_verification_rejects_unknown_match_vocabulary(
+    tmp_path: Path, field: str, value: str
+) -> None:
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        CorpusReconciliationError,
+        seal_reconciliation_snapshots,
+        verify_reconciliation_snapshots,
+    )
+
+    store = _complete_snapshot_store(tmp_path)
+    seal_reconciliation_snapshots(store=store, root=store.root)
+    snapshot = store.root / "snapshots" / "document-matches.jsonl"
+    records = [json.loads(line) for line in snapshot.read_text(encoding="utf-8").splitlines()]
+    records[0][field] = value
+    tampered = (
+        "\n".join(
+            sorted(json.dumps(item, sort_keys=True, separators=(",", ":")) for item in records)
+        )
+        + "\n"
+    ).encode()
+    snapshot.write_bytes(tampered)
+    snapshot.with_name(f"{snapshot.name}.sha256").write_text(
+        hashlib.sha256(tampered).hexdigest() + "\n", encoding="ascii"
+    )
+
+    with pytest.raises(
+        CorpusReconciliationError,
+        match="CORPUS_RECONCILIATION_SNAPSHOT_SCHEMA_INVALID",
+    ):
+        verify_reconciliation_snapshots(root=store.root)
+
+    store.close()
+
+
+def test_snapshot_verification_rejects_invalid_match_status_combination(
+    tmp_path: Path,
+) -> None:
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        CorpusReconciliationError,
+        seal_reconciliation_snapshots,
+        verify_reconciliation_snapshots,
+    )
+
+    store = _complete_snapshot_store(tmp_path)
+    seal_reconciliation_snapshots(store=store, root=store.root)
+    snapshot = store.root / "snapshots" / "document-matches.jsonl"
+    records = [json.loads(line) for line in snapshot.read_text(encoding="utf-8").splitlines()]
+    records[0].update(
+        match_method="FILENAME_AND_SIZE",
+        match_status="EXACT_MATCH",
+        reason_code="EXACT_IDENTITY_CONFIRMED",
+    )
+    tampered = (
+        "\n".join(
+            sorted(json.dumps(item, sort_keys=True, separators=(",", ":")) for item in records)
+        )
+        + "\n"
+    ).encode()
+    snapshot.write_bytes(tampered)
+    snapshot.with_name(f"{snapshot.name}.sha256").write_text(
+        hashlib.sha256(tampered).hexdigest() + "\n", encoding="ascii"
+    )
+
+    with pytest.raises(
+        CorpusReconciliationError,
+        match="CORPUS_RECONCILIATION_SNAPSHOT_SCHEMA_INVALID",
+    ):
+        verify_reconciliation_snapshots(root=store.root)
+
+    store.close()
+
+
+@pytest.mark.parametrize(
+    ("decision", "reason_code"),
+    (("MADE_UP", "REVIEWED"), ("ACCEPT", "MADE_UP")),
+)
+def test_snapshot_verification_rejects_unknown_review_decision_vocabulary(
+    tmp_path: Path, decision: str, reason_code: str
+) -> None:
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        CorpusReconciliationError,
+        seal_reconciliation_snapshots,
+        verify_reconciliation_snapshots,
+    )
+
+    store = _complete_snapshot_store(tmp_path)
+    seal_reconciliation_snapshots(store=store, root=store.root)
+    match_snapshot = store.root / "snapshots" / "document-matches.jsonl"
+    match_key = json.loads(match_snapshot.read_text(encoding="utf-8").splitlines()[0])[
+        "match_key"
+    ]
+    snapshot = store.root / "snapshots" / "review-decisions.jsonl"
+    tampered = (
+        json.dumps(
+            {
+                "decision": decision,
+                "decided_at": "2026-08-24T00:00:00Z",
+                "decision_id": "decision-1",
+                "match_key": match_key,
+                "reason_code": reason_code,
+                "reviewer_id": "reviewer-1",
+                "supersedes_decision_id": None,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode()
+    snapshot.write_bytes(tampered)
+    snapshot.with_name(f"{snapshot.name}.sha256").write_text(
+        hashlib.sha256(tampered).hexdigest() + "\n", encoding="ascii"
+    )
+
+    with pytest.raises(
+        CorpusReconciliationError,
+        match="CORPUS_RECONCILIATION_SNAPSHOT_SCHEMA_INVALID",
+    ):
+        verify_reconciliation_snapshots(root=store.root)
+
+    store.close()
+
+
 def test_snapshot_seal_rolls_back_complete_set_after_mid_publish_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1442,7 +1610,9 @@ def test_cli_rejects_invalid_drive_stdin_without_echoing_private_fields(
     monkeypatch.setattr(
         sys,
         "stdin",
-        io.StringIO('{"records":[],"next_page_token":null,"content":"private"}'),
+        io.StringIO(
+            '{"records":[],"page_token":null,"next_page_token":null,"content":"private"}'
+        ),
     )
 
     assert runner.cli() == 1
@@ -1456,6 +1626,25 @@ def test_cli_rejects_invalid_drive_stdin_without_echoing_private_fields(
     }
     assert "private" not in captured.err
     assert str(root) not in captured.err
+
+
+def test_cli_drive_stdin_returns_the_current_and_next_page_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _corpus_runner_module()
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        io.StringIO(
+            '{"records":[],"page_token":"token-2","next_page_token":"token-3"}'
+        ),
+    )
+
+    records, page_token, next_page_token = runner._read_drive_stdin()
+
+    assert records == ()
+    assert page_token == "token-2"
+    assert next_page_token == "token-3"
 
 
 def test_cli_status_is_aggregate_only(

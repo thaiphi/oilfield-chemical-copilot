@@ -98,7 +98,7 @@ git commit -m "feat: add resumable corpus reconciliation state"
 
 **Interfaces:**
 - Consumes: Task 1 records and `ReconciliationStore`.
-- Produces: `import_drive_page(store, records, next_page_token)`, `inventory_local_files(store, roots)`, `import_index_inventory(store, sources, locators)`, and aggregate `StageResult`.
+- Produces: `import_drive_page(store, records, page_token, next_page_token)`, `inventory_local_files(store, roots)`, `import_index_inventory(store, sources, locators)`, and aggregate `StageResult`.
 
 - [x] **Step 1: Write failing tests for page commits, expired-token rescan, local hashing, index conflicts, and simulated disconnect recovery**
 
@@ -106,7 +106,7 @@ git commit -m "feat: add resumable corpus reconciliation state"
 def test_drive_rescan_upserts_stable_ids_without_duplication(store: ReconciliationStore) -> None:
     page = (DriveFileRecord(drive_file_id="drive-1", name="private.pdf", mime_type="application/pdf", size_bytes=10, checksum_algorithm=None, checksum=None, modified_time="2026-08-23T00:00:00Z", parent_ids=("folder-1",)),)
     import_drive_page(store=store, records=page, next_page_token="token-2")
-    import_drive_page(store=store, records=page, next_page_token=None)
+    import_drive_page(store=store, records=page, page_token="token-2", next_page_token=None)
     assert store.count("drive_files") == 1
     assert store.checkpoint("drive_inventory").status == "COMPLETE"
 ```
@@ -291,7 +291,7 @@ Run: `uv run pytest -q tests/evaluation/test_corpus_reconciliation.py -k "cli"`
 
 - [x] **Step 3: Implement the CLI**
 
-`import-drive-page` reads exactly one JSON object from stdin with keys `records` and `next_page_token`. `inventory-local` accepts only explicitly provided roots and never follows symlinks outside them. `import-index` selects only source metadata and locators from `chunks` after contract verification. Every command opens the existing run, executes one stage, commits, and emits aggregate JSON.
+`import-drive-page` reads exactly one JSON object from stdin with keys `records`, `page_token`, and `next_page_token`; the current page token must match the saved checkpoint before the page is committed. `inventory-local` accepts only explicitly provided roots and never follows symlinks outside them. `import-index` selects only source metadata and locators from `chunks` after contract verification. Every command opens the existing run, executes one stage, commits, and emits aggregate JSON.
 
 - [x] **Step 4: Run focused tests, Ruff, and CLI preflight**
 
@@ -327,7 +327,7 @@ Verify Git ignore status, zero tracked private files, exact index contract, exac
 
 - [x] **Step 2: Import Google Drive metadata in resumable pages**
 
-Use the connected Drive metadata search/list actions. Pass each provider page directly to `import-drive-page` through stdin without writing intermediary tracked files or printing private records. Continue until `next_page_token` is absent; if interrupted, resume the existing SQLite run.
+Use the connected Drive metadata search/list actions. Pass each provider page and the token used to request it directly to `import-drive-page` through stdin without writing intermediary tracked files or printing private records. Continue until `next_page_token` is absent; if interrupted, resume only from the exact token saved in the existing SQLite run.
 
 - [x] **Step 3: Inventory approved local roots and import the verified index**
 

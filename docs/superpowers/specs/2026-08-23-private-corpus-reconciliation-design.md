@@ -135,9 +135,11 @@ not silently supersede an unfinished or invalid run.
 - closed `error_code`
 - `updated_at`
 
-Provider page tokens are resume hints, not authoritative progress. If a Drive
-token expires, restart discovery and upsert by stable Drive ID; do not delete
-already committed records.
+The saved provider page token is the required continuation point for the next
+page in the same run. Each submitted page identifies the token used to request
+it, and the controller rejects any mismatch before committing records. If a
+Drive token expires, start a new versioned inventory run; do not silently mark
+the interrupted run complete from a different page.
 
 ### `drive_files`
 
@@ -231,9 +233,10 @@ Failure at this stage initializes no Drive scan and no database inventory.
 
 ### Stage 1: Drive Metadata Inventory
 
-Discover the approved boundary in bounded pages. Upsert each record by Drive
-file ID and commit after every page. Record duplicate-title groups only as
-candidates; title equality is not document identity.
+Discover the approved boundary in bounded pages. Bind each page to the saved
+request token, upsert each record by Drive file ID, and commit the records plus
+the next token atomically. Record duplicate-title groups only as candidates;
+title equality is not document identity.
 
 ### Stage 2: Local Metadata Inventory
 

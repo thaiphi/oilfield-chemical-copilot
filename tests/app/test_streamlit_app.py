@@ -1,6 +1,8 @@
 from __future__ import annotations
 import pytest
 
+import app.streamlit_app as streamlit_app
+
 from app.streamlit_app import (
     _answer_question,
     _agentic_routing_enabled,
@@ -409,3 +411,105 @@ def test_feedback_records_only_closed_value_and_retrieval_mode(monkeypatch) -> N
     _record_feedback(FeedbackValue.HELPFUL, RetrievalMode.HYBRID)
 
     assert recorded == [(FeedbackValue.HELPFUL, RetrievalMode.HYBRID)]
+
+
+def test_run_app_renders_pending_feedback_without_a_new_prompt(monkeypatch) -> None:
+    events: list[str] = []
+
+    class SessionState(dict):
+        def __getattr__(self, name: str) -> object:
+            return self[name]
+
+        def __setattr__(self, name: str, value: object) -> None:
+            self[name] = value
+
+    class FakeStreamlit:
+        session_state = SessionState(
+            messages=[],
+            feedback_recorded=False,
+            feedback_retrieval_mode=RetrievalMode.HYBRID.value,
+        )
+
+        @staticmethod
+        def set_page_config(**_kwargs: object) -> None:
+            pass
+
+        @staticmethod
+        def title(_value: str) -> None:
+            pass
+
+        @staticmethod
+        def caption(_value: str) -> None:
+            pass
+
+        @staticmethod
+        def chat_input(_value: str) -> None:
+            return None
+
+    monkeypatch.setattr(streamlit_app, "st", FakeStreamlit())
+    monkeypatch.setattr(streamlit_app, "_initialize_state", lambda: None)
+    monkeypatch.setattr(streamlit_app, "_render_tools_sidebar", lambda _mode: "hybrid")
+    monkeypatch.setattr(
+        streamlit_app.RetrievalSettings,
+        "from_env",
+        lambda: RetrievalSettings(),
+    )
+    monkeypatch.setattr(
+        streamlit_app,
+        "_render_feedback_controls",
+        lambda: events.append("feedback-rendered"),
+        raising=False,
+    )
+
+    streamlit_app.run_app()
+
+    assert events == ["feedback-rendered"]
+
+
+def test_pending_feedback_button_records_feedback_on_rerun(monkeypatch) -> None:
+    recorded: list[tuple[FeedbackValue, RetrievalMode]] = []
+
+    class SessionState(dict):
+        def __getattr__(self, name: str) -> object:
+            return self[name]
+
+        def __setattr__(self, name: str, value: object) -> None:
+            self[name] = value
+
+    class Column:
+        def __enter__(self) -> "Column":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            pass
+
+    class FakeStreamlit:
+        session_state = SessionState(
+            messages=[{"role": "assistant"}],
+            feedback_recorded=False,
+            feedback_retrieval_mode=RetrievalMode.HYBRID.value,
+        )
+
+        @staticmethod
+        def columns(_count: int) -> tuple[Column, Column]:
+            return Column(), Column()
+
+        @staticmethod
+        def button(label: str, **_kwargs: object) -> bool:
+            return label == "Helpful"
+
+        @staticmethod
+        def toast(_value: str) -> None:
+            pass
+
+    monkeypatch.setattr(streamlit_app, "st", FakeStreamlit())
+    monkeypatch.setattr(
+        streamlit_app,
+        "_record_feedback",
+        lambda value, mode: recorded.append((value, mode)),
+    )
+
+    streamlit_app._render_feedback_controls()
+
+    assert recorded == [(FeedbackValue.HELPFUL, RetrievalMode.HYBRID)]
+    assert FakeStreamlit.session_state.feedback_recorded is True

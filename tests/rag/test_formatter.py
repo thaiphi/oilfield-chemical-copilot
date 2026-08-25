@@ -150,6 +150,41 @@ def test_format_answer_allows_a_numeric_claim_found_in_cited_evidence() -> None:
     assert "The cited threshold is 0.9." in answer.text
 
 
+def test_format_answer_rejects_a_numeric_claim_embedded_in_a_larger_source_number() -> None:
+    answer = format_answer(
+        RagDraft(
+            answer="The study evaluated 50 samples.",
+            why_this_matters="The sample count must be grounded exactly.",
+            cited_source_ids=["Source 1"],
+            recommended_next_checks=["Review the method.", "Confirm the sample set.", "Review limits."],
+            limitations="General evidence only.",
+        ),
+        [replace(_source(), excerpt="The study evaluated 150 samples.")],
+        question="How many samples were evaluated?",
+    )
+
+    assert answer.weak_evidence is True
+    assert "numeric claim" in answer.text
+    assert answer.sources == []
+
+
+def test_format_answer_allows_equivalent_decimal_numeric_tokens() -> None:
+    answer = format_answer(
+        RagDraft(
+            answer="The study evaluated 50.0 samples.",
+            why_this_matters="Equivalent numeric representations should remain grounded.",
+            cited_source_ids=["Source 1"],
+            recommended_next_checks=["Review the method.", "Confirm the sample set.", "Review limits."],
+            limitations="General evidence only.",
+        ),
+        [replace(_source(), excerpt="The study evaluated 50 samples.")],
+        question="How many samples were evaluated?",
+    )
+
+    assert answer.weak_evidence is False
+    assert "50.0 samples" in answer.text
+
+
 @pytest.mark.parametrize(
     ("answer_text", "excerpt", "question"),
     [

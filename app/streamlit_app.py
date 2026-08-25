@@ -293,6 +293,31 @@ def _render_message(message: dict[str, object]) -> None:
                     st.write(_excerpt(source.excerpt))
 
 
+def _render_feedback_controls() -> None:
+    if st.session_state.get("feedback_recorded", True) or (
+        "feedback_retrieval_mode" not in st.session_state
+    ):
+        return
+    feedback_cols = st.columns(2)
+    with feedback_cols[0]:
+        if st.button("Helpful", key=f"helpful-{len(st.session_state.messages)}"):
+            _record_feedback(
+                FeedbackValue.HELPFUL,
+                RetrievalMode(st.session_state.feedback_retrieval_mode),
+            )
+            st.session_state.feedback_recorded = True
+            st.toast("Feedback recorded.")
+    with feedback_cols[1]:
+        if st.button("Needs work", key=f"needs-work-{len(st.session_state.messages)}"):
+            if not st.session_state.get("feedback_recorded", True):
+                _record_feedback(
+                    FeedbackValue.NEEDS_WORK,
+                    RetrievalMode(st.session_state.feedback_retrieval_mode),
+                )
+                st.session_state.feedback_recorded = True
+                st.toast("Feedback recorded.")
+
+
 def run_app() -> None:
     st.set_page_config(page_title="Oilfield Chemical Copilot", layout="wide")
     _initialize_state()
@@ -306,6 +331,7 @@ def run_app() -> None:
 
     prompt = st.chat_input("Describe the production-chemistry problem...")
     if not prompt:
+        _render_feedback_controls()
         return
 
     st.session_state.messages.append({"role": "user", "content": prompt, "sources": []})
@@ -350,25 +376,7 @@ def run_app() -> None:
                 {"role": "assistant", "content": safe_message, "sources": []}
             )
 
-    feedback_cols = st.columns(2)
-    with feedback_cols[0]:
-        if st.button("Helpful", key=f"helpful-{len(st.session_state.messages)}"):
-            if not st.session_state.get("feedback_recorded", True):
-                _record_feedback(
-                    FeedbackValue.HELPFUL,
-                    RetrievalMode(st.session_state.feedback_retrieval_mode),
-                )
-                st.session_state.feedback_recorded = True
-                st.toast("Feedback recorded.")
-    with feedback_cols[1]:
-        if st.button("Needs work", key=f"needs-work-{len(st.session_state.messages)}"):
-            if not st.session_state.get("feedback_recorded", True):
-                _record_feedback(
-                    FeedbackValue.NEEDS_WORK,
-                    RetrievalMode(st.session_state.feedback_retrieval_mode),
-                )
-                st.session_state.feedback_recorded = True
-                st.toast("Feedback recorded.")
+    _render_feedback_controls()
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from decimal import Decimal
 import re
 from dataclasses import replace
 from pathlib import PurePosixPath, PureWindowsPath
@@ -102,7 +103,9 @@ def _safe_next_check(check: str) -> str:
 
 def _has_unsupported_numeric_claim(answer: str, sources: list[SourceEvidence]) -> bool:
     cited_text = " ".join(source.excerpt for source in sources)
-    return any(value not in cited_text for value in _NUMERIC_VALUE.findall(answer))
+    answer_values = {Decimal(value) for value in _NUMERIC_VALUE.findall(answer)}
+    cited_values = {Decimal(value) for value in _NUMERIC_VALUE.findall(cited_text)}
+    return not answer_values.issubset(cited_values)
 
 
 def _has_unsupported_semantic_claim(answer: str, sources: list[SourceEvidence]) -> bool:
