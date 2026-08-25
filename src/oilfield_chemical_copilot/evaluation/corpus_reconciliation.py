@@ -2511,7 +2511,10 @@ def _validate_snapshot_relationships(
 
 
 def verify_reconciliation_snapshots(
-    *, root: Path, store: ReconciliationStore | None = None
+    *,
+    root: Path,
+    store: ReconciliationStore | None = None,
+    expected_binding_sha256: str | None = None,
 ) -> SnapshotSet:
     """Verify a complete canonical snapshot and manifest set without rewriting it."""
     resolved = _snapshot_root(root)
@@ -2530,6 +2533,7 @@ def verify_reconciliation_snapshots(
     records_by_name: dict[str, tuple[Mapping[str, object], ...]] = {}
     snapshot_payloads: dict[str, bytes] = {}
     binding: dict[str, object] | None = None
+    binding_sha256: str | None = None
     for path, manifest in zip(expected_paths, expected_manifests, strict=True):
         try:
             content = path.read_bytes()
@@ -2549,6 +2553,7 @@ def verify_reconciliation_snapshots(
             _fail("CORPUS_RECONCILIATION_SNAPSHOT_DIGEST_MISMATCH")
         if path.name == SNAPSHOT_BINDING_NAME:
             binding = _verified_snapshot_binding(content)
+            binding_sha256 = digest
             record_count = 1
         else:
             records = _verified_snapshot_records(path.name, content)
@@ -2565,10 +2570,20 @@ def verify_reconciliation_snapshots(
             )
         )
     _validate_snapshot_relationships(records_by_name)
-    if binding is None:
+    if binding is None or binding_sha256 is None:
         _fail("CORPUS_RECONCILIATION_SNAPSHOT_BINDING_INVALID")
     if binding["snapshot_state_sha256"] != _snapshot_state_sha256(
         snapshot_payloads
+    ):
+        _fail("CORPUS_RECONCILIATION_SNAPSHOT_BINDING_MISMATCH")
+    if store is None and expected_binding_sha256 is None:
+        _fail("CORPUS_RECONCILIATION_SNAPSHOT_TRUST_ANCHOR_REQUIRED")
+    if expected_binding_sha256 is not None and (
+        _digest(
+            expected_binding_sha256,
+            "CORPUS_RECONCILIATION_SNAPSHOT_BINDING_MISMATCH",
+        )
+        != binding_sha256
     ):
         _fail("CORPUS_RECONCILIATION_SNAPSHOT_BINDING_MISMATCH")
     if store is not None:

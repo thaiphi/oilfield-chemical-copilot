@@ -102,7 +102,9 @@ artifact seals the run ID, schema version, index-contract digest, E1a-3
 allocation digest, and a digest over all six canonical snapshot payloads. A
 snapshot set is valid only when all six JSONL files, the binding artifact, and
 all seven manifests exist, validate, and match the active SQLite run's current
-canonical state.
+canonical state. Portable verification without the active SQLite store requires
+the expected binding-artifact SHA-256 from a trusted external record; the
+snapshot directory cannot authenticate itself.
 
 ### Tracked Public Output
 

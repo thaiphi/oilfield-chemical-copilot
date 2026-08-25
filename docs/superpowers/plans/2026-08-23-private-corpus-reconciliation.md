@@ -239,7 +239,7 @@ def test_snapshot_seal_rolls_back_complete_set_after_mid_publish_failure(store: 
     assert not tuple((tmp_path / "snapshots").glob("*.jsonl"))
 ```
 
-Test all six JSONL files, the active-run binding artifact, and all seven manifests: sorted deterministic records, trailing newline, strict keys, existing-set verification without rewrite, partial-set rejection, active-run/contract mismatch rejection, and rejection of content/credential fields.
+Test all six JSONL files, the active-run binding artifact, and all seven manifests: sorted deterministic records, trailing newline, strict keys, existing-set verification without rewrite, partial-set rejection, active-run/contract mismatch rejection, externally anchored standalone verification, and rejection of content/credential fields.
 
 - [x] **Step 2: Run snapshot tests and verify RED**
 

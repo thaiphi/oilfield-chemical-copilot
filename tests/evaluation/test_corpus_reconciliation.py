@@ -1199,7 +1199,15 @@ def test_snapshot_set_is_canonical_complete_and_idempotent(tmp_path: Path) -> No
 
     sealed = seal_reconciliation_snapshots(store=store, root=store.root)
     timestamps = {artifact.path.name: artifact.path.stat().st_mtime_ns for artifact in sealed.artifacts}
-    verified = verify_reconciliation_snapshots(root=store.root)
+    trusted_binding_sha256 = next(
+        artifact.sha256
+        for artifact in sealed.artifacts
+        if artifact.name == "snapshot-binding.json"
+    )
+    verified = verify_reconciliation_snapshots(
+        root=store.root,
+        expected_binding_sha256=trusted_binding_sha256,
+    )
     resealed = seal_reconciliation_snapshots(store=store, root=store.root)
 
     assert len(sealed.artifacts) == 7
@@ -1235,6 +1243,27 @@ def test_snapshot_set_is_canonical_complete_and_idempotent(tmp_path: Path) -> No
         "drive-1",
         "drive-2",
     ]
+    store.close()
+
+
+def test_standalone_snapshot_verification_requires_a_trusted_binding_digest(
+    tmp_path: Path,
+) -> None:
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        CorpusReconciliationError,
+        seal_reconciliation_snapshots,
+        verify_reconciliation_snapshots,
+    )
+
+    store = _complete_snapshot_store(tmp_path)
+    seal_reconciliation_snapshots(store=store, root=store.root)
+
+    with pytest.raises(
+        CorpusReconciliationError,
+        match="CORPUS_RECONCILIATION_SNAPSHOT_TRUST_ANCHOR_REQUIRED",
+    ):
+        verify_reconciliation_snapshots(root=store.root)
+
     store.close()
 
 
@@ -1371,17 +1400,23 @@ def test_snapshot_verification_rejects_forbidden_privacy_key(tmp_path: Path) -> 
     store.close()
 
 
-def test_snapshot_verification_rejects_content_not_bound_to_state_digest(
+def test_standalone_verification_rejects_a_locally_reanchored_snapshot_set(
     tmp_path: Path,
 ) -> None:
     from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
         CorpusReconciliationError,
+        SNAPSHOT_NAMES,
         seal_reconciliation_snapshots,
         verify_reconciliation_snapshots,
     )
 
     store = _complete_snapshot_store(tmp_path)
-    seal_reconciliation_snapshots(store=store, root=store.root)
+    sealed = seal_reconciliation_snapshots(store=store, root=store.root)
+    trusted_binding_sha256 = next(
+        artifact.sha256
+        for artifact in sealed.artifacts
+        if artifact.name == "snapshot-binding.json"
+    )
     snapshot = store.root / "snapshots" / "drive-inventory.jsonl"
     records = [
         json.loads(line)
@@ -1401,12 +1436,37 @@ def test_snapshot_verification_rejects_content_not_bound_to_state_digest(
     snapshot.with_name(f"{snapshot.name}.sha256").write_text(
         hashlib.sha256(tampered).hexdigest() + "\n", encoding="ascii"
     )
+    snapshot_root = store.root / "snapshots"
+    payload_digests = {
+        name: hashlib.sha256((snapshot_root / name).read_bytes()).hexdigest()
+        for name in SNAPSHOT_NAMES
+    }
+    state_sha256 = hashlib.sha256(
+        json.dumps(
+            payload_digests,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    binding_path = snapshot_root / "snapshot-binding.json"
+    binding = json.loads(binding_path.read_text(encoding="utf-8"))
+    binding["snapshot_state_sha256"] = state_sha256
+    binding_bytes = (
+        json.dumps(binding, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    binding_path.write_bytes(binding_bytes)
+    binding_path.with_name(f"{binding_path.name}.sha256").write_text(
+        hashlib.sha256(binding_bytes).hexdigest() + "\n", encoding="ascii"
+    )
 
     with pytest.raises(
         CorpusReconciliationError,
         match="CORPUS_RECONCILIATION_SNAPSHOT_BINDING_MISMATCH",
     ):
-        verify_reconciliation_snapshots(root=store.root)
+        verify_reconciliation_snapshots(
+            root=store.root,
+            expected_binding_sha256=trusted_binding_sha256,
+        )
 
     store.close()
 
