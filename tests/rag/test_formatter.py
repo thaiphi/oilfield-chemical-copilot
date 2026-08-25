@@ -185,6 +185,23 @@ def test_format_answer_allows_equivalent_decimal_numeric_tokens() -> None:
     assert "50.0 samples" in answer.text
 
 
+def test_format_answer_allows_equivalent_decimal_measurements() -> None:
+    answer = format_answer(
+        RagDraft(
+            answer="The cited concentration was 50.0 ppm.",
+            why_this_matters="Equivalent measurement representations should remain grounded.",
+            cited_source_ids=["Source 1"],
+            recommended_next_checks=["Review the method.", "Confirm the sample.", "Review limits."],
+            limitations="General evidence only.",
+        ),
+        [replace(_source(), excerpt="The cited concentration was 50 ppm.")],
+        question="What concentration was cited?",
+    )
+
+    assert answer.weak_evidence is False
+    assert "50.0 ppm" in answer.text
+
+
 @pytest.mark.parametrize(
     ("answer_text", "excerpt", "question"),
     [

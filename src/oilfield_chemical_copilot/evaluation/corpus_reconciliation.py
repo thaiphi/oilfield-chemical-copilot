@@ -59,6 +59,8 @@ SNAPSHOT_NAMES = (
     "review-decisions.jsonl",
     "locator-capacity.jsonl",
 )
+SNAPSHOT_BINDING_NAME = "snapshot-binding.json"
+SEALED_SNAPSHOT_NAMES = (*SNAPSHOT_NAMES, SNAPSHOT_BINDING_NAME)
 
 
 class CorpusReconciliationError(RuntimeError):
@@ -375,6 +377,65 @@ class IndexLocatorRecord:
             "topic": self.topic,
             "source_role": self.source_role,
             "substantive_status": self.substantive_status,
+        }
+
+
+@dataclass(frozen=True)
+class ReviewDecisionRecord:
+    decision_id: str
+    match_key: str
+    decision: str
+    reviewer_id: str
+    reason_code: str
+    supersedes_decision_id: str | None
+    decided_at: str
+
+    @classmethod
+    def from_mapping(cls, mapping: Mapping[str, object]) -> ReviewDecisionRecord:
+        code = "CORPUS_RECONCILIATION_REVIEW_DECISION_INVALID"
+        _exact_keys(
+            mapping,
+            frozenset(
+                {
+                    "decision_id",
+                    "match_key",
+                    "decision",
+                    "reviewer_id",
+                    "reason_code",
+                    "supersedes_decision_id",
+                    "decided_at",
+                }
+            ),
+            code,
+        )
+        decision_id = _string(mapping["decision_id"], code)
+        decision = _string(mapping["decision"], code)
+        reason = _string(mapping["reason_code"], code)
+        supersedes = _optional_string(mapping["supersedes_decision_id"], code)
+        if (
+            (decision, reason) not in REVIEW_DECISION_CONTRACTS
+            or supersedes == decision_id
+        ):
+            _fail(code)
+        return cls(
+            decision_id=decision_id,
+            match_key=_string(mapping["match_key"], code),
+            decision=decision,
+            reviewer_id=_string(mapping["reviewer_id"], code),
+            reason_code=reason,
+            supersedes_decision_id=supersedes,
+            decided_at=_string(mapping["decided_at"], code),
+        )
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "decision_id": self.decision_id,
+            "match_key": self.match_key,
+            "decision": self.decision,
+            "reviewer_id": self.reviewer_id,
+            "reason_code": self.reason_code,
+            "supersedes_decision_id": self.supersedes_decision_id,
+            "decided_at": self.decided_at,
         }
 
 
@@ -1237,6 +1298,89 @@ def _match_row(
     )
 
 
+def _review_decisions(store: ReconciliationStore) -> tuple[ReviewDecisionRecord, ...]:
+    rows = store._connection.execute(
+        """
+        select decision_id, match_key, decision, reviewer_id, reason_code,
+               supersedes_decision_id, decided_at
+        from review_decisions where run_id = ?
+        """,
+        (store.run_id,),
+    ).fetchall()
+    return tuple(ReviewDecisionRecord.from_mapping(dict(row)) for row in rows)
+
+
+def _current_review_decisions(
+    decisions: tuple[ReviewDecisionRecord, ...],
+) -> dict[str, ReviewDecisionRecord]:
+    by_id = {decision.decision_id: decision for decision in decisions}
+    if len(by_id) != len(decisions):
+        _fail("CORPUS_RECONCILIATION_REVIEW_DECISION_INVALID")
+    superseded: set[str] = set()
+    for decision in decisions:
+        if decision.supersedes_decision_id is None:
+            continue
+        prior = by_id.get(decision.supersedes_decision_id)
+        if prior is None or prior.match_key != decision.match_key:
+            _fail("CORPUS_RECONCILIATION_REVIEW_DECISION_INVALID")
+        superseded.add(prior.decision_id)
+    current: dict[str, ReviewDecisionRecord] = {}
+    for decision in decisions:
+        if decision.decision_id in superseded:
+            continue
+        if decision.match_key in current:
+            _fail("CORPUS_RECONCILIATION_REVIEW_DECISION_INVALID")
+        current[decision.match_key] = decision
+    return current
+
+
+def _unresolved_ambiguous_matches(store: ReconciliationStore) -> tuple[str, ...]:
+    match_rows = store._connection.execute(
+        """
+        select match_key, match_status from document_matches
+        where run_id = ?
+        """,
+        (store.run_id,),
+    ).fetchall()
+    match_keys = {str(row["match_key"]) for row in match_rows}
+    decisions = _review_decisions(store)
+    if any(decision.match_key not in match_keys for decision in decisions):
+        _fail("CORPUS_RECONCILIATION_REVIEW_DECISION_INVALID")
+    current = _current_review_decisions(decisions)
+    return tuple(
+        sorted(
+            str(row["match_key"])
+            for row in match_rows
+            if row["match_status"] == "AMBIGUOUS_REVIEW_REQUIRED"
+            and (
+                str(row["match_key"]) not in current
+                or current[str(row["match_key"])].decision
+                == "NEEDS_SOURCE_OWNER_REVIEW"
+            )
+        )
+    )
+
+
+def _set_document_matching_checkpoint(store: ReconciliationStore) -> StageResult:
+    committed = _table_count(
+        store._connection, run_id=store.run_id, table="document_matches"
+    )
+    unresolved = _unresolved_ambiguous_matches(store)
+    status = "BLOCKED" if unresolved else "COMPLETE"
+    error_code = (
+        "CORPUS_RECONCILIATION_AMBIGUOUS_REVIEW_REQUIRED" if unresolved else None
+    )
+    store.set_checkpoint(
+        stage="document_matching",
+        status=status,
+        committed_records=committed,
+        error_code=error_code,
+    )
+    return StageResult(
+        stage="document_matching", status=status, committed_records=committed
+    )
+
+
 def reconcile_document_matches(*, store: ReconciliationStore) -> MatchSummary:
     """Reconcile exact identities without confidence scores or content access."""
     stage = "document_matching"
@@ -1475,19 +1619,7 @@ def reconcile_document_matches(*, store: ReconciliationStore) -> MatchSummary:
                 """,
                 ((store.run_id, *row) for row in rows),
             )
-            store._connection.execute(
-                """
-                insert into checkpoints(
-                    run_id, stage, status, committed_records, error_code
-                ) values (?, ?, 'COMPLETE', ?, null)
-                on conflict(run_id, stage) do update set
-                    status = 'COMPLETE',
-                    committed_records = excluded.committed_records,
-                    error_code = null,
-                    updated_at = current_timestamp
-                """,
-                (store.run_id, stage, len(rows)),
-            )
+            _set_document_matching_checkpoint(store)
     except CorpusReconciliationError as error:
         _block_stage(store, stage=stage, table="document_matches", error_code=str(error))
         raise
@@ -1519,6 +1651,54 @@ def reconcile_document_matches(*, store: ReconciliationStore) -> MatchSummary:
         ambiguous_review_required=counts["AMBIGUOUS_REVIEW_REQUIRED"],
         ineligible=counts["INELIGIBLE"],
     )
+
+
+def record_review_decision(
+    *, store: ReconciliationStore, record: ReviewDecisionRecord
+) -> StageResult:
+    """Append one validated review decision and recompute matching closure."""
+    safe = ReviewDecisionRecord.from_mapping(record.to_mapping())
+    match = store._connection.execute(
+        """
+        select match_status from document_matches
+        where run_id = ? and match_key = ?
+        """,
+        (store.run_id, safe.match_key),
+    ).fetchone()
+    if match is None or match["match_status"] != "AMBIGUOUS_REVIEW_REQUIRED":
+        _fail("CORPUS_RECONCILIATION_REVIEW_DECISION_INVALID")
+    existing = _review_decisions(store)
+    current = _current_review_decisions(existing)
+    prior = current.get(safe.match_key)
+    if (prior is None) != (safe.supersedes_decision_id is None) or (
+        prior is not None and safe.supersedes_decision_id != prior.decision_id
+    ):
+        _fail("CORPUS_RECONCILIATION_REVIEW_DECISION_INVALID")
+    with store._connection:
+        try:
+            store._connection.execute(
+                """
+                insert into review_decisions(
+                    run_id, decision_id, match_key, decision, reviewer_id,
+                    reason_code, supersedes_decision_id, decided_at
+                ) values (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    store.run_id,
+                    safe.decision_id,
+                    safe.match_key,
+                    safe.decision,
+                    safe.reviewer_id,
+                    safe.reason_code,
+                    safe.supersedes_decision_id,
+                    safe.decided_at,
+                ),
+            )
+        except sqlite3.IntegrityError as error:
+            raise CorpusReconciliationError(
+                "CORPUS_RECONCILIATION_REVIEW_DECISION_INVALID"
+            ) from error
+        return _set_document_matching_checkpoint(store)
 
 
 def _locator_inventory_rows(store: ReconciliationStore) -> tuple[sqlite3.Row, ...]:
@@ -1787,6 +1967,25 @@ def _canonical_jsonl(records: Iterable[Mapping[str, object]]) -> bytes:
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
+def _snapshot_binding(store: ReconciliationStore) -> dict[str, object]:
+    index_digest, allocation_digest = store.contract_digests()
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "run_id": store.run_id,
+        "index_contract_sha256": index_digest,
+        "e1a3_allocation_sha256": allocation_digest,
+    }
+
+
+def _canonical_snapshot_binding(binding: Mapping[str, object]) -> bytes:
+    return (
+        json.dumps(
+            dict(binding), sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
 def _snapshot_payloads(store: ReconciliationStore) -> dict[str, bytes]:
     for stage in (
         "drive_inventory",
@@ -1801,6 +2000,8 @@ def _snapshot_payloads(store: ReconciliationStore) -> dict[str, bytes]:
             stage,
             error_code="CORPUS_RECONCILIATION_SNAPSHOT_INPUT_INCOMPLETE",
         )
+    if _unresolved_ambiguous_matches(store):
+        _fail("CORPUS_RECONCILIATION_SNAPSHOT_INPUT_INCOMPLETE")
 
     drives = tuple(record.to_mapping() for record in _load_drive_records(store))
     locals_ = tuple(record.to_mapping() for record in _load_local_records(store))
@@ -1876,6 +2077,7 @@ def _snapshot_payloads(store: ReconciliationStore) -> dict[str, bytes]:
         "document-matches.jsonl": _canonical_jsonl(matches),
         "review-decisions.jsonl": _canonical_jsonl(decisions),
         "locator-capacity.jsonl": _canonical_jsonl(capacity),
+        SNAPSHOT_BINDING_NAME: _canonical_snapshot_binding(_snapshot_binding(store)),
     }
 
 
@@ -2113,6 +2315,40 @@ def _verified_snapshot_records(
     return tuple(dict(record) for record in records)
 
 
+def _verified_snapshot_binding(content: bytes) -> dict[str, object]:
+    code = "CORPUS_RECONCILIATION_SNAPSHOT_BINDING_INVALID"
+    try:
+        binding = json.loads(content)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise CorpusReconciliationError(code) from error
+    if not isinstance(binding, Mapping):
+        _fail(code)
+    _exact_keys(
+        binding,
+        frozenset(
+            {
+                "schema_version",
+                "run_id",
+                "index_contract_sha256",
+                "e1a3_allocation_sha256",
+            }
+        ),
+        code,
+    )
+    verified = {
+        "schema_version": _integer(binding["schema_version"], code, minimum=1),
+        "run_id": _string(binding["run_id"], code),
+        "index_contract_sha256": _digest(binding["index_contract_sha256"], code),
+        "e1a3_allocation_sha256": _digest(binding["e1a3_allocation_sha256"], code),
+    }
+    if (
+        verified["schema_version"] != SCHEMA_VERSION
+        or _canonical_snapshot_binding(verified) != content
+    ):
+        _fail(code)
+    return verified
+
+
 def _validate_snapshot_relationships(
     records_by_name: Mapping[str, tuple[Mapping[str, object], ...]],
 ) -> None:
@@ -2209,6 +2445,25 @@ def _validate_snapshot_relationships(
                 or prior["match_key"] != match_key
             ):
                 _fail(code)
+    try:
+        current_decisions = _current_review_decisions(
+            tuple(
+                ReviewDecisionRecord.from_mapping(record)
+                for record in decision_records
+            )
+        )
+    except CorpusReconciliationError:
+        _fail(code)
+    if any(
+        record["match_status"] == "AMBIGUOUS_REVIEW_REQUIRED"
+        and (
+            str(record["match_key"]) not in current_decisions
+            or current_decisions[str(record["match_key"])].decision
+            == "NEEDS_SOURCE_OWNER_REVIEW"
+        )
+        for record in match_records
+    ):
+        _fail(code)
 
     capacity_records = records_by_name["locator-capacity.jsonl"]
     capacity = {
@@ -2227,11 +2482,13 @@ def _validate_snapshot_relationships(
             _fail(code)
 
 
-def verify_reconciliation_snapshots(*, root: Path) -> SnapshotSet:
+def verify_reconciliation_snapshots(
+    *, root: Path, store: ReconciliationStore | None = None
+) -> SnapshotSet:
     """Verify a complete canonical snapshot and manifest set without rewriting it."""
     resolved = _snapshot_root(root)
     snapshots = resolved / "snapshots"
-    expected_paths = tuple(snapshots / name for name in SNAPSHOT_NAMES)
+    expected_paths = tuple(snapshots / name for name in SEALED_SNAPSHOT_NAMES)
     expected_manifests = tuple(
         path.with_name(f"{path.name}.sha256") for path in expected_paths
     )
@@ -2243,6 +2500,7 @@ def verify_reconciliation_snapshots(*, root: Path) -> SnapshotSet:
         _fail("CORPUS_RECONCILIATION_SNAPSHOT_PARTIAL")
     artifacts: list[SnapshotArtifact] = []
     records_by_name: dict[str, tuple[Mapping[str, object], ...]] = {}
+    binding: dict[str, object] | None = None
     for path, manifest in zip(expected_paths, expected_manifests, strict=True):
         try:
             content = path.read_bytes()
@@ -2260,18 +2518,30 @@ def verify_reconciliation_snapshots(*, root: Path) -> SnapshotSet:
         digest = hashlib.sha256(content).hexdigest()
         if manifest_text[:64] != digest:
             _fail("CORPUS_RECONCILIATION_SNAPSHOT_DIGEST_MISMATCH")
-        records = _verified_snapshot_records(path.name, content)
-        records_by_name[path.name] = records
+        if path.name == SNAPSHOT_BINDING_NAME:
+            binding = _verified_snapshot_binding(content)
+            record_count = 1
+        else:
+            records = _verified_snapshot_records(path.name, content)
+            records_by_name[path.name] = records
+            record_count = len(records)
         artifacts.append(
             SnapshotArtifact(
                 name=path.name,
                 path=path,
                 manifest_path=manifest,
                 sha256=digest,
-                record_count=len(records),
+                record_count=record_count,
             )
         )
     _validate_snapshot_relationships(records_by_name)
+    if binding is None:
+        _fail("CORPUS_RECONCILIATION_SNAPSHOT_BINDING_INVALID")
+    if store is not None:
+        if store.root.resolve() != resolved:
+            _fail("CORPUS_RECONCILIATION_SNAPSHOT_BINDING_MISMATCH")
+        if binding != _snapshot_binding(store):
+            _fail("CORPUS_RECONCILIATION_SNAPSHOT_BINDING_MISMATCH")
     return SnapshotSet(artifacts=tuple(artifacts))
 
 
@@ -2299,7 +2569,7 @@ def seal_reconciliation_snapshots(
     snapshots = resolved / "snapshots"
     destinations = tuple(
         destination
-        for name in SNAPSHOT_NAMES
+        for name in SEALED_SNAPSHOT_NAMES
         for destination in (
             snapshots / name,
             snapshots / f"{name}.sha256",
@@ -2309,7 +2579,7 @@ def seal_reconciliation_snapshots(
     if any(presence):
         if not all(presence):
             _fail("CORPUS_RECONCILIATION_SNAPSHOT_PARTIAL")
-        return verify_reconciliation_snapshots(root=resolved)
+        return verify_reconciliation_snapshots(root=resolved, store=store)
 
     try:
         payloads = _snapshot_payloads(store)
@@ -2320,9 +2590,12 @@ def seal_reconciliation_snapshots(
             "CORPUS_RECONCILIATION_SNAPSHOT_BUILD_FAILED"
         ) from error
     prepared: list[tuple[Path, bytes]] = []
-    for name in SNAPSHOT_NAMES:
+    for name in SEALED_SNAPSHOT_NAMES:
         content = payloads[name]
-        _verified_snapshot_records(name, content)
+        if name == SNAPSHOT_BINDING_NAME:
+            _verified_snapshot_binding(content)
+        else:
+            _verified_snapshot_records(name, content)
         snapshot_path = snapshots / name
         prepared.append((snapshot_path, content))
         prepared.append(
@@ -2349,7 +2622,7 @@ def seal_reconciliation_snapshots(
         for temporary, destination in staged:
             os.replace(temporary, destination)
             published.append(destination)
-        return verify_reconciliation_snapshots(root=resolved)
+        return verify_reconciliation_snapshots(root=resolved, store=store)
     except (CorpusReconciliationError, OSError) as error:
         for temporary, _ in staged:
             try:

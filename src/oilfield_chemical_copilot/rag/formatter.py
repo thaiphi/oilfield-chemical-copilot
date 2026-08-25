@@ -125,11 +125,12 @@ def _has_unsupported_semantic_claim(answer: str, sources: list[SourceEvidence]) 
 
 def _measurements_supported(answer: str, cited_text: str) -> bool:
     cited_measurements = {
-        (match.group("value"), _normalize_unit(match.group("unit")))
+        (Decimal(match.group("value")), _normalize_unit(match.group("unit")))
         for match in _MEASUREMENT.finditer(cited_text)
     }
     return all(
-        (match.group("value"), _normalize_unit(match.group("unit"))) in cited_measurements
+        (Decimal(match.group("value")), _normalize_unit(match.group("unit")))
+        in cited_measurements
         for match in _MEASUREMENT.finditer(answer)
     )
 

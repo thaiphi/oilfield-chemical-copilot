@@ -92,12 +92,16 @@ Successful checkpoints export canonical JSONL files:
 .private/corpus-reconciliation/v1/snapshots/document-matches.jsonl
 .private/corpus-reconciliation/v1/snapshots/review-decisions.jsonl
 .private/corpus-reconciliation/v1/snapshots/locator-capacity.jsonl
+.private/corpus-reconciliation/v1/snapshots/snapshot-binding.json
 ```
 
 Each export is written to a same-directory temporary file, flushed, closed,
 validated, and atomically replaced. Every snapshot receives a SHA-256 manifest
-under `.private/corpus-reconciliation/v1/manifests/`. A snapshot set is valid
-only when every required JSONL file and manifest exists and validates.
+beside it under `.private/corpus-reconciliation/v1/snapshots/`. The binding
+artifact seals the run ID, schema version, index-contract digest, and E1a-3
+allocation digest. A snapshot set is valid only when all six JSONL files, the
+binding artifact, and all seven manifests exist, validate, and match the active
+SQLite run.
 
 ### Tracked Public Output
 
@@ -309,10 +313,11 @@ no correction.
 
 ### Stage 8: Seal Reconciliation Evidence
 
-When all stages validate, export the canonical JSONL snapshot set, validate set
-equality and digests, and mark the SQLite run `COMPLETE`. Only then may a new
-plan authorize a mapping correction, controlled ingestion, or another E1a-4
-sampling-frame attempt.
+When all stages validate and every ambiguous match has one valid current closed
+review decision, export the canonical snapshot set. Validate set equality,
+digests, cross-file relationships, and the immutable active-run binding before
+marking the SQLite run `COMPLETE`. Only then may a new plan authorize a mapping
+correction, controlled ingestion, or another E1a-4 sampling-frame attempt.
 
 ## Restart And Recovery
 
@@ -321,8 +326,8 @@ sampling-frame attempt.
 - A stage becomes `COMPLETE` only after its record-count and contract checks
   pass.
 - Resuming revalidates the run bindings before using saved state.
-- Expired Drive tokens trigger a safe rescan; stable Drive IDs prevent
-  duplicates.
+- Expired Drive tokens require a new versioned inventory run; the interrupted
+  run cannot be completed from a different pagination chain.
 - Database disconnection leaves the current stage `IN_PROGRESS` or `BLOCKED`.
 - JSONL exports never resume by appending to a partial file; they are rebuilt
   from committed SQLite rows and atomically published.

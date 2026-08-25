@@ -25,7 +25,8 @@ from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (  # noqa
     IndexLocatorRecord,
     IndexSourceRecord,
     ReconciliationStore,
-    SNAPSHOT_NAMES,
+    ReviewDecisionRecord,
+    SEALED_SNAPSHOT_NAMES,
     TOPICS,
     calculate_locator_capacity,
     dry_run_e1a4_allocation,
@@ -33,6 +34,7 @@ from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (  # noqa
     import_index_inventory,
     inventory_local_files,
     reconcile_document_matches,
+    record_review_decision,
     seal_reconciliation_snapshots,
     verify_reconciliation_snapshots,
 )
@@ -78,6 +80,7 @@ def _parser() -> argparse.ArgumentParser:
     index = command("import-index")
     index.add_argument("--database-url", default=os.environ.get("DATABASE_URL", ""))
     command("reconcile")
+    command("record-review-decision")
     command("capacity")
     command("seal")
     command("status")
@@ -243,17 +246,17 @@ def _status_payload(store: ReconciliationStore) -> dict[str, object]:
     snapshots = store.root / "snapshots"
     snapshot_paths = tuple(
         path
-        for name in SNAPSHOT_NAMES
+        for name in SEALED_SNAPSHOT_NAMES
         for path in (snapshots / name, snapshots / f"{name}.sha256")
     )
     presence = tuple(path.is_file() for path in snapshot_paths)
     snapshots_complete = False
     if any(presence):
-        verify_reconciliation_snapshots(root=store.root)
+        verify_reconciliation_snapshots(root=store.root, store=store)
         snapshots_complete = True
     status = (
         "CORPUS_RECONCILIATION_COMPLETE"
-        if snapshots_complete and stages["e1a4_dry_run"] in {"COMPLETE", "BLOCKED"}
+        if snapshots_complete and all(value == "COMPLETE" for value in stages.values())
         else "CORPUS_RECONCILIATION_IN_PROGRESS"
     )
     return {
@@ -473,6 +476,17 @@ def _read_drive_stdin() -> tuple[tuple[DriveFileRecord, ...], str | None, str | 
         raise CorpusReconciliationError(code) from error
 
 
+def _read_review_decision_stdin() -> ReviewDecisionRecord:
+    code = "CORPUS_RECONCILIATION_REVIEW_STDIN_INVALID"
+    try:
+        payload = json.loads(sys.stdin.readline())
+        if not isinstance(payload, Mapping):
+            raise CorpusReconciliationError(code)
+        return ReviewDecisionRecord.from_mapping(payload)
+    except (UnicodeError, json.JSONDecodeError, TypeError, CorpusReconciliationError) as error:
+        raise CorpusReconciliationError(code) from error
+
+
 def main() -> int:
     args = _parser().parse_args()
     if args.command == "init":
@@ -564,7 +578,22 @@ def main() -> int:
         }
     elif args.command == "reconcile":
         summary = reconcile_document_matches(store=store)
-        output = {"status": "COMPLETE", "counts": asdict(summary)}
+        checkpoint = store.checkpoint("document_matching")
+        output = {
+            "status": checkpoint.status,
+            "error_code": checkpoint.error_code,
+            "counts": asdict(summary),
+        }
+    elif args.command == "record-review-decision":
+        result = record_review_decision(
+            store=store,
+            record=_read_review_decision_stdin(),
+        )
+        output = {
+            "status": result.status,
+            "stage": result.stage,
+            "committed_records": result.committed_records,
+        }
     elif args.command == "capacity":
         prior = _load_prior_locator_keys(args.e1a3_root)
         report = calculate_locator_capacity(

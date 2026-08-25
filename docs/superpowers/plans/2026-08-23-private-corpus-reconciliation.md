@@ -121,7 +121,7 @@ Expected: failures because the import functions do not exist.
 
 - [x] **Step 3: Implement idempotent import functions**
 
-Commit every Drive page and bounded local/index batch independently. Treat provider page tokens as hints. Normalize paths and locators before identity comparison. Calculate local SHA-256 in streaming blocks. Accept pre-existing parser metadata as input; do not invoke parsers.
+Commit every Drive page and bounded local/index batch independently. Bind every Drive page to the exact saved provider token. Normalize paths and locators before identity comparison. Calculate local SHA-256 in streaming blocks. Accept pre-existing parser metadata as input; do not invoke parsers.
 
 - [x] **Step 4: Run focused tests and Ruff**
 
@@ -239,7 +239,7 @@ def test_snapshot_seal_rolls_back_complete_set_after_mid_publish_failure(store: 
     assert not tuple((tmp_path / "snapshots").glob("*.jsonl"))
 ```
 
-Test all six JSONL files and manifests, sorted deterministic records, trailing newline, strict keys, existing-set verification without rewrite, partial-set rejection, and rejection of content/credential fields.
+Test all six JSONL files, the active-run binding artifact, and all seven manifests: sorted deterministic records, trailing newline, strict keys, existing-set verification without rewrite, partial-set rejection, active-run/contract mismatch rejection, and rejection of content/credential fields.
 
 - [x] **Step 2: Run snapshot tests and verify RED**
 
@@ -247,7 +247,7 @@ Run: `uv run pytest -q tests/evaluation/test_corpus_reconciliation.py -k "snapsh
 
 - [x] **Step 3: Implement atomic sealing and verification**
 
-Build every payload from committed SQLite rows. Validate all destinations before publication. Write and fsync same-directory temporary files, publish with `os.replace`, and remove every newly published file after a later failure. SHA-256 manifests contain lowercase 64-character digests plus newline.
+Build every payload from committed SQLite rows and bind the sealed set to the run ID, schema version, index-contract digest, and E1a-3 allocation digest. Validate all destinations before publication. Write and fsync same-directory temporary files, publish with `os.replace`, and remove every newly published file after a later failure. SHA-256 manifests contain lowercase 64-character digests plus newline.
 
 - [x] **Step 4: Run focused tests and Ruff**
 
@@ -319,7 +319,7 @@ git commit -m "feat: add private corpus reconciliation cli"
 
 **Interfaces:**
 - Consumes: verified CLI, connected Google Drive metadata, approved local roots, configured read-only PostgreSQL URL, index contract, and E1a-3 allocation.
-- Produces: private SQLite state, six sealed JSONL snapshots with manifests, aggregate blocker classification, and updated public plan status.
+- Produces: private SQLite state, six sealed JSONL snapshots plus one active-run binding artifact with seven manifests, aggregate blocker classification, and updated public plan status.
 
 - [x] **Step 1: Run presence-only preflight and initialize the bound run**
 
@@ -360,12 +360,12 @@ git add -- docs/superpowers/plans/2026-08-19-e1a4-requirements-aware-evidence-ga
 git commit -m "docs: record private corpus reconciliation gate"
 ```
 
-## Execution Result — 2026-08-23
+## Execution Result — 2026-08-23 (superseded by contract correction 2026-08-24)
 
-- Status: `CORPUS_RECONCILIATION_COMPLETE`; the E1a-4 no-write dry run is intentionally `BLOCKED`.
+- Status: `CORPUS_RECONCILIATION_AMBIGUOUS_REVIEW_REQUIRED`. The earlier `COMPLETE` status is superseded: a blocked E1a-4 dry run and unresolved review candidates cannot satisfy the corrected sealing contract.
 - Sealed private inventory: 385 topic-scoped Drive candidates, 232 local files, 198 contract-verified index sources, 1,874 locator records, and 815 closed match rows.
-- Identity result: 117 filename-and-size candidates require human review; no ambiguous candidate was promoted to an exact match.
+- Identity result: 117 filename-and-size candidates require human review; no ambiguous candidate was promoted to an exact match, and `document_matching` must remain `BLOCKED` until every candidate has one valid current closed review decision.
 - Capacity result: all four supporting strata are sufficient and all four foundational strata are insufficient after exact E1a-3 locator exclusion.
-- Artifact result: six canonical private JSONL snapshots and six SHA-256 manifests verified, including no-rewrite restart verification.
-- Verification: 35 focused reconciliation tests passed; the full suite passed 810 tests with 2 skipped; full Ruff passed; whitespace, Git-ignore, tracked-private-file, and public privacy scans passed.
-- Decision: do not run the E1a-4 sampling-frame sealer, ingest/reindex documents, reuse E1a-3 locators, or weaken the exact grid. The next approval gate is a narrow, separately reviewed foundational-locator evidence audit of the already approved corpus.
+- Artifact result: the earlier six-file set is historical evidence only and is not accepted by the corrected seven-artifact active-run binding contract. No private artifacts were read or resealed during this correction.
+- Verification: tracked regression and full-suite evidence for the corrected contract is recorded in PR #1; private revalidation remains pending.
+- Decision: do not run the E1a-4 sampling-frame sealer, ingest/reindex documents, reuse E1a-3 locators, or weaken the exact grid. The next approval gate is bounded human review of the unresolved identity candidates followed by a new versioned, active-run-bound reconciliation seal; the foundational-locator audit remains downstream of that gate.

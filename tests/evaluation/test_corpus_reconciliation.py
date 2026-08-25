@@ -604,10 +604,12 @@ def test_same_algorithm_checksum_creates_exact_match(tmp_path: Path) -> None:
 
 def test_filename_and_size_only_requires_review(tmp_path: Path) -> None:
     from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        ReviewDecisionRecord,
         import_drive_page,
         import_index_inventory,
         inventory_local_files,
         reconcile_document_matches,
+        record_review_decision,
     )
 
     content = b"same-size"
@@ -635,6 +637,25 @@ def test_filename_and_size_only_requires_review(tmp_path: Path) -> None:
 
     assert summary.ambiguous_review_required == 1
     assert store.match_status("drive-1") == "AMBIGUOUS_REVIEW_REQUIRED"
+    checkpoint = store.checkpoint("document_matching")
+    assert checkpoint.status == "BLOCKED"
+    assert checkpoint.error_code == "CORPUS_RECONCILIATION_AMBIGUOUS_REVIEW_REQUIRED"
+    result = record_review_decision(
+        store=store,
+        record=ReviewDecisionRecord.from_mapping(
+            {
+                "decision_id": "decision-1",
+                "match_key": "drive:drive-1",
+                "decision": "ACCEPT",
+                "reviewer_id": "reviewer-1",
+                "reason_code": "REVIEWED",
+                "supersedes_decision_id": None,
+                "decided_at": "2026-08-24T00:00:00Z",
+            }
+        ),
+    )
+    assert result.status == "COMPLETE"
+    assert store.checkpoint("document_matching").status == "COMPLETE"
     store.close()
 
 
@@ -1146,7 +1167,18 @@ def test_snapshot_set_is_canonical_complete_and_idempotent(tmp_path: Path) -> No
     verified = verify_reconciliation_snapshots(root=store.root)
     resealed = seal_reconciliation_snapshots(store=store, root=store.root)
 
-    assert len(sealed.artifacts) == 6
+    assert len(sealed.artifacts) == 7
+    binding = json.loads(
+        (store.root / "snapshots" / "snapshot-binding.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert binding == {
+        "schema_version": 1,
+        "run_id": "run-001",
+        "index_contract_sha256": "a" * 64,
+        "e1a3_allocation_sha256": "b" * 64,
+    }
     assert verified == sealed
     assert resealed == sealed
     assert {
@@ -1164,6 +1196,64 @@ def test_snapshot_set_is_canonical_complete_and_idempotent(tmp_path: Path) -> No
         "drive-1",
         "drive-2",
     ]
+    store.close()
+
+
+def test_status_rejects_snapshots_bound_to_a_different_run(tmp_path: Path) -> None:
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        CorpusReconciliationError,
+        ReconciliationStore,
+        seal_reconciliation_snapshots,
+    )
+
+    runner = _corpus_runner_module()
+    original = _complete_snapshot_store(tmp_path)
+    seal_reconciliation_snapshots(store=original, root=original.root)
+    root = original.root
+    original.close()
+    current = ReconciliationStore.create(
+        root=root,
+        expected_root=root,
+        run_id="run-002",
+        index_contract_sha256="c" * 64,
+        e1a3_allocation_sha256="d" * 64,
+    )
+    current.set_checkpoint(
+        stage="e1a4_dry_run",
+        status="COMPLETE",
+        committed_records=96,
+    )
+
+    with pytest.raises(
+        CorpusReconciliationError,
+        match="CORPUS_RECONCILIATION_SNAPSHOT_BINDING_MISMATCH",
+    ):
+        runner._status_payload(current)
+
+    current.close()
+
+
+def test_status_does_not_declare_completion_when_an_active_stage_is_blocked(
+    tmp_path: Path,
+) -> None:
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        seal_reconciliation_snapshots,
+    )
+
+    runner = _corpus_runner_module()
+    store = _complete_snapshot_store(tmp_path)
+    seal_reconciliation_snapshots(store=store, root=store.root)
+    store.set_checkpoint(
+        stage="document_matching",
+        status="BLOCKED",
+        committed_records=store.count("document_matches"),
+        error_code="CORPUS_RECONCILIATION_AMBIGUOUS_REVIEW_REQUIRED",
+    )
+
+    payload = runner._status_payload(store)
+
+    assert payload["snapshots_complete"] is True
+    assert payload["status"] == "CORPUS_RECONCILIATION_IN_PROGRESS"
     store.close()
 
 
@@ -1645,6 +1735,34 @@ def test_cli_drive_stdin_returns_the_current_and_next_page_tokens(
     assert records == ()
     assert page_token == "token-2"
     assert next_page_token == "token-3"
+
+
+def test_cli_review_stdin_requires_a_closed_decision_mapping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _corpus_runner_module()
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        io.StringIO(
+            json.dumps(
+                {
+                    "decision_id": "decision-1",
+                    "match_key": "drive:drive-1",
+                    "decision": "ACCEPT",
+                    "reviewer_id": "reviewer-1",
+                    "reason_code": "REVIEWED",
+                    "supersedes_decision_id": None,
+                    "decided_at": "2026-08-24T00:00:00Z",
+                }
+            )
+        ),
+    )
+
+    record = runner._read_review_decision_stdin()
+
+    assert record.decision == "ACCEPT"
+    assert record.reason_code == "REVIEWED"
 
 
 def test_cli_status_is_aggregate_only(
