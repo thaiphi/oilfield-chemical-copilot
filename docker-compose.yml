@@ -1,4 +1,4 @@
-﻿services:
+services:
   postgres:
     image: pgvector/pgvector:pg16
     env_file:
@@ -18,53 +18,179 @@
       timeout: 5s
       retries: 5
 
-  app:
+  migrate:
     build:
       context: .
       dockerfile: Dockerfile
     env_file:
       - .env.example
     environment:
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4.1-mini}
-      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-openai}
       DATABASE_URL: ${DATABASE_URL:-postgresql://postgres:postgres@postgres:5432/oilfield_copilot}
-      DATA_MODE: ${DATA_MODE:-sample}
+    command: ["uv", "run", "python", "ingestion/apply_migrations.py"]
     depends_on:
       postgres:
         condition: service_healthy
+
+  monitoring-migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: oilfield-chemical-copilot:local
+    env_file:
+      - .env.example
+    environment:
+      DATABASE_URL: ${MONITORING_DATABASE_URL:-postgresql://postgres:postgres@postgres:5432/oilfield_copilot}
+    command: ["uv", "run", "python", "ingestion/apply_migrations.py"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: oilfield-chemical-copilot:local
+    env_file:
+      - .env.example
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4.1-mini}
+      LLM_PROVIDER: ${LLM_PROVIDER:-ollama}
+      OLLAMA_BASE_URL: ${OLLAMA_DOCKER_BASE_URL:-http://host.docker.internal:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-granite4.1:8b}
+      OLLAMA_EMBEDDING_MODEL: ${OLLAMA_EMBEDDING_MODEL:-granite-embedding:latest}
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-ollama}
+      EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-384}
+      SENTENCE_TRANSFORMERS_MODEL: ${SENTENCE_TRANSFORMERS_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
+      RAG_TOP_K: ${RAG_TOP_K:-5}
+      RAG_MIN_SCORE: ${RAG_MIN_SCORE:-0.2}
+      RAG_MAX_CONTEXT_CHARS: ${RAG_MAX_CONTEXT_CHARS:-4000}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://postgres:postgres@postgres:5432/oilfield_copilot}
+      DATA_MODE: ${DATA_MODE:-sample}
+      MONITORING_PERSISTENCE_ENABLED: "true"
+      MONITORING_DATABASE_URL: ${MONITORING_DATABASE_URL:-postgresql://postgres:postgres@postgres:5432/oilfield_copilot}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      monitoring-migrate:
+        condition: service_completed_successfully
     ports:
       - "${STREAMLIT_PORT:-8501}:8501"
     volumes:
       - ./data:/app/data:ro
 
+  kestra-db-init:
+    image: postgres:16
+    env_file:
+      - .env.example
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        until pg_isready -h postgres -U "$${POSTGRES_USER}" -d postgres; do sleep 1; done
+        psql -h postgres -U "$${POSTGRES_USER}" -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname = 'kestra'" | grep -q 1 ||
+          psql -h postgres -U "$${POSTGRES_USER}" -d postgres -c "CREATE DATABASE kestra"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  grafana-role-init:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: oilfield-chemical-copilot:local
+    env_file:
+      - .env.example
+    environment:
+      DATABASE_URL: ${MONITORING_DATABASE_URL:-postgresql://postgres:postgres@postgres:5432/oilfield_copilot}
+      GRAFANA_DB_PASSWORD: ${GRAFANA_DB_PASSWORD:-grafana}
+    command: ["uv", "run", "python", "monitoring/bootstrap_grafana_role.py"]
+    depends_on:
+      monitoring-migrate:
+        condition: service_completed_successfully
+
   kestra:
     image: kestra/kestra:latest
     env_file:
       - .env.example
+    user: "root"
     command: server standalone
+    environment:
+      KESTRA_CONFIGURATION: |
+        datasources:
+          postgres:
+            url: jdbc:postgresql://postgres:5432/kestra
+            driver-class-name: org.postgresql.Driver
+            username: postgres
+            password: postgres
+        kestra:
+          server:
+            basic-auth:
+              enabled: false
+              username: ${KESTRA_USERNAME:-admin@kestra.io}
+              password: ${KESTRA_PASSWORD:-Kestra123}
+          repository:
+            type: postgres
+          storage:
+            type: local
+            local:
+              base-path: "/app/storage"
+          queue:
+            type: postgres
+          tasks:
+            tmp-dir:
+              path: /tmp/kestra-wd/tmp
+            scripts:
+              docker:
+                volume-enabled: true
+          url: http://localhost:8080/
     ports:
       - "${KESTRA_PORT:-8080}:8080"
     volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
       - kestra-data:/app/storage
+      - /tmp/kestra-wd:/tmp/kestra-wd
       - ./flows/kestra:/app/flows:ro
       - ./data:/app/data:ro
     depends_on:
-      postgres:
-        condition: service_healthy
+      kestra-db-init:
+        condition: service_completed_successfully
 
   grafana:
     image: grafana/grafana:latest
     env_file:
       - .env.example
+    environment:
+      MONITORING_POSTGRES_DB: ${MONITORING_POSTGRES_DB:-oilfield_copilot}
+      GRAFANA_DB_PASSWORD: ${GRAFANA_DB_PASSWORD:-grafana}
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
     ports:
-      - "${GRAFANA_PORT:-3000}:3000"
+      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"
     volumes:
       - grafana-data:/var/lib/grafana
       - ./monitoring/grafana:/etc/grafana/provisioning:ro
     depends_on:
-      postgres:
-        condition: service_healthy
+      grafana-role-init:
+        condition: service_completed_successfully
+
+  monitoring-demo-seed:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: oilfield-chemical-copilot:local
+    profiles: ["demo"]
+    env_file:
+      - .env.example
+    environment:
+      DATABASE_URL: ${MONITORING_DATABASE_URL:-postgresql://postgres:postgres@postgres:5432/oilfield_copilot}
+    command: ["uv", "run", "python", "monitoring/seed_demo_metrics.py"]
+    depends_on:
+      grafana-role-init:
+        condition: service_completed_successfully
 
 volumes:
   pgdata:

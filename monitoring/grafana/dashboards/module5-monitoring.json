@@ -1,0 +1,75 @@
+{
+  "uid": "oilfield-module5-monitoring",
+  "title": "Oilfield Chemical Copilot - Synthetic Monitoring Demo",
+  "timezone": "utc",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "",
+  "time": {
+    "from": "2026-01-15T07:00:00.000Z",
+    "to": "2026-01-15T15:00:00.000Z"
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Request Volume by Outcome",
+      "description": "What this chart tells you: how the app handled requests during each UTC hour. A rising line shows that outcome happened more often in that hour. request_count is the number of requests in the outcome. outcome means the final handling path: rag_answered = the RAG path returned a cited response; rag_weak_evidence = the RAG path stopped because evidence was too weak; scope_abstained = the safety boundary declined a closed-scope request before RAG; tool_calculated = the validated dosage calculator completed; tool_input_invalid = a calculator request was missing or had invalid inputs; rag_configuration_error = the RAG service could not run because its configuration was unavailable. Use this chart to spot changes in normal answers, safety abstentions, tool use, weak evidence, or configuration failures.",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "type": "timeseries",
+      "datasource": {"type": "postgres", "uid": "oilfield-monitoring"},
+      "targets": [{"format": "time_series", "rawSql": "select bucket_start as time, outcome as metric, sum(request_count) as value from monitoring_request_hourly where $__timeFilter(bucket_start) group by bucket_start, outcome order by bucket_start"}]
+    },
+    {
+      "id": 2,
+      "title": "Average Response Latency by Retrieval Mode",
+      "description": "What this chart tells you: whether one retrieval path is making people wait longer than another. A higher line means a slower average response during that UTC hour. The unit is milliseconds, where 1,000 milliseconds equals 1 second. retrieval_mode is vector for semantic search only, hybrid for keyword plus semantic search, or not_applicable when retrieval did not run. latency_total_ms is the combined elapsed time for all timed requests in the hour. latency_count is how many timed requests were included. Average response time is latency_total_ms divided by latency_count.",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "type": "timeseries",
+      "datasource": {"type": "postgres", "uid": "oilfield-monitoring"},
+      "targets": [{"format": "time_series", "rawSql": "select bucket_start as time, retrieval_mode as metric, sum(latency_total_ms) / nullif(sum(latency_count), 0) as value from monitoring_request_hourly where $__timeFilter(bucket_start) group by bucket_start, retrieval_mode order by bucket_start"}]
+    },
+    {
+      "id": 3,
+      "title": "Response Latency Minimum and Maximum",
+      "description": "What this chart tells you: the best-case and worst-case response time in each UTC hour. A wide gap between the two lines means some requests took much longer than others. The unit is milliseconds, where 1,000 milliseconds equals 1 second. latency_minimum_ms is the fastest timed request in the hour. latency_maximum_ms is the slowest timed request in the hour. These are hourly aggregates across all handling paths; the chart does not show individual requests.",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "type": "timeseries",
+      "datasource": {"type": "postgres", "uid": "oilfield-monitoring"},
+      "targets": [{"format": "time_series", "rawSql": "select bucket_start as time, min(latency_minimum_ms) as minimum_ms, max(latency_maximum_ms) as maximum_ms from monitoring_request_hourly where $__timeFilter(bucket_start) group by bucket_start order by bucket_start"}]
+    },
+    {
+      "id": 4,
+      "title": "Outcome Mix",
+      "description": "What this chart tells you: which handling paths made up the requests in the selected time range. Each pie slice is a percentage of all request_count values; a larger slice means that outcome happened more often. outcome is the final handling path: rag_answered = a cited RAG response was returned; rag_weak_evidence = the RAG path stopped because evidence was too weak; scope_abstained = the safety boundary declined a closed-scope request; tool_calculated = the validated dosage calculator completed; tool_input_invalid = calculator inputs were missing or invalid; rag_configuration_error = the RAG service configuration was unavailable. request_count is the aggregate number of requests in each outcome. This shows the mix of app handling paths, not answer quality or chemistry success.",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+      "type": "piechart",
+      "datasource": {"type": "postgres", "uid": "oilfield-monitoring"},
+      "options": {
+        "reduceOptions": {"values": true, "calcs": ["lastNotNull"], "fields": ""},
+        "pieType": "pie",
+        "displayLabels": ["percent"],
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "single", "sort": "none"}
+      },
+      "targets": [{"format": "table", "rawSql": "select outcome as metric, sum(request_count) as value from monitoring_request_hourly where $__timeFilter(bucket_start) group by outcome order by outcome"}]
+    },
+    {
+      "id": 5,
+      "title": "Retrieval Mode Volume",
+      "description": "What this chart tells you: how often the app used each retrieval path in the selected time range. Taller bars mean that path handled more requests. retrieval_mode is vector for semantic search only, hybrid for keyword plus semantic search with RRF ranking, or not_applicable when a safety or calculator route did not search. request_count is the aggregate number of requests handled by that mode. This measures route usage, not whether a response was correct or useful.",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
+      "type": "barchart",
+      "datasource": {"type": "postgres", "uid": "oilfield-monitoring"},
+      "targets": [{"format": "table", "rawSql": "select retrieval_mode as metric, sum(request_count) as value from monitoring_request_hourly where $__timeFilter(bucket_start) group by retrieval_mode order by retrieval_mode"}]
+    },
+    {
+      "id": 6,
+      "title": "Helpful Rate and Feedback Volume",
+      "description": "What this chart tells you: how much feedback was submitted and what share was marked helpful in each UTC hour. helpful_rate is the percentage of submitted feedback that was helpful: 100 multiplied by helpful feedback_count divided by total feedback_count. helpful_count is the number of helpful selections, and needs_work_count is the number of needs-work selections. feedback_count is the aggregate number of selections for each feedback value. No feedback does not mean a negative result; it only means no selection was submitted. This panel excludes free-text notes and identity data.",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16},
+      "type": "timeseries",
+      "datasource": {"type": "postgres", "uid": "oilfield-monitoring"},
+      "targets": [{"format": "time_series", "rawSql": "select bucket_start as time, 100.0 * sum(feedback_count) filter (where feedback_value = 'helpful') / nullif(sum(feedback_count), 0) as helpful_rate, sum(feedback_count) filter (where feedback_value = 'helpful') as helpful_count, sum(feedback_count) filter (where feedback_value = 'needs_work') as needs_work_count from monitoring_feedback_hourly where $__timeFilter(bucket_start) group by bucket_start order by bucket_start"}]
+    }
+  ]
+}

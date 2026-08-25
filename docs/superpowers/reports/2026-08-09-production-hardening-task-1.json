@@ -1,0 +1,1 @@
+{"counts": {"checks_failed": 0, "checks_run": 1, "review_findings_verified": 5, "tests_run": 41}, "gates": {"privacy_guard_passed": true}, "status": "pass", "task": 1}

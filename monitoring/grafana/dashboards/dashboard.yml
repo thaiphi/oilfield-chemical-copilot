@@ -1,0 +1,10 @@
+apiVersion: 1
+
+providers:
+  - name: Oilfield Module 5
+    folder: Oilfield Chemical Copilot
+    type: file
+    disableDeletion: true
+    editable: false
+    options:
+      path: /etc/grafana/provisioning/dashboards

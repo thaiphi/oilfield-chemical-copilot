@@ -1,8 +1,8 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from pathlib import Path
 
-SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".xlsx", ".csv"}
+SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".xlsx", ".csv", ".txt", ".md"}
 
 
 def scan_sources(root: Path) -> list[Path]:

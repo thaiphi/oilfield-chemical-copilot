@@ -2,11 +2,25 @@
 
 from pathlib import Path
 
-from oilfield_chemical_copilot.ingest.chunking import build_placeholder_chunk
+from pypdf import PdfReader
+
+from oilfield_chemical_copilot.ingest.chunking import chunk_text
 from oilfield_chemical_copilot.ingest.models import LoadedChunk
 
 
-def parse_pdf(path: Path) -> list[LoadedChunk]:
-    """Scaffold PDF parser."""
-    # TODO: Extract page text with pypdf and preserve page numbers in metadata.
-    return [build_placeholder_chunk(path, "TODO: extracted PDF text", "unclassified", "page:unknown")]
+def parse_pdf(path: Path, *, source_root: Path | None = None, topic: str = "unknown") -> list[LoadedChunk]:
+    reader = PdfReader(path)
+    chunks: list[LoadedChunk] = []
+    for page_number, page in enumerate(reader.pages, start=1):
+        text = page.extract_text() or ""
+        chunks.extend(
+            chunk_text(
+                text=text,
+                source_file=path,
+                source_root=source_root,
+                topic=topic,
+                parser_type="pdf",
+                page_or_sheet=f"page:{page_number}",
+            )
+        )
+    return chunks

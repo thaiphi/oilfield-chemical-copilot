@@ -1,0 +1,3 @@
+﻿well_id,chloride_mg_l,tds_mg_l,sulfate_mg_l,calcium_mg_l,barium_mg_l,iron_mg_l,ph,temperature_f,notes
+sample-1,35000,62000,1200,2400,15,4.2,6.7,145,synthetic brine with sulfate and hardness for scale screening
+sample-2,18000,39000,80,900,2,1.1,7.1,120,synthetic lower sulfate water for comparison

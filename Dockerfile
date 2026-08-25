@@ -1,14 +1,18 @@
-﻿FROM python:3.12-slim
+FROM python:3.12-slim
 
 WORKDIR /app
 
 COPY --from=ghcr.io/astral-sh/uv:0.5.24 /uv /uvx /bin/
 
-COPY pyproject.toml README.md ./
+COPY pyproject.toml uv.lock README.md ./
 COPY app ./app
+COPY db ./db
+COPY ingestion ./ingestion
+COPY monitoring ./monitoring
 COPY src ./src
+COPY data/sample ./data/sample
 
-RUN uv sync --no-dev
+RUN uv sync --locked --no-dev
 
 EXPOSE 8501
 

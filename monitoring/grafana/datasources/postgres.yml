@@ -1,0 +1,16 @@
+apiVersion: 1
+
+datasources:
+  - name: Oilfield Monitoring
+    uid: oilfield-monitoring
+    type: postgres
+    access: proxy
+    url: postgres:5432
+    user: grafana_reader
+    secureJsonData:
+      password: $GRAFANA_DB_PASSWORD
+    jsonData:
+      database: $MONITORING_POSTGRES_DB
+      sslmode: disable
+      postgresVersion: 1600
+      timescaledb: false
