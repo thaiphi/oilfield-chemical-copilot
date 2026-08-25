@@ -945,6 +945,15 @@ def inventory_local_files(
                     )
         if set(safe_metadata) != seen_paths.intersection(safe_metadata):
             _fail("CORPUS_RECONCILIATION_LOCAL_METADATA_UNMATCHED")
+        persisted_paths = {
+            str(row["relative_path"])
+            for row in store._connection.execute(
+                "select relative_path from local_files where run_id = ?",
+                (store.run_id,),
+            ).fetchall()
+        }
+        if persisted_paths != seen_paths:
+            _fail("CORPUS_RECONCILIATION_LOCAL_STALE_RECORDS")
         store.set_checkpoint(
             stage=stage, status="COMPLETE", committed_records=committed
         )
@@ -1739,6 +1748,7 @@ def _snapshot_payloads(store: ReconciliationStore) -> dict[str, bytes]:
         "index_inventory",
         "document_matching",
         "locator_capacity",
+        "e1a4_dry_run",
     ):
         _require_complete_checkpoint(
             store,
@@ -1968,7 +1978,9 @@ def _validate_snapshot_record(name: str, record: object) -> None:
                 _fail(code)
 
 
-def _verified_snapshot_records(name: str, content: bytes) -> int:
+def _verified_snapshot_records(
+    name: str, content: bytes
+) -> tuple[Mapping[str, object], ...]:
     code = "CORPUS_RECONCILIATION_SNAPSHOT_SCHEMA_INVALID"
     if content and not content.endswith(b"\n"):
         _fail(code)
@@ -1981,7 +1993,121 @@ def _verified_snapshot_records(name: str, content: bytes) -> int:
         _validate_snapshot_record(name, record)
     if _canonical_jsonl(records) != content:
         _fail(code)
-    return len(records)
+    return tuple(dict(record) for record in records)
+
+
+def _validate_snapshot_relationships(
+    records_by_name: Mapping[str, tuple[Mapping[str, object], ...]],
+) -> None:
+    code = "CORPUS_RECONCILIATION_SNAPSHOT_RELATIONSHIP_INVALID"
+    index_records = records_by_name["index-inventory.jsonl"]
+    sources = {
+        str(record["source_id"]): record
+        for record in index_records
+        if record["record_type"] == "source"
+    }
+    if len(sources) != sum(record["record_type"] == "source" for record in index_records):
+        _fail(code)
+    locator_keys: set[tuple[str, str]] = set()
+    available_counts = {
+        (topic, role): 0 for topic in TOPICS for role in SOURCE_ROLES
+    }
+    for record in index_records:
+        if record["record_type"] != "locator":
+            continue
+        source_id = str(record["source_id"])
+        locator_key = (source_id, str(record["locator"]))
+        source = sources.get(source_id)
+        if (
+            source is None
+            or source["topic"] != record["topic"]
+            or locator_key in locator_keys
+            or (
+                record["e1a4_available"] is True
+                and (
+                    record["substantive_status"] != "SUBSTANTIVE"
+                    or record["e1a3_used"] is True
+                )
+            )
+        ):
+            _fail(code)
+        locator_keys.add(locator_key)
+        if record["e1a4_available"] is True:
+            available_counts[(str(record["topic"]), str(record["source_role"]))] += 1
+
+    drive_records = records_by_name["drive-inventory.jsonl"]
+    drive_ids = {str(record["drive_file_id"]) for record in drive_records}
+    local_records = records_by_name["local-inventory.jsonl"]
+    local_paths = {str(record["relative_path"]) for record in local_records}
+    if len(drive_ids) != len(drive_records) or len(local_paths) != len(local_records):
+        _fail(code)
+    if any(
+        record["provenance_drive_file_id"] is not None
+        and str(record["provenance_drive_file_id"]) not in drive_ids
+        for record in sources.values()
+    ):
+        _fail(code)
+
+    match_records = records_by_name["document-matches.jsonl"]
+    match_keys = {str(record["match_key"]) for record in match_records}
+    referenced_drive_ids = {
+        str(record["drive_file_id"])
+        for record in match_records
+        if record["drive_file_id"] is not None
+    }
+    referenced_local_paths = {
+        str(record["relative_path"])
+        for record in match_records
+        if record["relative_path"] is not None
+    }
+    referenced_source_ids = {
+        str(record["source_id"])
+        for record in match_records
+        if record["source_id"] is not None
+    }
+    if (
+        len(match_keys) != len(match_records)
+        or referenced_drive_ids != drive_ids
+        or referenced_local_paths != local_paths
+        or referenced_source_ids != set(sources)
+    ):
+        _fail(code)
+
+    decision_records = records_by_name["review-decisions.jsonl"]
+    decisions = {
+        str(record["decision_id"]): record for record in decision_records
+    }
+    if len(decisions) != len(decision_records):
+        _fail(code)
+    for decision_id, record in decisions.items():
+        match_key = str(record["match_key"])
+        supersedes = record["supersedes_decision_id"]
+        if match_key not in match_keys:
+            _fail(code)
+        if supersedes is not None:
+            prior = decisions.get(str(supersedes))
+            if (
+                prior is None
+                or str(supersedes) == decision_id
+                or prior["match_key"] != match_key
+            ):
+                _fail(code)
+
+    capacity_records = records_by_name["locator-capacity.jsonl"]
+    capacity = {
+        (str(record["topic"]), str(record["source_role"])): record
+        for record in capacity_records
+    }
+    if len(capacity) != len(capacity_records) or set(capacity) != set(available_counts):
+        _fail(code)
+    for stratum, record in capacity.items():
+        fresh = available_counts[stratum]
+        if (
+            record["fresh_locator_count"] != fresh
+            or record["required_locators"] != 12
+            or record["sufficient"] != (fresh >= 12)
+        ):
+            _fail(code)
 
 
 def verify_reconciliation_snapshots(*, root: Path) -> SnapshotSet:
@@ -1999,6 +2125,7 @@ def verify_reconciliation_snapshots(*, root: Path) -> SnapshotSet:
     if not all(present):
         _fail("CORPUS_RECONCILIATION_SNAPSHOT_PARTIAL")
     artifacts: list[SnapshotArtifact] = []
+    records_by_name: dict[str, tuple[Mapping[str, object], ...]] = {}
     for path, manifest in zip(expected_paths, expected_manifests, strict=True):
         try:
             content = path.read_bytes()
@@ -2016,16 +2143,18 @@ def verify_reconciliation_snapshots(*, root: Path) -> SnapshotSet:
         digest = hashlib.sha256(content).hexdigest()
         if manifest_text[:64] != digest:
             _fail("CORPUS_RECONCILIATION_SNAPSHOT_DIGEST_MISMATCH")
-        record_count = _verified_snapshot_records(path.name, content)
+        records = _verified_snapshot_records(path.name, content)
+        records_by_name[path.name] = records
         artifacts.append(
             SnapshotArtifact(
                 name=path.name,
                 path=path,
                 manifest_path=manifest,
                 sha256=digest,
-                record_count=record_count,
+                record_count=len(records),
             )
         )
+    _validate_snapshot_relationships(records_by_name)
     return SnapshotSet(artifacts=tuple(artifacts))
 
 

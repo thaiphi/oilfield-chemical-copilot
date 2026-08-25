@@ -361,6 +361,30 @@ def test_local_inventory_hashes_without_persisting_file_bytes(tmp_path: Path) ->
     assert content not in (store.root / "reconciliation.sqlite").read_bytes()
 
 
+def test_local_inventory_rejects_rows_for_files_missing_on_rescan(tmp_path: Path) -> None:
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        CorpusReconciliationError,
+        inventory_local_files,
+    )
+
+    approved_root = tmp_path / "approved"
+    approved_root.mkdir()
+    source_file = approved_root / "private.pdf"
+    source_file.write_bytes(b"private-content")
+    store = _create_store(tmp_path)
+    inventory_local_files(store=store, roots=(approved_root,))
+    source_file.unlink()
+
+    with pytest.raises(
+        CorpusReconciliationError,
+        match="CORPUS_RECONCILIATION_LOCAL_STALE_RECORDS",
+    ):
+        inventory_local_files(store=store, roots=(approved_root,))
+
+    assert store.checkpoint("local_inventory").status == "BLOCKED"
+    store.close()
+
+
 def test_index_inventory_requires_bound_contract_and_exact_totals(tmp_path: Path) -> None:
     from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
         CorpusReconciliationError,
@@ -1016,9 +1040,10 @@ def test_dry_run_fails_closed_when_one_stratum_is_unavailable(tmp_path: Path) ->
     store.close()
 
 
-def _complete_snapshot_store(tmp_path: Path):
+def _complete_snapshot_store(tmp_path: Path, *, include_dry_run: bool = True):
     from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
         calculate_locator_capacity,
+        dry_run_e1a4_allocation,
         import_drive_page,
         import_index_inventory,
         inventory_local_files,
@@ -1047,7 +1072,27 @@ def _complete_snapshot_store(tmp_path: Path):
     )
     reconcile_document_matches(store=store)
     calculate_locator_capacity(store=store, prior_locator_keys=())
+    if include_dry_run:
+        dry_run = dry_run_e1a4_allocation(store=store, prior_locator_keys=())
+        assert dry_run.status == "COMPLETE"
     return store
+
+
+def test_snapshot_seal_requires_completed_e1a4_dry_run(tmp_path: Path) -> None:
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        CorpusReconciliationError,
+        seal_reconciliation_snapshots,
+    )
+
+    store = _complete_snapshot_store(tmp_path, include_dry_run=False)
+
+    with pytest.raises(
+        CorpusReconciliationError,
+        match="CORPUS_RECONCILIATION_SNAPSHOT_INPUT_INCOMPLETE",
+    ):
+        seal_reconciliation_snapshots(store=store, root=store.root)
+
+    store.close()
 
 
 def test_snapshot_set_is_canonical_complete_and_idempotent(tmp_path: Path) -> None:
@@ -1122,6 +1167,150 @@ def test_snapshot_verification_rejects_forbidden_privacy_key(tmp_path: Path) -> 
     store.close()
 
 
+def test_snapshot_verification_rejects_locator_without_source(tmp_path: Path) -> None:
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        CorpusReconciliationError,
+        seal_reconciliation_snapshots,
+        verify_reconciliation_snapshots,
+    )
+
+    store = _complete_snapshot_store(tmp_path)
+    seal_reconciliation_snapshots(store=store, root=store.root)
+    snapshot = store.root / "snapshots" / "index-inventory.jsonl"
+    records = [json.loads(line) for line in snapshot.read_text(encoding="utf-8").splitlines()]
+    source_id = next(record["source_id"] for record in records if record["record_type"] == "source")
+    records = [
+        record
+        for record in records
+        if not (record["record_type"] == "source" and record["source_id"] == source_id)
+    ]
+    tampered = (
+        "\n".join(
+            sorted(json.dumps(record, sort_keys=True, separators=(",", ":")) for record in records)
+        )
+        + "\n"
+    ).encode()
+    snapshot.write_bytes(tampered)
+    snapshot.with_name(f"{snapshot.name}.sha256").write_text(
+        hashlib.sha256(tampered).hexdigest() + "\n", encoding="ascii"
+    )
+
+    with pytest.raises(
+        CorpusReconciliationError,
+        match="CORPUS_RECONCILIATION_SNAPSHOT_RELATIONSHIP_INVALID",
+    ):
+        verify_reconciliation_snapshots(root=store.root)
+
+    store.close()
+
+
+def test_snapshot_verification_rejects_match_without_source(tmp_path: Path) -> None:
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        CorpusReconciliationError,
+        seal_reconciliation_snapshots,
+        verify_reconciliation_snapshots,
+    )
+
+    store = _complete_snapshot_store(tmp_path)
+    seal_reconciliation_snapshots(store=store, root=store.root)
+    snapshot = store.root / "snapshots" / "document-matches.jsonl"
+    records = [json.loads(line) for line in snapshot.read_text(encoding="utf-8").splitlines()]
+    record = next(item for item in records if item["source_id"] is not None)
+    record["source_id"] = "missing-source"
+    tampered = (
+        "\n".join(
+            sorted(json.dumps(item, sort_keys=True, separators=(",", ":")) for item in records)
+        )
+        + "\n"
+    ).encode()
+    snapshot.write_bytes(tampered)
+    snapshot.with_name(f"{snapshot.name}.sha256").write_text(
+        hashlib.sha256(tampered).hexdigest() + "\n", encoding="ascii"
+    )
+
+    with pytest.raises(
+        CorpusReconciliationError,
+        match="CORPUS_RECONCILIATION_SNAPSHOT_RELATIONSHIP_INVALID",
+    ):
+        verify_reconciliation_snapshots(root=store.root)
+
+    store.close()
+
+
+def test_snapshot_verification_rejects_capacity_not_derived_from_locators(
+    tmp_path: Path,
+) -> None:
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        CorpusReconciliationError,
+        seal_reconciliation_snapshots,
+        verify_reconciliation_snapshots,
+    )
+
+    store = _complete_snapshot_store(tmp_path)
+    seal_reconciliation_snapshots(store=store, root=store.root)
+    snapshot = store.root / "snapshots" / "locator-capacity.jsonl"
+    records = [json.loads(line) for line in snapshot.read_text(encoding="utf-8").splitlines()]
+    records[0]["fresh_locator_count"] += 1
+    tampered = (
+        "\n".join(
+            sorted(json.dumps(item, sort_keys=True, separators=(",", ":")) for item in records)
+        )
+        + "\n"
+    ).encode()
+    snapshot.write_bytes(tampered)
+    snapshot.with_name(f"{snapshot.name}.sha256").write_text(
+        hashlib.sha256(tampered).hexdigest() + "\n", encoding="ascii"
+    )
+
+    with pytest.raises(
+        CorpusReconciliationError,
+        match="CORPUS_RECONCILIATION_SNAPSHOT_RELATIONSHIP_INVALID",
+    ):
+        verify_reconciliation_snapshots(root=store.root)
+
+    store.close()
+
+
+def test_snapshot_verification_rejects_decision_without_match(tmp_path: Path) -> None:
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        CorpusReconciliationError,
+        seal_reconciliation_snapshots,
+        verify_reconciliation_snapshots,
+    )
+
+    store = _complete_snapshot_store(tmp_path)
+    seal_reconciliation_snapshots(store=store, root=store.root)
+    snapshot = store.root / "snapshots" / "review-decisions.jsonl"
+    tampered = (
+        json.dumps(
+            {
+                "decision": "ACCEPT",
+                "decided_at": "2026-08-24T00:00:00Z",
+                "decision_id": "decision-1",
+                "match_key": "missing-match",
+                "reason_code": "REVIEWED",
+                "reviewer_id": "reviewer-1",
+                "supersedes_decision_id": None,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode()
+    snapshot.write_bytes(tampered)
+    snapshot.with_name(f"{snapshot.name}.sha256").write_text(
+        hashlib.sha256(tampered).hexdigest() + "\n", encoding="ascii"
+    )
+
+    with pytest.raises(
+        CorpusReconciliationError,
+        match="CORPUS_RECONCILIATION_SNAPSHOT_RELATIONSHIP_INVALID",
+    ):
+        verify_reconciliation_snapshots(root=store.root)
+
+    store.close()
+
+
 def test_snapshot_seal_rolls_back_complete_set_after_mid_publish_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1160,6 +1349,40 @@ def _corpus_runner_module() -> object:
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def test_cli_rejects_caller_selected_reconciliation_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runner = _corpus_runner_module()
+    controller_root = tmp_path / ".private" / "corpus-reconciliation" / "v1"
+    public_root = tmp_path / "docs" / "reconciliation"
+    monkeypatch.setattr(runner, "DEFAULT_ROOT", controller_root)
+    monkeypatch.setattr(runner, "_index_contract_digest", lambda _path: "a" * 64)
+    monkeypatch.setattr(runner, "_load_prior_locator_keys", lambda _root: ())
+    monkeypatch.setattr(runner, "_allocation_digest", lambda _root: "b" * 64)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "reconcile_private_corpus.py",
+            "init",
+            "--private-root",
+            str(public_root),
+        ],
+    )
+
+    assert runner.cli() == 1
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert json.loads(captured.err) == {
+        "status": "CORPUS_RECONCILIATION_BLOCKED",
+        "error_code": "CORPUS_RECONCILIATION_PRIVATE_ROOT_INVALID",
+    }
+    assert not (public_root / "reconciliation.sqlite").exists()
 
 
 def test_cli_rejects_missing_prerequisites_without_traceback(
@@ -1203,6 +1426,7 @@ def test_cli_rejects_invalid_drive_stdin_without_echoing_private_fields(
     store = _create_store(tmp_path)
     root = store.root
     store.close()
+    monkeypatch.setattr(runner, "DEFAULT_ROOT", root)
     monkeypatch.setattr(
         sys,
         "argv",
@@ -1243,6 +1467,7 @@ def test_cli_status_is_aggregate_only(
     store = _create_store(tmp_path)
     root = store.root
     store.close()
+    monkeypatch.setattr(runner, "DEFAULT_ROOT", root)
     monkeypatch.setattr(
         sys,
         "argv",
@@ -1273,6 +1498,46 @@ def test_cli_status_is_aggregate_only(
     assert str(root) not in captured.out
     assert "run-001" not in captured.out
     assert "a" * 64 not in captured.out
+
+
+def test_cli_status_rejects_corrupted_complete_snapshot_set(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        seal_reconciliation_snapshots,
+    )
+
+    runner = _corpus_runner_module()
+    store = _complete_snapshot_store(tmp_path)
+    root = store.root
+    seal_reconciliation_snapshots(store=store, root=root)
+    snapshot = root / "snapshots" / "drive-inventory.jsonl"
+    snapshot.write_bytes(snapshot.read_bytes() + b"{}\n")
+    store.close()
+    monkeypatch.setattr(runner, "DEFAULT_ROOT", root)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "reconcile_private_corpus.py",
+            "status",
+            "--private-root",
+            str(root),
+            "--run-id",
+            "run-001",
+        ],
+    )
+
+    assert runner.cli() == 1
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert json.loads(captured.err) == {
+        "status": "CORPUS_RECONCILIATION_BLOCKED",
+        "error_code": "CORPUS_RECONCILIATION_SNAPSHOT_DIGEST_MISMATCH",
+    }
 
 
 def test_index_connection_verifies_contract_before_read_only_connect(

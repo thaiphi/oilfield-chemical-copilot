@@ -34,6 +34,7 @@ from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (  # noqa
     inventory_local_files,
     reconcile_document_matches,
     seal_reconciliation_snapshots,
+    verify_reconciliation_snapshots,
 )
 from oilfield_chemical_copilot.evaluation.e1a3_sampling import (  # noqa: E402
     E1A3SamplingError,
@@ -209,7 +210,7 @@ def _validate_store_bindings(
 def _open_store(args: argparse.Namespace) -> ReconciliationStore:
     return ReconciliationStore.open(
         root=args.private_root,
-        expected_root=args.private_root,
+        expected_root=DEFAULT_ROOT,
         run_id=args.run_id,
     )
 
@@ -240,11 +241,16 @@ def _status_payload(store: ReconciliationStore) -> dict[str, object]:
         except CorpusReconciliationError:
             stages[stage] = "NOT_STARTED"
     snapshots = store.root / "snapshots"
-    snapshots_complete = all(
-        (snapshots / name).is_file()
-        and (snapshots / f"{name}.sha256").is_file()
+    snapshot_paths = tuple(
+        path
         for name in SNAPSHOT_NAMES
+        for path in (snapshots / name, snapshots / f"{name}.sha256")
     )
+    presence = tuple(path.is_file() for path in snapshot_paths)
+    snapshots_complete = False
+    if any(presence):
+        verify_reconciliation_snapshots(root=store.root)
+        snapshots_complete = True
     status = (
         "CORPUS_RECONCILIATION_COMPLETE"
         if snapshots_complete and stages["e1a4_dry_run"] in {"COMPLETE", "BLOCKED"}
@@ -465,7 +471,7 @@ def main() -> int:
         allocation_digest = _allocation_digest(args.e1a3_root)
         store = ReconciliationStore.create(
             root=args.private_root,
-            expected_root=args.private_root,
+            expected_root=DEFAULT_ROOT,
             run_id=args.run_id,
             index_contract_sha256=index_digest,
             e1a3_allocation_sha256=allocation_digest,
