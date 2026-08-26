@@ -23,10 +23,13 @@ from oilfield_chemical_copilot.evaluation.foundational_locator_audit import (  #
     FoundationalLocatorAuditError,
     LocatorAuditDecision,
     audit_status,
+    calculate_hypothetical_capacity,
     extract_candidate_page,
     initialize_audit,
     next_unreviewed_locator,
     record_locator_decision,
+    seal_correction_proposal,
+    verify_correction_proposal,
 )
 
 
@@ -59,6 +62,10 @@ def _parser() -> argparse.ArgumentParser:
     next_command.add_argument("--packet-output", type=Path, required=True)
     command("record")
     command("status")
+    command("seal")
+    verify = command("verify")
+    verify.add_argument("--expected-binding-sha256", required=True)
+    command("capacity")
     return parser
 
 
@@ -163,11 +170,13 @@ def cli(argv: Sequence[str] | None = None) -> int:
             store.close()
         else:
             audit = _open_audit(args)
+        output: dict[str, object]
         if args.command == "record":
             record_locator_decision(
                 audit=audit,
                 record=LocatorAuditDecision.from_mapping(_read_stdin_mapping()),
             )
+            output = _public_status(audit)
         elif args.command == "next":
             locator = next_unreviewed_locator(audit)
             if locator is not None:
@@ -190,7 +199,43 @@ def cli(argv: Sequence[str] | None = None) -> int:
                     destination=args.packet_output,
                     payload=content,
                 )
-        output = _public_status(audit)
+            output = _public_status(audit)
+        elif args.command == "seal":
+            sealed = seal_correction_proposal(audit=audit)
+            output = {
+                "status": "SEALED",
+                "artifact_count": len(sealed.artifacts),
+                "manifest_count": sum(
+                    artifact.manifest_path.is_file()
+                    for artifact in sealed.artifacts
+                ),
+            }
+        elif args.command == "verify":
+            verified = verify_correction_proposal(
+                audit=audit,
+                expected_binding_sha256=args.expected_binding_sha256,
+            )
+            output = {
+                "status": "VERIFIED",
+                "artifact_count": len(verified.artifacts),
+                "manifest_count": sum(
+                    artifact.manifest_path.is_file()
+                    for artifact in verified.artifacts
+                ),
+            }
+        elif args.command == "capacity":
+            report = calculate_hypothetical_capacity(audit=audit)
+            output = {
+                "status": "SUFFICIENT" if report.all_sufficient else "INSUFFICIENT",
+                "all_sufficient": report.all_sufficient,
+                "allocation_available": report.allocation_available,
+                "allocation_count": report.allocation_count,
+                "sufficient_strata_count": sum(
+                    item.sufficient for item in report.strata
+                ),
+            }
+        else:
+            output = _public_status(audit)
         audit.close()
         print(json.dumps(output, sort_keys=True))
         return 0

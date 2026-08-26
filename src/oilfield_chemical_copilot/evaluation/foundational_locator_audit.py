@@ -5,9 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import sqlite3
+from tempfile import NamedTemporaryFile
 from typing import Mapping
 
 from pypdf import PdfReader
@@ -15,6 +17,12 @@ from pypdf import PdfReader
 from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
     ReconciliationStore,
     TOPICS,
+)
+from oilfield_chemical_copilot.evaluation.e1a3_sampling import (
+    E1A3SamplingError,
+    E1A3SourceMetadata,
+    allocate_sampling_slots,
+    build_sampling_slots,
 )
 
 
@@ -29,6 +37,9 @@ AUDIT_DECISION_CONTRACTS = frozenset(
         ("NEEDS_SECOND_REVIEW", "AMBIGUOUS_OR_NONEXTRACTABLE"),
     }
 )
+AUDIT_ARTIFACT_VERSION = "v1"
+CORRECTION_NAME = "foundational-locator-corrections.v1.jsonl"
+AUDIT_BINDING_NAME = "audit-binding.v1.json"
 
 
 class FoundationalLocatorAuditError(RuntimeError):
@@ -178,6 +189,38 @@ class LocatorReviewPacket:
             "page_text": self.page_text,
             "page_text_sha256": self.page_text_sha256,
         }
+
+
+@dataclass(frozen=True)
+class AuditArtifact:
+    name: str
+    path: Path
+    manifest_path: Path
+    sha256: str
+    record_count: int
+
+
+@dataclass(frozen=True)
+class AuditSeal:
+    artifacts: tuple[AuditArtifact, ...]
+    binding_sha256: str
+
+
+@dataclass(frozen=True)
+class HypotheticalCapacityStratum:
+    topic: str
+    source_role: str
+    fresh_locator_count: int
+    required_locators: int
+    sufficient: bool
+
+
+@dataclass(frozen=True)
+class HypotheticalCapacityReport:
+    strata: tuple[HypotheticalCapacityStratum, ...]
+    all_sufficient: bool
+    allocation_available: bool
+    allocation_count: int
 
 
 class FoundationalAuditStore:
@@ -617,3 +660,348 @@ def next_unreviewed_locator(audit: FoundationalAuditStore) -> str | None:
         if key not in current:
             return key[1]
     return None
+
+
+def _canonical_jsonl(records: tuple[Mapping[str, object], ...]) -> bytes:
+    if not records:
+        return b""
+    lines = tuple(
+        json.dumps(
+            dict(record),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+        for record in records
+    )
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def _complete_current_decisions(
+    audit: FoundationalAuditStore,
+) -> tuple[LocatorAuditDecision, ...]:
+    status = audit_status(audit)
+    if status.status != "COMPLETE" or status.remaining_count != 0:
+        _fail("FOUNDATIONAL_LOCATOR_AUDIT_INCOMPLETE")
+    current = _current_decisions(_decision_records(audit))
+    return tuple(
+        current[key]
+        for key in sorted(current, key=lambda item: (item[0], _page_number(item[1], "FOUNDATIONAL_LOCATOR_AUDIT_DECISION_INVALID")))
+    )
+
+
+def _audit_binding_row(audit: FoundationalAuditStore) -> sqlite3.Row:
+    row = audit._connection.execute(
+        """
+        select snapshot_binding_sha256, source_file_sha256,
+               candidate_set_sha256, candidate_count
+        from foundational_audit_runs
+        where run_id = ? and audit_id = ?
+        """,
+        (audit.run_id, audit.audit_id),
+    ).fetchone()
+    if row is None:
+        _fail("FOUNDATIONAL_LOCATOR_AUDIT_RUN_MISSING")
+    return row
+
+
+def _correction_payload(audit: FoundationalAuditStore) -> bytes:
+    decisions = _complete_current_decisions(audit)
+    return _canonical_jsonl(tuple(decision.to_mapping() for decision in decisions))
+
+
+def _binding_payload(audit: FoundationalAuditStore, correction_sha256: str) -> bytes:
+    row = _audit_binding_row(audit)
+    binding = {
+        "schema_version": 1,
+        "run_id": audit.run_id,
+        "audit_id": audit.audit_id,
+        "snapshot_binding_sha256": _digest(
+            row["snapshot_binding_sha256"],
+            "FOUNDATIONAL_LOCATOR_AUDIT_BINDING_INVALID",
+        ),
+        "source_file_sha256": _digest(
+            row["source_file_sha256"],
+            "FOUNDATIONAL_LOCATOR_AUDIT_BINDING_INVALID",
+        ),
+        "candidate_set_sha256": _digest(
+            row["candidate_set_sha256"],
+            "FOUNDATIONAL_LOCATOR_AUDIT_BINDING_INVALID",
+        ),
+        "candidate_count": int(row["candidate_count"]),
+        "correction_payload_sha256": _digest(
+            correction_sha256,
+            "FOUNDATIONAL_LOCATOR_AUDIT_BINDING_INVALID",
+        ),
+    }
+    return (
+        json.dumps(
+            binding,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def _sealed_directory(audit: FoundationalAuditStore) -> Path:
+    return (
+        audit.database_path.parent
+        / "foundational-locator-audit"
+        / AUDIT_ARTIFACT_VERSION
+        / "sealed"
+    )
+
+
+def _write_fsynced_temporary(*, destination: Path, content: bytes) -> Path:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with NamedTemporaryFile(
+        dir=destination.parent,
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+        delete=False,
+    ) as temporary:
+        temporary.write(content)
+        temporary.flush()
+        os.fsync(temporary.fileno())
+        return Path(temporary.name)
+
+
+def _manifest_digest(path: Path) -> str:
+    manifest = path.with_name(f"{path.name}.sha256")
+    try:
+        content = path.read_bytes()
+        text = manifest.read_text(encoding="ascii")
+    except (OSError, UnicodeError) as error:
+        raise FoundationalLocatorAuditError(
+            "FOUNDATIONAL_LOCATOR_AUDIT_SEAL_VERIFY_FAILED"
+        ) from error
+    if (
+        len(text) != 65
+        or not text.endswith("\n")
+        or any(character not in "0123456789abcdef" for character in text[:64])
+    ):
+        _fail("FOUNDATIONAL_LOCATOR_AUDIT_MANIFEST_INVALID")
+    digest = hashlib.sha256(content).hexdigest()
+    if digest != text[:64]:
+        _fail("FOUNDATIONAL_LOCATOR_AUDIT_DIGEST_MISMATCH")
+    return digest
+
+
+def verify_correction_proposal(
+    *, audit: FoundationalAuditStore, expected_binding_sha256: str
+) -> AuditSeal:
+    """Verify the sealed proposal against its trust anchor and current audit state."""
+    trusted = _digest(
+        expected_binding_sha256,
+        "FOUNDATIONAL_LOCATOR_AUDIT_BINDING_MISMATCH",
+    )
+    sealed = _sealed_directory(audit)
+    correction_path = sealed / CORRECTION_NAME
+    binding_path = sealed / AUDIT_BINDING_NAME
+    paths = (correction_path, binding_path)
+    manifests = tuple(path.with_name(f"{path.name}.sha256") for path in paths)
+    presence = tuple(path.is_file() for path in (*paths, *manifests))
+    if not any(presence):
+        _fail("FOUNDATIONAL_LOCATOR_AUDIT_SEAL_MISSING")
+    if not all(presence):
+        _fail("FOUNDATIONAL_LOCATOR_AUDIT_SEAL_PARTIAL")
+    correction_digest = _manifest_digest(correction_path)
+    binding_digest = _manifest_digest(binding_path)
+    if binding_digest != trusted:
+        _fail("FOUNDATIONAL_LOCATOR_AUDIT_BINDING_MISMATCH")
+    expected_corrections = _correction_payload(audit)
+    if correction_path.read_bytes() != expected_corrections:
+        _fail("FOUNDATIONAL_LOCATOR_AUDIT_BINDING_MISMATCH")
+    expected_binding = _binding_payload(audit, correction_digest)
+    if binding_path.read_bytes() != expected_binding:
+        _fail("FOUNDATIONAL_LOCATOR_AUDIT_BINDING_MISMATCH")
+    decisions = tuple(
+        LocatorAuditDecision.from_mapping(json.loads(line))
+        for line in expected_corrections.decode("utf-8").splitlines()
+    )
+    return AuditSeal(
+        artifacts=(
+            AuditArtifact(
+                name=CORRECTION_NAME,
+                path=correction_path,
+                manifest_path=manifests[0],
+                sha256=correction_digest,
+                record_count=len(decisions),
+            ),
+            AuditArtifact(
+                name=AUDIT_BINDING_NAME,
+                path=binding_path,
+                manifest_path=manifests[1],
+                sha256=binding_digest,
+                record_count=1,
+            ),
+        ),
+        binding_sha256=binding_digest,
+    )
+
+
+def seal_correction_proposal(*, audit: FoundationalAuditStore) -> AuditSeal:
+    """Atomically publish an immutable proposal without changing index rows."""
+    correction = _correction_payload(audit)
+    correction_digest = hashlib.sha256(correction).hexdigest()
+    binding = _binding_payload(audit, correction_digest)
+    binding_digest = hashlib.sha256(binding).hexdigest()
+    sealed = _sealed_directory(audit)
+    payloads = {
+        CORRECTION_NAME: correction,
+        AUDIT_BINDING_NAME: binding,
+    }
+    prepared = tuple(
+        item
+        for name, content in payloads.items()
+        for item in (
+            (sealed / name, content),
+            (
+                sealed / f"{name}.sha256",
+                (hashlib.sha256(content).hexdigest() + "\n").encode("ascii"),
+            ),
+        )
+    )
+    presence = tuple(path.exists() for path, _ in prepared)
+    if any(presence):
+        if not all(presence):
+            _fail("FOUNDATIONAL_LOCATOR_AUDIT_SEAL_PARTIAL")
+        return verify_correction_proposal(
+            audit=audit,
+            expected_binding_sha256=binding_digest,
+        )
+    staged: list[tuple[Path, Path]] = []
+    published: list[Path] = []
+    try:
+        for destination, content in prepared:
+            staged.append(
+                (
+                    _write_fsynced_temporary(
+                        destination=destination,
+                        content=content,
+                    ),
+                    destination,
+                )
+            )
+        for temporary, destination in staged:
+            os.replace(temporary, destination)
+            published.append(destination)
+        return verify_correction_proposal(
+            audit=audit,
+            expected_binding_sha256=binding_digest,
+        )
+    except (FoundationalLocatorAuditError, OSError) as error:
+        for temporary, _ in staged:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+        for destination in published:
+            try:
+                destination.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise FoundationalLocatorAuditError(
+            "FOUNDATIONAL_LOCATOR_AUDIT_SEAL_WRITE_FAILED"
+        ) from error
+
+
+def calculate_hypothetical_capacity(
+    *, audit: FoundationalAuditStore
+) -> HypotheticalCapacityReport:
+    """Project current promotions into capacity without mutating inventory."""
+    decisions = _complete_current_decisions(audit)
+    rows = audit._connection.execute(
+        """
+        select locator.source_id, locator.locator, locator.topic,
+               locator.source_role, source.parser_type
+        from index_locators as locator
+        join index_sources as source
+          on source.run_id = locator.run_id and source.source_id = locator.source_id
+        where locator.run_id = ? and locator.e1a4_available = 1
+        order by locator.source_id, locator.locator
+        """,
+        (audit.run_id,),
+    ).fetchall()
+    parser_rows = audit._connection.execute(
+        """
+        select source_id, parser_type from index_sources where run_id = ?
+        """,
+        (audit.run_id,),
+    ).fetchall()
+    parser_by_source = {str(row["source_id"]): str(row["parser_type"]) for row in parser_rows}
+    grouped: dict[tuple[str, str, str, str], list[str]] = {}
+    for row in rows:
+        grouped.setdefault(
+            (
+                str(row["source_id"]),
+                str(row["topic"]),
+                str(row["source_role"]),
+                str(row["parser_type"]),
+            ),
+            [],
+        ).append(str(row["locator"]))
+    for decision in decisions:
+        if decision.decision != "PROMOTE_FOUNDATIONAL":
+            continue
+        parser_type = parser_by_source.get(decision.source_id)
+        if parser_type is None or decision.proposed_topic is None:
+            _fail("FOUNDATIONAL_LOCATOR_AUDIT_CAPACITY_INVALID")
+        grouped.setdefault(
+            (
+                decision.source_id,
+                decision.proposed_topic,
+                "foundational",
+                parser_type,
+            ),
+            [],
+        ).append(decision.locator)
+    counts = {
+        (topic, role): 0
+        for topic in ("iron_sulfide", "scale", "corrosion", "paraffin")
+        for role in ("foundational", "supporting")
+    }
+    for (_, topic, role, _), locators in grouped.items():
+        counts[(topic, role)] += len(set(locators))
+    strata = tuple(
+        HypotheticalCapacityStratum(
+            topic=topic,
+            source_role=role,
+            fresh_locator_count=counts[(topic, role)],
+            required_locators=12,
+            sufficient=counts[(topic, role)] >= 12,
+        )
+        for topic in ("iron_sulfide", "scale", "corrosion", "paraffin")
+        for role in ("foundational", "supporting")
+    )
+    all_sufficient = all(item.sufficient for item in strata)
+    allocation_count = 0
+    if all_sufficient:
+        sources = tuple(
+            E1A3SourceMetadata(
+                source_id=source_id,
+                topic=topic,  # type: ignore[arg-type]
+                source_role=role,  # type: ignore[arg-type]
+                parser_type=parser_type,
+                locators=tuple(sorted(set(locators))),
+                eligibility_status="eligible",
+            )
+            for (source_id, topic, role, parser_type), locators in sorted(grouped.items())
+        )
+        try:
+            allocations = allocate_sampling_slots(
+                slots=build_sampling_slots(),
+                sources=sources,
+            )
+            if len(allocations) == 96:
+                allocation_count = 96
+        except E1A3SamplingError:
+            allocation_count = 0
+    return HypotheticalCapacityReport(
+        strata=strata,
+        all_sufficient=all_sufficient,
+        allocation_available=allocation_count == 96,
+        allocation_count=allocation_count,
+    )

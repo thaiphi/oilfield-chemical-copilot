@@ -284,3 +284,146 @@ def test_record_locator_decision_rejects_unknown_locator(tmp_path: Path) -> None
         )
 
     audit.close()
+
+
+def _completed_audit(tmp_path: Path):
+    from oilfield_chemical_copilot.evaluation.foundational_locator_audit import (
+        record_locator_decision,
+    )
+
+    audit = _initialize(tmp_path)
+    record_locator_decision(
+        audit=audit,
+        record=_decision(locator="page:1", decision="PROMOTE_FOUNDATIONAL"),
+    )
+    record_locator_decision(audit=audit, record=_decision(locator="page:2"))
+    record_locator_decision(audit=audit, record=_decision(locator="page:3"))
+    return audit
+
+
+def _locator_rows(audit) -> tuple[tuple[object, ...], ...]:
+    return tuple(
+        tuple(row)
+        for row in audit._connection.execute(
+            """
+            select source_id, locator, topic, source_role,
+                   substantive_status, e1a3_used, e1a4_available
+            from index_locators where run_id = ?
+            order by source_id, locator
+            """,
+            (audit.run_id,),
+        ).fetchall()
+    )
+
+
+def test_seal_requires_one_current_closed_decision_per_candidate(
+    tmp_path: Path,
+) -> None:
+    from oilfield_chemical_copilot.evaluation.foundational_locator_audit import (
+        FoundationalLocatorAuditError,
+        seal_correction_proposal,
+    )
+
+    audit = _initialize(tmp_path)
+
+    with pytest.raises(
+        FoundationalLocatorAuditError,
+        match="FOUNDATIONAL_LOCATOR_AUDIT_INCOMPLETE",
+    ):
+        seal_correction_proposal(audit=audit)
+
+    audit.close()
+
+
+def test_correction_proposal_is_canonical_complete_and_idempotent(
+    tmp_path: Path,
+) -> None:
+    from oilfield_chemical_copilot.evaluation.foundational_locator_audit import (
+        seal_correction_proposal,
+        verify_correction_proposal,
+    )
+
+    audit = _completed_audit(tmp_path)
+
+    sealed = seal_correction_proposal(audit=audit)
+    verified = verify_correction_proposal(
+        audit=audit,
+        expected_binding_sha256=sealed.binding_sha256,
+    )
+    resealed = seal_correction_proposal(audit=audit)
+
+    assert len(sealed.artifacts) == 2
+    assert all(artifact.manifest_path.is_file() for artifact in sealed.artifacts)
+    assert verified == sealed
+    assert resealed == sealed
+    audit.close()
+
+
+def test_hypothetical_capacity_does_not_update_index_locators(
+    tmp_path: Path,
+) -> None:
+    from oilfield_chemical_copilot.evaluation.foundational_locator_audit import (
+        calculate_hypothetical_capacity,
+    )
+
+    audit = _completed_audit(tmp_path)
+    before = _locator_rows(audit)
+
+    report = calculate_hypothetical_capacity(audit=audit)
+
+    assert _locator_rows(audit) == before
+    assert len(report.strata) == 8
+    assert report.all_sufficient is False
+    assert report.allocation_available is False
+    assert report.allocation_count == 0
+    audit.close()
+
+
+def test_cli_seal_verify_and_capacity_outputs_are_aggregate_only(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    audit = _completed_audit(tmp_path)
+    root = audit.database_path.parent
+    audit.close()
+    common = [
+        "--private-root",
+        str(root),
+        "--run-id",
+        "run-001",
+        "--audit-id",
+        "foundational-locator-audit-v1",
+    ]
+    runner = _runner_module()
+
+    assert runner.cli(["seal", *common]) == 0
+    sealed = json.loads(capsys.readouterr().out)
+    assert sealed == {
+        "status": "SEALED",
+        "artifact_count": 2,
+        "manifest_count": 2,
+    }
+    binding_manifest = (
+        root
+        / "foundational-locator-audit"
+        / "v1"
+        / "sealed"
+        / "audit-binding.v1.json.sha256"
+    )
+    trusted = binding_manifest.read_text(encoding="ascii").strip()
+    assert runner.cli(["verify", *common, "--expected-binding-sha256", trusted]) == 0
+    verified = json.loads(capsys.readouterr().out)
+    assert verified == {
+        "status": "VERIFIED",
+        "artifact_count": 2,
+        "manifest_count": 2,
+    }
+    assert runner.cli(["capacity", *common]) == 0
+    capacity = json.loads(capsys.readouterr().out)
+    assert capacity == {
+        "status": "INSUFFICIENT",
+        "all_sufficient": False,
+        "allocation_available": False,
+        "allocation_count": 0,
+        "sufficient_strata_count": 0,
+    }

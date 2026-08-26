@@ -214,7 +214,7 @@ git commit -m "feat: verify foundational audit pdf pages"
 - Consumes: exact current decisions for every candidate and the unchanged reconciliation inventory.
 - Produces: `seal_correction_proposal(audit: FoundationalAuditStore) -> AuditSeal`, `verify_correction_proposal(audit: FoundationalAuditStore, expected_binding_sha256: str) -> AuditSeal`, and `calculate_hypothetical_capacity(audit: FoundationalAuditStore) -> HypotheticalCapacityReport` without updating inventory rows.
 
-- [ ] **Step 1: Write failing tests for exact closure, atomic sealing, and no-write capacity**
+- [x] **Step 1: Write failing tests for exact closure, atomic sealing, and no-write capacity**
 
 ```python
 def test_seal_requires_one_current_closed_decision_per_candidate(tmp_path: Path) -> None:
@@ -231,23 +231,23 @@ def test_hypothetical_capacity_does_not_update_index_locators(tmp_path: Path) ->
     assert len(report.strata) == 8
 ```
 
-- [ ] **Step 2: Run seal/capacity tests and verify RED**
+- [x] **Step 2: Run seal/capacity tests and verify RED**
 
 Run: `python -m pytest -q tests/evaluation/test_foundational_locator_audit.py -k "seal or hypothetical"`
 
 Expected: FAIL because proposal sealing and hypothetical capacity do not exist.
 
-- [ ] **Step 3: Implement atomic private proposal sealing and no-write calculation**
+- [x] **Step 3: Implement atomic private proposal sealing and no-write calculation**
 
 Write `foundational-locator-corrections.v1.jsonl`, its SHA-256 manifest, and `audit-binding.v1.json` plus manifest under `.private/corpus-reconciliation/v1/foundational-locator-audit/v1/sealed/`. Include only current decisions and exact binding fields. Require zero unresolved/second-review decisions. Calculate capacity from a temporary in-memory projection that treats current promotions as substantive, foundational, unused locators; call the existing deterministic allocator against that projection and never update SQLite inventory tables.
 
-- [ ] **Step 4: Run seal/capacity tests and verify GREEN**
+- [x] **Step 4: Run seal/capacity tests and verify GREEN**
 
 Run: `python -m pytest -q tests/evaluation/test_foundational_locator_audit.py -k "seal or hypothetical"`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit Task 3**
+- [x] **Step 5: Commit Task 3**
 
 ```powershell
 git add -- src/oilfield_chemical_copilot/evaluation/foundational_locator_audit.py eval/audit_foundational_locators.py tests/evaluation/test_foundational_locator_audit.py
