@@ -263,23 +263,23 @@ git commit -m "feat: seal foundational locator correction proposal"
 - Consumes: verified raw Drive PDF bytes and Tasks 1-3 controller.
 - Produces: 133 durable current decisions, a verified private correction proposal, and an aggregate hypothetical-capacity result.
 
-- [ ] **Step 1: Verify exact Drive PDF identity and initialize the bound audit**
+- [x] **Step 1: Verify exact Drive PDF identity and initialize the bound audit**
 
 Fetch the exact Drive file as raw bytes, verify its SHA-256, verify its page count covers every bound locator, and initialize only if the active reconciliation binding and candidate-set digest match.
 
-- [ ] **Step 2: Review and persist every candidate page**
+- [x] **Step 2: Review and persist every candidate page**
 
 For each locator in controller order, inspect the exact page text and page rendering when extraction is insufficient. Record `PROMOTE_FOUNDATIONAL`, `KEEP_INELIGIBLE`, or `NEEDS_SECOND_REVIEW` immediately. Do not batch uncommitted decisions.
 
-- [ ] **Step 3: Resolve every second-review decision**
+- [x] **Step 3: Resolve every second-review decision**
 
 Use append-only supersession records. Do not seal while any current decision is `NEEDS_SECOND_REVIEW`.
 
-- [ ] **Step 4: Seal and verify the correction proposal**
+- [x] **Step 4: Seal and verify the correction proposal**
 
-Run the `seal` command, then perform a separate no-write `verify` call using the active binding digest as trust anchor.
+Run the `seal` command, then perform a separate no-write `verify` call using the sealed audit-binding digest as its direct trust anchor while also requiring the embedded active reconciliation binding to match current audit state.
 
-- [ ] **Step 5: Run hypothetical capacity and allocator**
+- [x] **Step 5: Run hypothetical capacity and allocator**
 
 Report only whether each of the eight public strata is sufficient, whether exact 96-slot allocation is available, and aggregate promoted/retained counts. Do not write an E1a-4 population or sampling frame.
 
@@ -294,11 +294,11 @@ Report only whether each of the eight public strata is sufficient, whether exact
 - Consumes: verified private aggregate results only.
 - Produces: synchronized public gate status and a reviewable branch.
 
-- [ ] **Step 1: Update public documents with aggregates only**
+- [x] **Step 1: Update public documents with aggregates only**
 
 Record candidate count, promoted/retained/second-review totals, eight-stratum sufficient/insufficient statuses, allocator available/unavailable status, seal verification, and the next approval gate. Do not include private identifiers, page text, filenames, locators, or hashes.
 
-- [ ] **Step 2: Run focused and full verification**
+- [x] **Step 2: Run focused and full verification**
 
 Run:
 
@@ -314,13 +314,23 @@ git status --short
 
 Expected: all tests pass, Ruff and diff checks are clean, `git ls-files .private` is empty, and no private artifact appears in status.
 
-- [ ] **Step 3: Request independent review before any mapping application**
+- [x] **Step 3: Request independent review before any mapping application**
 
 Review only the controller code, tests, aggregate public updates, and private artifact contract/digest verification. Do not expose private PDF content or locator decisions. Mapping application remains unauthorized until this review approves the versioned proposal.
 
-- [ ] **Step 4: Commit the tracked audit implementation and public result**
+- [x] **Step 4: Commit the tracked audit implementation and public result**
 
 ```powershell
 git add -- src/oilfield_chemical_copilot/evaluation/foundational_locator_audit.py eval/audit_foundational_locators.py tests/evaluation/test_foundational_locator_audit.py docs/superpowers/plans/2026-08-26-foundational-locator-evidence-audit.md docs/superpowers/plans/2026-08-23-private-corpus-reconciliation.md docs/superpowers/plans/2026-08-19-e1a4-requirements-aware-evidence-gate.md docs/CURRICULUM_REMEDIATION_BACKLOG.md
 git commit -m "feat: audit foundational locator evidence"
 ```
+
+## Execution Result — 2026-08-26
+
+- Identity and scope: the exact Drive PDF bytes matched the mounted copy; the bound audit covered all 133 candidates and closed with 133 current decisions and zero second-review items.
+- Decision aggregates: 92 candidates were promoted as substantive foundational evidence and 41 remained ineligible. Promotions were iron sulfide 5, scale 26, corrosion 33, and paraffin 28. Retained reasons were 20 title/index-only, 13 no-target-topic, 5 supporting-only, and 3 insufficient-context.
+- Artifact result: the stricter private v2 correction seal contains two artifacts and two manifests and was published by one atomic directory rename. It binds the active verified reconciliation seal, exact Drive provenance, exact PDF bytes, candidate set, and all 133 page-text digests. A separate no-write verification passed; the earlier v1 seal is preserved as superseded history.
+- Capacity result: all four supporting strata remain sufficient. Foundational scale, corrosion, and paraffin are sufficient; foundational iron sulfide remains insufficient at 5 of 12 fresh locators. The exact 96-slot allocation remains unavailable and no E1a-4 sampling frame was written.
+- Verification result: 17 foundational-audit tests, 62 reconciliation tests, and the full 666-test suite passed with 2 skips; Ruff and diff checks passed, and no private file is tracked or visible in Git status.
+- Independent review: approved with no Critical, Important, or Minor findings after the controller derived PDF identity from authenticated reconciliation evidence and rejected unrelated bytes.
+- Decision: do not apply the proposed locator mappings, run E1a-4 sampling, ingest/reindex material, change retrieval, reuse E1a-3 evidence, or weaken the grid. The next substantive approval is either a narrowly scoped acquisition of at least seven fresh substantive foundational iron-sulfide locators or closure of E1a-4 as infeasible under the current grid.

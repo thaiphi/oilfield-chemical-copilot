@@ -23,6 +23,7 @@ from oilfield_chemical_copilot.evaluation.foundational_locator_audit import (  #
     FoundationalLocatorAuditError,
     LocatorAuditDecision,
     audit_status,
+    bind_candidate_pages,
     calculate_hypothetical_capacity,
     extract_candidate_page,
     initialize_audit,
@@ -56,7 +57,8 @@ def _parser() -> argparse.ArgumentParser:
         child.add_argument("--audit-id", default=DEFAULT_AUDIT_ID)
         return child
 
-    command("init")
+    init = command("init")
+    init.add_argument("--pdf-path", type=Path, required=True)
     next_command = command("next")
     next_command.add_argument("--pdf-path", type=Path, required=True)
     next_command.add_argument("--packet-output", type=Path, required=True)
@@ -167,6 +169,7 @@ def cli(argv: Sequence[str] | None = None) -> int:
                 source_drive_file_id=payload["source_drive_file_id"],
                 source_file_sha256=payload["source_file_sha256"],
             )
+            bind_candidate_pages(audit=audit, pdf_path=args.pdf_path)
             store.close()
         else:
             audit = _open_audit(args)
@@ -243,6 +246,18 @@ def cli(argv: Sequence[str] | None = None) -> int:
         print(
             json.dumps(
                 {"status": "FOUNDATIONAL_LOCATOR_AUDIT_BLOCKED", "error_code": str(error)},
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+        )
+        return 1
+    except Exception:
+        print(
+            json.dumps(
+                {
+                    "status": "FOUNDATIONAL_LOCATOR_AUDIT_BLOCKED",
+                    "error_code": "FOUNDATIONAL_LOCATOR_AUDIT_OPERATION_FAILED",
+                },
                 sort_keys=True,
             ),
             file=sys.stderr,

@@ -379,3 +379,10 @@ git commit -m "docs: record private corpus reconciliation gate"
 - Capacity result: all four supporting strata remain sufficient and all four foundational strata remain insufficient after exact E1a-3 locator exclusion.
 - Verification to date: 62 focused reconciliation tests pass and the changed controller/test files are Ruff-clean. Full-suite and final independent review remain pending.
 - Decision: do not run E1a-4 sampling, ingestion, reindexing, retrieval changes, locator reuse, or grid weakening. The next authorized gate is the bounded foundational-locator audit; any corpus change requires a separate reviewed plan after that audit reports aggregate evidence gaps.
+
+## Foundational-Locator Audit Closure — 2026-08-26
+
+- Status: the bounded 133-candidate evidence audit is complete and durably persisted. All saved decisions were revalidated against page text extracted from the exact verified PDF bytes. It produced 92 proposed promotions, 41 retained ineligible decisions, and zero unresolved or second-review items.
+- Capacity result: all four supporting strata remain sufficient. Proposed foundational capacity is sufficient for scale, corrosion, and paraffin, while iron sulfide remains insufficient at 5 of 12 fresh locators. The deterministic 96-slot allocation therefore remains unavailable.
+- Artifact result: the stricter v2 two-artifact correction seal and both manifests passed separate no-write verification after atomic publication. It binds the active reconciliation seal, Drive provenance, PDF bytes, candidate set, and page-text digests; the prior v1 seal remains preserved as superseded history. The proposal has not been applied to the reconciliation inventory or index.
+- Review and decision: independent review approved the v2 proposal contract with no findings. E1a-4 sampling, ingestion, reindexing, retrieval changes, locator reuse, grid weakening, and mapping application remain unauthorized because the exact allocation is still unavailable. The next approval choice is a narrow acquisition plan for at least seven fresh substantive foundational iron-sulfide locators or closure of E1a-4 as infeasible under the current grid.

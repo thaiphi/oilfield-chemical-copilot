@@ -4,19 +4,23 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+from io import BytesIO
 import json
 import os
 from pathlib import Path
 import re
+import shutil
 import sqlite3
-from tempfile import NamedTemporaryFile
+from tempfile import mkdtemp
 from typing import Mapping
 
 from pypdf import PdfReader
 
 from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+    CorpusReconciliationError,
     ReconciliationStore,
     TOPICS,
+    verify_reconciliation_snapshots,
 )
 from oilfield_chemical_copilot.evaluation.e1a3_sampling import (
     E1A3SamplingError,
@@ -37,9 +41,9 @@ AUDIT_DECISION_CONTRACTS = frozenset(
         ("NEEDS_SECOND_REVIEW", "AMBIGUOUS_OR_NONEXTRACTABLE"),
     }
 )
-AUDIT_ARTIFACT_VERSION = "v1"
-CORRECTION_NAME = "foundational-locator-corrections.v1.jsonl"
-AUDIT_BINDING_NAME = "audit-binding.v1.json"
+AUDIT_ARTIFACT_VERSION = "v2"
+CORRECTION_NAME = "foundational-locator-corrections.v2.jsonl"
+AUDIT_BINDING_NAME = "audit-binding.v2.json"
 
 
 class FoundationalLocatorAuditError(RuntimeError):
@@ -296,6 +300,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             source_id text not null,
             locator text not null,
             page_number integer not null,
+            page_text_sha256 text,
             primary key (run_id, audit_id, source_id, locator),
             foreign key (run_id, audit_id)
                 references foundational_audit_runs(run_id, audit_id)
@@ -321,6 +326,17 @@ def _create_schema(connection: sqlite3.Connection) -> None:
         );
         """
     )
+    columns = {
+        str(row[1])
+        for row in connection.execute(
+            "pragma table_info(foundational_audit_candidates)"
+        ).fetchall()
+    }
+    if "page_text_sha256" not in columns:
+        connection.execute(
+            "alter table foundational_audit_candidates "
+            "add column page_text_sha256 text"
+        )
 
 
 def _candidate_records(
@@ -366,6 +382,105 @@ def _candidate_set_sha256(records: tuple[tuple[str, str, int], ...]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _trusted_source_sha256(
+    *,
+    store: ReconciliationStore,
+    source_id: str,
+    source_name: str,
+    source_provenance_drive_file_id: object,
+    source_content_sha256: object,
+    drive_id: str,
+    drive_size_bytes: int,
+) -> str:
+    """Derive the expected PDF digest from authenticated reconciliation evidence."""
+    match = store._connection.execute(
+        """
+        select match_key, relative_path, source_id, canonical_sha256,
+               match_method, match_status
+        from document_matches
+        where run_id = ? and drive_file_id = ?
+        """,
+        (store.run_id, drive_id),
+    ).fetchone()
+    if match is None or (
+        match["source_id"] is not None and str(match["source_id"]) != source_id
+    ):
+        _fail("FOUNDATIONAL_LOCATOR_AUDIT_SOURCE_PROVENANCE_INVALID")
+
+    relative_path = match["relative_path"]
+    local = None
+    if relative_path is not None:
+        local = store._connection.execute(
+            """
+            select sha256, size_bytes, file_type from local_files
+            where run_id = ? and relative_path = ?
+            """,
+            (store.run_id, relative_path),
+        ).fetchone()
+        if (
+            local is None
+            or Path(str(relative_path).replace("\\", "/")).name.casefold()
+            != source_name.casefold()
+            or int(local["size_bytes"]) != drive_size_bytes
+            or str(local["file_type"]).lower() != "pdf"
+        ):
+            _fail("FOUNDATIONAL_LOCATOR_AUDIT_SOURCE_PROVENANCE_INVALID")
+
+    status = str(match["match_status"])
+    method = str(match["match_method"])
+    if status in {"EXACT_MATCH", "DUPLICATE_ALIAS"}:
+        if match["canonical_sha256"] is None:
+            _fail("FOUNDATIONAL_LOCATOR_AUDIT_SOURCE_PROVENANCE_INVALID")
+        expected_digest = _digest(
+            match["canonical_sha256"],
+            "FOUNDATIONAL_LOCATOR_AUDIT_SOURCE_PROVENANCE_INVALID",
+        )
+        if local is not None and str(local["sha256"]) != expected_digest:
+            _fail("FOUNDATIONAL_LOCATOR_AUDIT_SOURCE_PROVENANCE_INVALID")
+        if local is None and not (
+            method == "DRIVE_ID_PROVENANCE"
+            and source_provenance_drive_file_id == drive_id
+            and source_content_sha256 == expected_digest
+        ):
+            _fail("FOUNDATIONAL_LOCATOR_AUDIT_SOURCE_PROVENANCE_INVALID")
+    elif status == "AMBIGUOUS_REVIEW_REQUIRED" and method == "FILENAME_AND_SIZE":
+        decisions = store._connection.execute(
+            """
+            select decision_id, decision, supersedes_decision_id
+            from review_decisions
+            where run_id = ? and match_key = ?
+            """,
+            (store.run_id, match["match_key"]),
+        ).fetchall()
+        superseded = {
+            str(row["supersedes_decision_id"])
+            for row in decisions
+            if row["supersedes_decision_id"] is not None
+        }
+        current = tuple(
+            row for row in decisions if str(row["decision_id"]) not in superseded
+        )
+        if (
+            local is None
+            or len(current) != 1
+            or str(current[0]["decision"]) != "ACCEPT"
+        ):
+            _fail("FOUNDATIONAL_LOCATOR_AUDIT_SOURCE_PROVENANCE_INVALID")
+        expected_digest = _digest(
+            local["sha256"],
+            "FOUNDATIONAL_LOCATOR_AUDIT_SOURCE_PROVENANCE_INVALID",
+        )
+    else:
+        _fail("FOUNDATIONAL_LOCATOR_AUDIT_SOURCE_PROVENANCE_INVALID")
+
+    if source_provenance_drive_file_id not in (None, drive_id) or (
+        source_content_sha256 is not None
+        and str(source_content_sha256) != expected_digest
+    ):
+        _fail("FOUNDATIONAL_LOCATOR_AUDIT_SOURCE_PROVENANCE_INVALID")
+    return expected_digest
+
+
 def initialize_audit(
     *,
     store: ReconciliationStore,
@@ -388,6 +503,57 @@ def initialize_audit(
     candidates = _candidate_records(store)
     source_id = candidates[0][0]
     candidate_digest = _candidate_set_sha256(candidates)
+    try:
+        verify_reconciliation_snapshots(
+            root=store.root,
+            store=store,
+            expected_binding_sha256=binding_digest,
+        )
+    except CorpusReconciliationError as error:
+        raise FoundationalLocatorAuditError(
+            "FOUNDATIONAL_LOCATOR_AUDIT_RECONCILIATION_UNTRUSTED"
+        ) from error
+    source = store._connection.execute(
+        """
+        select source_path, parser_type, provenance_drive_file_id, content_sha256
+        from index_sources
+        where run_id = ? and source_id = ?
+        """,
+        (store.run_id, source_id),
+    ).fetchone()
+    drive = store._connection.execute(
+        """
+        select name, mime_type, size_bytes from drive_files
+        where run_id = ? and drive_file_id = ?
+        """,
+        (store.run_id, drive_id),
+    ).fetchone()
+    if source is None or drive is None:
+        _fail("FOUNDATIONAL_LOCATOR_AUDIT_SOURCE_PROVENANCE_INVALID")
+    source_name = Path(str(source["source_path"]).replace("\\", "/")).name
+    duplicate_drive_names = store._connection.execute(
+        "select count(*) from drive_files where run_id = ? and name = ?",
+        (store.run_id, drive["name"]),
+    ).fetchone()
+    if (
+        str(source["parser_type"]).lower() != "pdf"
+        or str(drive["mime_type"]) != "application/pdf"
+        or source_name != str(drive["name"])
+        or duplicate_drive_names is None
+        or int(duplicate_drive_names[0]) != 1
+    ):
+        _fail("FOUNDATIONAL_LOCATOR_AUDIT_SOURCE_PROVENANCE_INVALID")
+    trusted_source_digest = _trusted_source_sha256(
+        store=store,
+        source_id=source_id,
+        source_name=source_name,
+        source_provenance_drive_file_id=source["provenance_drive_file_id"],
+        source_content_sha256=source["content_sha256"],
+        drive_id=drive_id,
+        drive_size_bytes=int(drive["size_bytes"]),
+    )
+    if source_digest != trusted_source_digest:
+        _fail("FOUNDATIONAL_LOCATOR_AUDIT_SOURCE_PROVENANCE_INVALID")
     _create_schema(store._connection)
     existing = store._connection.execute(
         """
@@ -519,13 +685,18 @@ def record_locator_decision(
     safe = LocatorAuditDecision.from_mapping(record.to_mapping())
     candidate = audit._connection.execute(
         """
-        select 1 from foundational_audit_candidates
+        select page_text_sha256 from foundational_audit_candidates
         where run_id = ? and audit_id = ? and source_id = ? and locator = ?
         """,
         (audit.run_id, audit.audit_id, safe.source_id, safe.locator),
     ).fetchone()
     if candidate is None:
         _fail("FOUNDATIONAL_LOCATOR_AUDIT_DECISION_INVALID")
+    if (
+        candidate["page_text_sha256"] is None
+        or safe.page_text_sha256 != str(candidate["page_text_sha256"])
+    ):
+        _fail("FOUNDATIONAL_LOCATOR_AUDIT_PAGE_BINDING_MISMATCH")
     current = _current_decisions(_decision_records(audit))
     prior = current.get((safe.source_id, safe.locator))
     if (prior is None) != (safe.supersedes_decision_id is None) or (
@@ -573,10 +744,9 @@ def record_locator_decision(
         return status
 
 
-def verify_source_pdf(
+def _verified_pdf_reader(
     *, audit: FoundationalAuditStore, pdf_path: Path
-) -> VerifiedSourcePdf:
-    """Require the exact bound PDF bytes and complete candidate page range."""
+) -> tuple[VerifiedSourcePdf, PdfReader]:
     path = pdf_path.resolve()
     if not path.is_file():
         _fail("FOUNDATIONAL_LOCATOR_AUDIT_PDF_MISSING")
@@ -589,11 +759,17 @@ def verify_source_pdf(
     ).fetchone()
     if expected is None:
         _fail("FOUNDATIONAL_LOCATOR_AUDIT_RUN_MISSING")
-    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    try:
+        content = path.read_bytes()
+    except OSError as error:
+        raise FoundationalLocatorAuditError(
+            "FOUNDATIONAL_LOCATOR_AUDIT_PDF_READ_FAILED"
+        ) from error
+    digest = hashlib.sha256(content).hexdigest()
     if digest != expected["source_file_sha256"]:
         _fail("FOUNDATIONAL_LOCATOR_AUDIT_PDF_MISMATCH")
     try:
-        reader = PdfReader(path)
+        reader = PdfReader(BytesIO(content))
     except Exception as error:
         raise FoundationalLocatorAuditError(
             "FOUNDATIONAL_LOCATOR_AUDIT_PDF_INVALID"
@@ -608,7 +784,85 @@ def verify_source_pdf(
     ).fetchone()
     if required is None or required[0] is None or int(required[0]) > page_count:
         _fail("FOUNDATIONAL_LOCATOR_AUDIT_PDF_PAGE_RANGE_INVALID")
-    return VerifiedSourcePdf(path=path, sha256=digest, page_count=page_count)
+    return VerifiedSourcePdf(path=path, sha256=digest, page_count=page_count), reader
+
+
+def verify_source_pdf(
+    *, audit: FoundationalAuditStore, pdf_path: Path
+) -> VerifiedSourcePdf:
+    """Require the exact bound PDF bytes and complete candidate page range."""
+    verified, _ = _verified_pdf_reader(audit=audit, pdf_path=pdf_path)
+    return verified
+
+
+def _normalized_page_text(reader: PdfReader, page_number: int) -> str:
+    try:
+        extracted = reader.pages[page_number - 1].extract_text()
+    except Exception as error:
+        raise FoundationalLocatorAuditError(
+            "FOUNDATIONAL_LOCATOR_AUDIT_PAGE_EXTRACTION_FAILED"
+        ) from error
+    return (extracted or "").replace("\r\n", "\n").replace("\r", "\n")
+
+
+def bind_candidate_pages(
+    *, audit: FoundationalAuditStore, pdf_path: Path
+) -> int:
+    """Bind every candidate to text parsed from the same verified PDF bytes."""
+    _, reader = _verified_pdf_reader(audit=audit, pdf_path=pdf_path)
+    candidates = audit._connection.execute(
+        """
+        select source_id, locator, page_number, page_text_sha256
+        from foundational_audit_candidates
+        where run_id = ? and audit_id = ?
+        order by page_number, source_id, locator
+        """,
+        (audit.run_id, audit.audit_id),
+    ).fetchall()
+    bindings = tuple(
+        (
+            hashlib.sha256(
+                _normalized_page_text(reader, int(row["page_number"])).encode("utf-8")
+            ).hexdigest(),
+            str(row["source_id"]),
+            str(row["locator"]),
+            row["page_text_sha256"],
+        )
+        for row in candidates
+    )
+    if any(
+        prior is not None and str(prior) != digest
+        for digest, _, _, prior in bindings
+    ):
+        _fail("FOUNDATIONAL_LOCATOR_AUDIT_PAGE_BINDING_MISMATCH")
+    expected_by_key = {
+        (source_id, locator): digest for digest, source_id, locator, _ in bindings
+    }
+    if any(
+        decision.page_text_sha256
+        != expected_by_key.get((decision.source_id, decision.locator))
+        for decision in _decision_records(audit)
+    ):
+        _fail("FOUNDATIONAL_LOCATOR_AUDIT_PAGE_BINDING_MISMATCH")
+    with audit._connection:
+        audit._connection.executemany(
+            """
+            update foundational_audit_candidates
+            set page_text_sha256 = ?
+            where run_id = ? and audit_id = ? and source_id = ? and locator = ?
+            """,
+            (
+                (
+                    digest,
+                    audit.run_id,
+                    audit.audit_id,
+                    source_id,
+                    locator,
+                )
+                for digest, source_id, locator, _ in bindings
+            ),
+        )
+    return len(bindings)
 
 
 def extract_candidate_page(
@@ -626,14 +880,8 @@ def extract_candidate_page(
     ).fetchone()
     if candidate is None:
         _fail("FOUNDATIONAL_LOCATOR_AUDIT_CANDIDATE_INVALID")
-    verified = verify_source_pdf(audit=audit, pdf_path=pdf_path)
-    try:
-        extracted = PdfReader(verified.path).pages[int(candidate["page_number"]) - 1].extract_text()
-    except Exception as error:
-        raise FoundationalLocatorAuditError(
-            "FOUNDATIONAL_LOCATOR_AUDIT_PAGE_EXTRACTION_FAILED"
-        ) from error
-    text = (extracted or "").replace("\r\n", "\n").replace("\r", "\n")
+    _, reader = _verified_pdf_reader(audit=audit, pdf_path=pdf_path)
+    text = _normalized_page_text(reader, int(candidate["page_number"]))
     text_digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
     return LocatorReviewPacket(
         source_id=str(candidate["source_id"]),
@@ -684,6 +932,23 @@ def _complete_current_decisions(
     if status.status != "COMPLETE" or status.remaining_count != 0:
         _fail("FOUNDATIONAL_LOCATOR_AUDIT_INCOMPLETE")
     current = _current_decisions(_decision_records(audit))
+    candidate_bindings = {
+        (str(row["source_id"]), str(row["locator"])): row["page_text_sha256"]
+        for row in audit._connection.execute(
+            """
+            select source_id, locator, page_text_sha256
+            from foundational_audit_candidates
+            where run_id = ? and audit_id = ?
+            """,
+            (audit.run_id, audit.audit_id),
+        ).fetchall()
+    }
+    if len(candidate_bindings) != status.candidate_count or any(
+        digest is None
+        or current[key].page_text_sha256 != str(digest)
+        for key, digest in candidate_bindings.items()
+    ):
+        _fail("FOUNDATIONAL_LOCATOR_AUDIT_PAGE_BINDING_MISMATCH")
     return tuple(
         current[key]
         for key in sorted(current, key=lambda item: (item[0], _page_number(item[1], "FOUNDATIONAL_LOCATOR_AUDIT_DECISION_INVALID")))
@@ -693,7 +958,7 @@ def _complete_current_decisions(
 def _audit_binding_row(audit: FoundationalAuditStore) -> sqlite3.Row:
     row = audit._connection.execute(
         """
-        select snapshot_binding_sha256, source_file_sha256,
+        select snapshot_binding_sha256, source_drive_file_id, source_file_sha256,
                candidate_set_sha256, candidate_count
         from foundational_audit_runs
         where run_id = ? and audit_id = ?
@@ -713,11 +978,15 @@ def _correction_payload(audit: FoundationalAuditStore) -> bytes:
 def _binding_payload(audit: FoundationalAuditStore, correction_sha256: str) -> bytes:
     row = _audit_binding_row(audit)
     binding = {
-        "schema_version": 1,
+        "schema_version": 2,
         "run_id": audit.run_id,
         "audit_id": audit.audit_id,
         "snapshot_binding_sha256": _digest(
             row["snapshot_binding_sha256"],
+            "FOUNDATIONAL_LOCATOR_AUDIT_BINDING_INVALID",
+        ),
+        "source_drive_file_id": _string(
+            row["source_drive_file_id"],
             "FOUNDATIONAL_LOCATOR_AUDIT_BINDING_INVALID",
         ),
         "source_file_sha256": _digest(
@@ -754,18 +1023,11 @@ def _sealed_directory(audit: FoundationalAuditStore) -> Path:
     )
 
 
-def _write_fsynced_temporary(*, destination: Path, content: bytes) -> Path:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    with NamedTemporaryFile(
-        dir=destination.parent,
-        prefix=f".{destination.name}.",
-        suffix=".tmp",
-        delete=False,
-    ) as temporary:
-        temporary.write(content)
-        temporary.flush()
-        os.fsync(temporary.fileno())
-        return Path(temporary.name)
+def _write_fsynced_file(*, destination: Path, content: bytes) -> None:
+    with destination.open("xb") as stream:
+        stream.write(content)
+        stream.flush()
+        os.fsync(stream.fileno())
 
 
 def _manifest_digest(path: Path) -> str:
@@ -806,6 +1068,15 @@ def verify_correction_proposal(
     if not any(presence):
         _fail("FOUNDATIONAL_LOCATOR_AUDIT_SEAL_MISSING")
     if not all(presence):
+        _fail("FOUNDATIONAL_LOCATOR_AUDIT_SEAL_PARTIAL")
+    expected_names = {path.name for path in (*paths, *manifests)}
+    try:
+        actual_names = {path.name for path in sealed.iterdir()}
+    except OSError as error:
+        raise FoundationalLocatorAuditError(
+            "FOUNDATIONAL_LOCATOR_AUDIT_SEAL_VERIFY_FAILED"
+        ) from error
+    if actual_names != expected_names:
         _fail("FOUNDATIONAL_LOCATOR_AUDIT_SEAL_PARTIAL")
     correction_digest = _manifest_digest(correction_path)
     binding_digest = _manifest_digest(binding_path)
@@ -853,56 +1124,36 @@ def seal_correction_proposal(*, audit: FoundationalAuditStore) -> AuditSeal:
         CORRECTION_NAME: correction,
         AUDIT_BINDING_NAME: binding,
     }
-    prepared = tuple(
-        item
-        for name, content in payloads.items()
-        for item in (
-            (sealed / name, content),
-            (
-                sealed / f"{name}.sha256",
-                (hashlib.sha256(content).hexdigest() + "\n").encode("ascii"),
-            ),
-        )
-    )
-    presence = tuple(path.exists() for path, _ in prepared)
-    if any(presence):
-        if not all(presence):
+    if sealed.exists():
+        if not sealed.is_dir():
             _fail("FOUNDATIONAL_LOCATOR_AUDIT_SEAL_PARTIAL")
         return verify_correction_proposal(
             audit=audit,
             expected_binding_sha256=binding_digest,
         )
-    staged: list[tuple[Path, Path]] = []
-    published: list[Path] = []
+    version_root = sealed.parent
+    version_root.mkdir(parents=True, exist_ok=True)
+    for stale in version_root.glob(".sealed.*.tmp"):
+        if stale.is_dir():
+            shutil.rmtree(stale, ignore_errors=True)
+    staged = Path(mkdtemp(prefix=".sealed.", suffix=".tmp", dir=version_root))
     try:
-        for destination, content in prepared:
-            staged.append(
-                (
-                    _write_fsynced_temporary(
-                        destination=destination,
-                        content=content,
-                    ),
-                    destination,
-                )
+        for name, content in payloads.items():
+            _write_fsynced_file(destination=staged / name, content=content)
+            _write_fsynced_file(
+                destination=staged / f"{name}.sha256",
+                content=(hashlib.sha256(content).hexdigest() + "\n").encode(
+                    "ascii"
+                ),
             )
-        for temporary, destination in staged:
-            os.replace(temporary, destination)
-            published.append(destination)
+        os.replace(staged, sealed)
         return verify_correction_proposal(
             audit=audit,
             expected_binding_sha256=binding_digest,
         )
     except (FoundationalLocatorAuditError, OSError) as error:
-        for temporary, _ in staged:
-            try:
-                temporary.unlink(missing_ok=True)
-            except OSError:
-                pass
-        for destination in published:
-            try:
-                destination.unlink(missing_ok=True)
-            except OSError:
-                pass
+        if staged.exists():
+            shutil.rmtree(staged, ignore_errors=True)
         raise FoundationalLocatorAuditError(
             "FOUNDATIONAL_LOCATOR_AUDIT_SEAL_WRITE_FAILED"
         ) from error

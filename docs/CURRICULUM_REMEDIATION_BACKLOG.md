@@ -7,9 +7,9 @@
 ## Active Experiment Status - 2026-08-23
 
 - E1a-4 Task 1 contracts are complete.
-- E1a-4 Task 2 contract and sealer code is implemented, but the private sampling frame is blocked after a completed, sealed metadata reconciliation. The approved index contains 4,797 chunks from 198 sources; all four supporting strata have sufficient fresh locator capacity, while all four foundational strata are insufficient after mandatory E1a-3 locator exclusion. No sampling-frame artifact was written.
+- E1a-4 Task 2 contract and sealer code is implemented, but the private sampling frame remains blocked after completed sealed reconciliation and a completed 133-candidate foundational evidence audit. The audit proposed 92 promotions and retained 41 candidates with zero unresolved items; its stricter v2 correction seal passed separate verification without applying mappings. All four supporting strata and foundational scale, corrosion, and paraffin are sufficient; foundational iron sulfide remains at 5 of 12 fresh locators. No sampling-frame artifact was written and the proposal has not been applied.
 - E1a-4 Tasks 3-6 have not started. Do not weaken locator freshness, the exact grid, or the one-shot gates to bypass Task 2.
-- The reconciliation checkpoint contains 385 topic-scoped Drive candidates, 232 local files, 198 index sources, and 1,874 locator records. It left 117 filename-and-size candidates for human review and made no automatic ambiguous match. This does not validate ingestion of hundreds of PDFs, but it does show that E1a-4's immediate blocker is foundational-locator freshness rather than general supporting-corpus capacity.
+- The reconciliation checkpoint contains 385 topic-scoped Drive candidates, 232 local files, 198 index sources, and 1,874 locator records. All 117 filename-and-size candidates were subsequently resolved through bounded byte-identity review, and the active seven-artifact reconciliation seal verifies. This does not validate ingestion of hundreds of PDFs; the remaining E1a-4 blocker is a seven-locator foundational iron-sulfide deficit rather than general supporting-corpus capacity.
 
 ## P0 - Preserve Submission Integrity
 
@@ -122,7 +122,7 @@
 
 ## Recommended Next Approval
 
-For E1a-4, approve only a narrow private foundational-locator evidence audit of the already approved corpus: review whether existing foundational documents contain additional substantive, topic-bound locators that were not used by E1a-3; version and independently review any mapping correction; then rerun the same capacity calculation and no-write allocator. Do not retrieve, generate questions, tune models, ingest/reindex documents, or relax freshness during that audit. If the exact foundational quotas still fail, require a separate approval for new foundational-source acquisition or close E1a-4 as infeasible under the current grid.
+For E1a-4, the versioned foundational-locator correction proposal passed independent review without exposing private content, but its verified no-write projection still lacks seven fresh substantive foundational iron-sulfide locators. Do not apply mappings, retrieve, generate questions, tune models, ingest/reindex documents, or relax freshness. The next substantive approval must choose between a narrow new-source acquisition plan limited to that deficit and closure of E1a-4 as infeasible under the current grid.
 
 Approve **P0.1 plus P0.2** when ready to publish: push the two verified local
 commits, then validate an independent public clone at the resulting fixed hash.
