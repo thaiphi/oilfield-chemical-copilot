@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+import importlib.util
+import json
 from pathlib import Path
 
 import pytest
@@ -56,7 +59,7 @@ def _reconciliation_with_foundational_candidates(tmp_path: Path):
     return store
 
 
-def _initialize(tmp_path: Path):
+def _initialize(tmp_path: Path, *, source_file_sha256: str = "d" * 64):
     from oilfield_chemical_copilot.evaluation.foundational_locator_audit import (
         initialize_audit,
     )
@@ -67,7 +70,7 @@ def _initialize(tmp_path: Path):
         audit_id="foundational-locator-audit-v1",
         snapshot_binding_sha256="c" * 64,
         source_drive_file_id="drive-source-1",
-        source_file_sha256="d" * 64,
+        source_file_sha256=source_file_sha256,
     )
     store.close()
     return audit
@@ -111,6 +114,101 @@ def test_initialize_audit_binds_exact_candidate_set(tmp_path: Path) -> None:
     assert status.current_decision_count == 0
     assert status.remaining_count == 3
     audit.close()
+
+
+def _three_page_pdf(tmp_path: Path) -> Path:
+    from pypdf import PdfWriter
+
+    path = tmp_path / "source.pdf"
+    writer = PdfWriter()
+    for _ in range(3):
+        writer.add_blank_page(width=612, height=792)
+    with path.open("wb") as stream:
+        writer.write(stream)
+    return path
+
+
+def _runner_module():
+    path = Path(__file__).resolve().parents[2] / "eval" / "audit_foundational_locators.py"
+    spec = importlib.util.spec_from_file_location("audit_foundational_locators", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_extract_candidate_page_requires_bound_pdf_and_exact_locator(
+    tmp_path: Path,
+) -> None:
+    from oilfield_chemical_copilot.evaluation.foundational_locator_audit import (
+        extract_candidate_page,
+    )
+
+    pdf = _three_page_pdf(tmp_path)
+    digest = hashlib.sha256(pdf.read_bytes()).hexdigest()
+    audit = _initialize(tmp_path, source_file_sha256=digest)
+
+    packet = extract_candidate_page(
+        audit=audit,
+        pdf_path=pdf,
+        locator="page:2",
+    )
+
+    assert packet.page_number == 2
+    assert packet.locator == "page:2"
+    assert packet.page_text == ""
+    assert packet.page_text_sha256 == hashlib.sha256(b"").hexdigest()
+    audit.close()
+
+
+def test_extract_candidate_page_rejects_pdf_hash_mismatch(tmp_path: Path) -> None:
+    from oilfield_chemical_copilot.evaluation.foundational_locator_audit import (
+        FoundationalLocatorAuditError,
+        extract_candidate_page,
+    )
+
+    pdf = _three_page_pdf(tmp_path)
+    audit = _initialize(tmp_path)
+
+    with pytest.raises(
+        FoundationalLocatorAuditError,
+        match="FOUNDATIONAL_LOCATOR_AUDIT_PDF_MISMATCH",
+    ):
+        extract_candidate_page(audit=audit, pdf_path=pdf, locator="page:2")
+
+    audit.close()
+
+
+def test_cli_status_never_prints_private_identifiers(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    audit = _initialize(tmp_path)
+    root = audit.database_path.parent
+    audit.close()
+    runner = _runner_module()
+
+    assert (
+        runner.cli(
+            [
+                "status",
+                "--private-root",
+                str(root),
+                "--run-id",
+                "run-001",
+                "--audit-id",
+                "foundational-locator-audit-v1",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {
+        "status": "IN_PROGRESS",
+        "candidate_count": 3,
+        "current_decision_count": 0,
+        "remaining_count": 3,
+    }
 
 
 def test_initialize_audit_rejects_binding_change(tmp_path: Path) -> None:

@@ -10,6 +10,8 @@ import re
 import sqlite3
 from typing import Mapping
 
+from pypdf import PdfReader
+
 from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
     ReconciliationStore,
     TOPICS,
@@ -151,6 +153,31 @@ class AuditStatus:
     current_decision_count: int
     remaining_count: int
     needs_second_review_count: int
+
+
+@dataclass(frozen=True)
+class VerifiedSourcePdf:
+    path: Path
+    sha256: str
+    page_count: int
+
+
+@dataclass(frozen=True)
+class LocatorReviewPacket:
+    source_id: str
+    locator: str
+    page_number: int
+    page_text: str
+    page_text_sha256: str
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "source_id": self.source_id,
+            "locator": self.locator,
+            "page_number": self.page_number,
+            "page_text": self.page_text,
+            "page_text_sha256": self.page_text_sha256,
+        }
 
 
 class FoundationalAuditStore:
@@ -501,3 +528,92 @@ def record_locator_decision(
             (status.status, audit.run_id, audit.audit_id),
         )
         return status
+
+
+def verify_source_pdf(
+    *, audit: FoundationalAuditStore, pdf_path: Path
+) -> VerifiedSourcePdf:
+    """Require the exact bound PDF bytes and complete candidate page range."""
+    path = pdf_path.resolve()
+    if not path.is_file():
+        _fail("FOUNDATIONAL_LOCATOR_AUDIT_PDF_MISSING")
+    expected = audit._connection.execute(
+        """
+        select source_file_sha256 from foundational_audit_runs
+        where run_id = ? and audit_id = ?
+        """,
+        (audit.run_id, audit.audit_id),
+    ).fetchone()
+    if expected is None:
+        _fail("FOUNDATIONAL_LOCATOR_AUDIT_RUN_MISSING")
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    if digest != expected["source_file_sha256"]:
+        _fail("FOUNDATIONAL_LOCATOR_AUDIT_PDF_MISMATCH")
+    try:
+        reader = PdfReader(path)
+    except Exception as error:
+        raise FoundationalLocatorAuditError(
+            "FOUNDATIONAL_LOCATOR_AUDIT_PDF_INVALID"
+        ) from error
+    page_count = len(reader.pages)
+    required = audit._connection.execute(
+        """
+        select max(page_number) from foundational_audit_candidates
+        where run_id = ? and audit_id = ?
+        """,
+        (audit.run_id, audit.audit_id),
+    ).fetchone()
+    if required is None or required[0] is None or int(required[0]) > page_count:
+        _fail("FOUNDATIONAL_LOCATOR_AUDIT_PDF_PAGE_RANGE_INVALID")
+    return VerifiedSourcePdf(path=path, sha256=digest, page_count=page_count)
+
+
+def extract_candidate_page(
+    *, audit: FoundationalAuditStore, pdf_path: Path, locator: str
+) -> LocatorReviewPacket:
+    """Extract one exact bound candidate page without changing audit state."""
+    safe_locator = _string(locator, "FOUNDATIONAL_LOCATOR_AUDIT_CANDIDATE_INVALID")
+    candidate = audit._connection.execute(
+        """
+        select source_id, locator, page_number
+        from foundational_audit_candidates
+        where run_id = ? and audit_id = ? and locator = ?
+        """,
+        (audit.run_id, audit.audit_id, safe_locator),
+    ).fetchone()
+    if candidate is None:
+        _fail("FOUNDATIONAL_LOCATOR_AUDIT_CANDIDATE_INVALID")
+    verified = verify_source_pdf(audit=audit, pdf_path=pdf_path)
+    try:
+        extracted = PdfReader(verified.path).pages[int(candidate["page_number"]) - 1].extract_text()
+    except Exception as error:
+        raise FoundationalLocatorAuditError(
+            "FOUNDATIONAL_LOCATOR_AUDIT_PAGE_EXTRACTION_FAILED"
+        ) from error
+    text = (extracted or "").replace("\r\n", "\n").replace("\r", "\n")
+    text_digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return LocatorReviewPacket(
+        source_id=str(candidate["source_id"]),
+        locator=str(candidate["locator"]),
+        page_number=int(candidate["page_number"]),
+        page_text=text,
+        page_text_sha256=text_digest,
+    )
+
+
+def next_unreviewed_locator(audit: FoundationalAuditStore) -> str | None:
+    """Return the next candidate locator with no current decision."""
+    current = _current_decisions(_decision_records(audit))
+    rows = audit._connection.execute(
+        """
+        select source_id, locator from foundational_audit_candidates
+        where run_id = ? and audit_id = ?
+        order by page_number, source_id, locator
+        """,
+        (audit.run_id, audit.audit_id),
+    ).fetchall()
+    for row in rows:
+        key = (str(row["source_id"]), str(row["locator"]))
+        if key not in current:
+            return key[1]
+    return None

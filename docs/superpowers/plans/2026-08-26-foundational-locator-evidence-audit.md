@@ -155,7 +155,7 @@ git commit -m "feat: add durable foundational locator audit contracts"
 - Consumes: raw PDF path, expected PDF SHA-256, and exact bound candidates.
 - Produces: `verify_source_pdf(audit: FoundationalAuditStore, pdf_path: Path) -> VerifiedSourcePdf`, `extract_candidate_page(audit: FoundationalAuditStore, pdf_path: Path, locator: str) -> LocatorReviewPacket`, and CLI commands `init`, `next`, `record`, `status`, `seal`, and `capacity` with aggregate-only stdout/stderr.
 
-- [ ] **Step 1: Write failing tests for byte identity, page provenance, and safe output**
+- [x] **Step 1: Write failing tests for byte identity, page provenance, and safe output**
 
 ```python
 def test_extract_candidate_page_requires_bound_pdf_and_exact_locator(
@@ -180,23 +180,23 @@ def test_cli_status_never_prints_private_identifiers(capsys) -> None:
     }
 ```
 
-- [ ] **Step 2: Run PDF/CLI tests and verify RED**
+- [x] **Step 2: Run PDF/CLI tests and verify RED**
 
 Run: `python -m pytest -q tests/evaluation/test_foundational_locator_audit.py -k "pdf or page or cli"`
 
 Expected: FAIL because PDF verification, extraction, and CLI do not exist.
 
-- [ ] **Step 3: Implement fail-closed PDF extraction and aggregate-only CLI**
+- [x] **Step 3: Implement fail-closed PDF extraction and aggregate-only CLI**
 
 Use `pypdf.PdfReader` only after SHA-256 matches the audit binding. Convert the 1-based locator page to a 0-based reader index, reject out-of-range pages, extract the exact page text, normalize line endings only, and hash the exact normalized UTF-8 text stored in the private packet. `next` returns one private packet only to the controller process; normal stdout reports counts only.
 
-- [ ] **Step 4: Run PDF/CLI tests and verify GREEN**
+- [x] **Step 4: Run PDF/CLI tests and verify GREEN**
 
 Run: `python -m pytest -q tests/evaluation/test_foundational_locator_audit.py -k "pdf or page or cli"`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit Task 2**
+- [x] **Step 5: Commit Task 2**
 
 ```powershell
 git add -- src/oilfield_chemical_copilot/evaluation/foundational_locator_audit.py eval/audit_foundational_locators.py tests/evaluation/test_foundational_locator_audit.py
