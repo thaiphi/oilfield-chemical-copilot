@@ -232,7 +232,7 @@ git commit -m "feat: add deterministic supplement role review"
 - Consumes: a closed supplement audit, the verified core-PDF v2 proposal, and unchanged reconciliation inventory.
 - Produces: `seal_supplement_proposal(...)`, `verify_supplement_proposal(...)`, and `calculate_combined_hypothetical_capacity(...)`.
 
-- [ ] **Step 1: Write failing tests for prefix closure, four-file atomic sealing, and combined no-write capacity**
+- [x] **Step 1: Write failing tests for prefix closure, four-file atomic sealing, and combined no-write capacity**
 
 ```python
 def test_seal_rejects_gap_in_reviewed_prefix(tmp_path: Path) -> None:
@@ -255,25 +255,25 @@ def test_combined_capacity_never_updates_index_locators(tmp_path: Path) -> None:
     assert report.allocation_available is True
 ```
 
-- [ ] **Step 2: Run seal/capacity tests and verify RED**
+- [x] **Step 2: Run seal/capacity tests and verify RED**
 
 Run: `python -m pytest -q tests/evaluation/test_iron_sulfide_supplement_audit.py -k "seal or combined"`
 
 Expected: FAIL because supplement sealing and combined capacity do not exist.
 
-- [ ] **Step 3: Implement immutable v1 seal and combined projection**
+- [x] **Step 3: Implement immutable v1 seal and combined projection**
 
 Publish exactly four files under the ignored supplement audit root using one atomic directory rename: canonical current-prefix decisions JSONL, its SHA-256 manifest, an audit binding JSON, and its manifest. Bind schema version, reconciliation binding, source-set digest, candidate-set digest, page-binding digest, stop rule, reviewed-prefix length, decision digest, and the verified core-PDF v2 binding digest. Reject extra files, partial publication, stale manifests, decision gaps, unresolved decisions, or a seal that differs from current SQLite state.
 
 For combined capacity, verify both private seals, reject overlapping locator keys, project core and supplement promotions into a temporary in-memory inventory, call the existing capacity and exact allocator contracts, and never update reconciliation rows or write an E1a-4 sampling frame.
 
-- [ ] **Step 4: Run seal/capacity tests and verify GREEN**
+- [x] **Step 4: Run seal/capacity tests and verify GREEN**
 
 Run: `python -m pytest -q tests/evaluation/test_iron_sulfide_supplement_audit.py -k "seal or combined"`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit Task 3**
+- [x] **Step 5: Commit Task 3**
 
 ```powershell
 git add -- src/oilfield_chemical_copilot/evaluation/iron_sulfide_supplement_audit.py eval/audit_iron_sulfide_supplement.py tests/evaluation/test_iron_sulfide_supplement_audit.py

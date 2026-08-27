@@ -18,16 +18,22 @@ sys.path[:0] = [str(PROJECT_ROOT), str(SRC_DIR)]
 from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (  # noqa: E402
     ReconciliationStore,
 )
+from oilfield_chemical_copilot.evaluation.foundational_locator_audit import (  # noqa: E402
+    FoundationalAuditStore,
+)
 from oilfield_chemical_copilot.evaluation.iron_sulfide_supplement_audit import (  # noqa: E402
     IronSulfideSupplementAuditError,
     IronSulfideSupplementAuditStore,
     SupplementLocatorDecision,
     bind_supplement_pages,
+    calculate_combined_hypothetical_capacity,
     extract_supplement_page,
     initialize_supplement_audit,
     next_supplement_candidate,
     record_supplement_decision,
+    seal_supplement_proposal,
     supplement_audit_status,
+    verify_supplement_proposal,
 )
 
 
@@ -61,6 +67,15 @@ def _parser() -> argparse.ArgumentParser:
     next_command.add_argument("--packet-output", type=Path, required=True)
     command("record")
     command("status")
+    seal = command("seal")
+    seal.add_argument("--core-binding-sha256", required=True)
+    verify = command("verify")
+    verify.add_argument("--expected-binding-sha256", required=True)
+    verify.add_argument("--expected-core-binding-sha256", required=True)
+    capacity = command("capacity")
+    capacity.add_argument("--core-audit-id", required=True)
+    capacity.add_argument("--expected-binding-sha256", required=True)
+    capacity.add_argument("--expected-core-binding-sha256", required=True)
     return parser
 
 
@@ -196,7 +211,57 @@ def cli(argv: Sequence[str] | None = None) -> int:
                 audit=audit,
                 record=SupplementLocatorDecision.from_mapping(_read_stdin_mapping()),
             )
-        output = _public_status(audit)
+        if args.command == "seal":
+            sealed = seal_supplement_proposal(
+                audit=audit,
+                core_binding_sha256=args.core_binding_sha256,
+            )
+            output = {
+                "status": "SEALED",
+                "artifact_count": len(sealed.artifacts),
+                "manifest_count": len(sealed.artifacts),
+            }
+        elif args.command == "verify":
+            sealed = verify_supplement_proposal(
+                audit=audit,
+                expected_binding_sha256=args.expected_binding_sha256,
+                expected_core_binding_sha256=args.expected_core_binding_sha256,
+            )
+            output = {
+                "status": "VERIFIED",
+                "artifact_count": len(sealed.artifacts),
+                "manifest_count": len(sealed.artifacts),
+            }
+        elif args.command == "capacity":
+            core = FoundationalAuditStore.open(
+                database_path=audit.database_path,
+                run_id=args.run_id,
+                audit_id=args.core_audit_id,
+            )
+            try:
+                report = calculate_combined_hypothetical_capacity(
+                    core_audit=core,
+                    supplement_audit=audit,
+                    expected_core_binding_sha256=(
+                        args.expected_core_binding_sha256
+                    ),
+                    expected_supplement_binding_sha256=(
+                        args.expected_binding_sha256
+                    ),
+                )
+            finally:
+                core.close()
+            output = {
+                "status": "SUFFICIENT" if report.all_sufficient else "INSUFFICIENT",
+                "all_sufficient": report.all_sufficient,
+                "allocation_available": report.allocation_available,
+                "allocation_count": report.allocation_count,
+                "sufficient_strata_count": sum(
+                    item.sufficient for item in report.strata
+                ),
+            }
+        else:
+            output = _public_status(audit)
         audit.close()
         print(json.dumps(output, sort_keys=True))
         return 0

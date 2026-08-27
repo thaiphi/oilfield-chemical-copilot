@@ -6,8 +6,11 @@ from dataclasses import dataclass
 import hashlib
 from io import BytesIO
 import json
+import os
 from pathlib import Path, PurePosixPath
+import shutil
 import sqlite3
+from tempfile import mkdtemp
 from typing import Mapping
 
 from pypdf import PdfReader
@@ -15,8 +18,27 @@ from pypdf import PdfReader
 from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
     CorpusReconciliationError,
     ReconciliationStore,
+    TOPICS,
     verify_reconciliation_snapshots,
 )
+from oilfield_chemical_copilot.evaluation.e1a3_sampling import (
+    E1A3SamplingError,
+    E1A3SourceMetadata,
+    allocate_sampling_slots,
+    build_sampling_slots,
+)
+from oilfield_chemical_copilot.evaluation.foundational_locator_audit import (
+    FoundationalAuditStore,
+    HypotheticalCapacityReport,
+    HypotheticalCapacityStratum,
+    LocatorAuditDecision,
+    verify_correction_proposal,
+)
+
+
+SUPPLEMENT_ARTIFACT_VERSION = "v1"
+SUPPLEMENT_CORRECTION_NAME = "iron-sulfide-supplement-corrections.v1.jsonl"
+SUPPLEMENT_BINDING_NAME = "audit-binding.v1.json"
 
 
 class IronSulfideSupplementAuditError(RuntimeError):
@@ -164,6 +186,21 @@ class SupplementReviewPacket:
     page_number: int
     page_text: str
     page_text_sha256: str
+
+
+@dataclass(frozen=True)
+class SupplementAuditArtifact:
+    name: str
+    path: Path
+    manifest_path: Path
+    sha256: str
+    record_count: int
+
+
+@dataclass(frozen=True)
+class SupplementAuditSeal:
+    artifacts: tuple[SupplementAuditArtifact, ...]
+    binding_sha256: str
 
 
 class IronSulfideSupplementAuditStore:
@@ -984,4 +1021,479 @@ def extract_supplement_page(
         page_number=candidate.page_number,
         page_text=text,
         page_text_sha256=digest,
+    )
+
+
+def _canonical_jsonl(records: tuple[Mapping[str, object], ...]) -> bytes:
+    if not records:
+        return b""
+    return (
+        "\n".join(
+            json.dumps(
+                dict(record),
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+            for record in records
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def _terminal_decisions(
+    audit: IronSulfideSupplementAuditStore,
+) -> tuple[SupplementLocatorDecision, ...]:
+    status = supplement_audit_status(audit)
+    if (
+        status.status not in {"TARGET_MET", "EXHAUSTED_INSUFFICIENT"}
+        or status.needs_second_review_count != 0
+    ):
+        _fail("IRON_SULFIDE_SUPPLEMENT_AUDIT_INCOMPLETE")
+    run = audit._connection.execute(
+        """
+        select promotion_target from iron_sulfide_supplement_audit_runs
+        where run_id = ? and audit_id = ?
+        """,
+        (audit.run_id, audit.audit_id),
+    ).fetchone()
+    if run is None:
+        _fail("IRON_SULFIDE_SUPPLEMENT_RUN_MISSING")
+    target = int(run["promotion_target"])
+    if (
+        status.status == "TARGET_MET" and status.promotion_count != target
+    ) or (
+        status.status == "EXHAUSTED_INSUFFICIENT"
+        and (
+            status.reviewed_count != status.candidate_count
+            or status.promotion_count >= target
+        )
+    ):
+        _fail("IRON_SULFIDE_SUPPLEMENT_AUDIT_INCOMPLETE")
+    current = _current_supplement_decisions(audit)
+    rows = audit._connection.execute(
+        """
+        select source_id, locator, review_order, page_text_sha256
+        from iron_sulfide_supplement_audit_candidates
+        where run_id = ? and audit_id = ? and review_order <= ?
+        order by review_order
+        """,
+        (audit.run_id, audit.audit_id, status.reviewed_count),
+    ).fetchall()
+    decisions: list[SupplementLocatorDecision] = []
+    for row in rows:
+        key = (str(row["source_id"]), str(row["locator"]))
+        decision = current.get(key)
+        if (
+            decision is None
+            or row["page_text_sha256"] is None
+            or decision.page_text_sha256 != str(row["page_text_sha256"])
+        ):
+            _fail("IRON_SULFIDE_SUPPLEMENT_AUDIT_INCOMPLETE")
+        decisions.append(decision)
+    if len(decisions) != status.reviewed_count:
+        _fail("IRON_SULFIDE_SUPPLEMENT_AUDIT_INCOMPLETE")
+    return tuple(decisions)
+
+
+def _page_binding_digest(audit: IronSulfideSupplementAuditStore) -> str:
+    rows = audit._connection.execute(
+        """
+        select source_id, locator, page_number, review_order, page_text_sha256
+        from iron_sulfide_supplement_audit_candidates
+        where run_id = ? and audit_id = ? order by review_order
+        """,
+        (audit.run_id, audit.audit_id),
+    ).fetchall()
+    if not rows or any(row["page_text_sha256"] is None for row in rows):
+        _fail("IRON_SULFIDE_SUPPLEMENT_PAGE_BINDING_MISMATCH")
+    return _canonical_digest(tuple(dict(row) for row in rows))
+
+
+def _supplement_binding_payload(
+    *,
+    audit: IronSulfideSupplementAuditStore,
+    decision_payload_sha256: str,
+    core_binding_sha256: str,
+) -> bytes:
+    run = audit._connection.execute(
+        """
+        select snapshot_binding_sha256, source_set_sha256, candidate_set_sha256,
+               source_count, candidate_count, promotion_target, status
+        from iron_sulfide_supplement_audit_runs
+        where run_id = ? and audit_id = ?
+        """,
+        (audit.run_id, audit.audit_id),
+    ).fetchone()
+    if run is None:
+        _fail("IRON_SULFIDE_SUPPLEMENT_RUN_MISSING")
+    decisions = _terminal_decisions(audit)
+    binding = {
+        "schema_version": 1,
+        "run_id": audit.run_id,
+        "audit_id": audit.audit_id,
+        "snapshot_binding_sha256": _digest(
+            run["snapshot_binding_sha256"],
+            "IRON_SULFIDE_SUPPLEMENT_BINDING_INVALID",
+        ),
+        "source_set_sha256": _digest(
+            run["source_set_sha256"], "IRON_SULFIDE_SUPPLEMENT_BINDING_INVALID"
+        ),
+        "candidate_set_sha256": _digest(
+            run["candidate_set_sha256"],
+            "IRON_SULFIDE_SUPPLEMENT_BINDING_INVALID",
+        ),
+        "page_binding_sha256": _page_binding_digest(audit),
+        "source_count": int(run["source_count"]),
+        "candidate_count": int(run["candidate_count"]),
+        "promotion_target": int(run["promotion_target"]),
+        "terminal_status": str(run["status"]),
+        "reviewed_prefix_count": len(decisions),
+        "decision_payload_sha256": _digest(
+            decision_payload_sha256,
+            "IRON_SULFIDE_SUPPLEMENT_BINDING_INVALID",
+        ),
+        "core_audit_binding_sha256": _digest(
+            core_binding_sha256,
+            "IRON_SULFIDE_SUPPLEMENT_BINDING_INVALID",
+        ),
+    }
+    return (
+        json.dumps(
+            binding,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def _supplement_sealed_directory(audit: IronSulfideSupplementAuditStore) -> Path:
+    return (
+        audit.database_path.parent
+        / "iron-sulfide-supplement-audit"
+        / SUPPLEMENT_ARTIFACT_VERSION
+        / "sealed"
+    )
+
+
+def _write_fsynced_file(*, destination: Path, content: bytes) -> None:
+    with destination.open("xb") as stream:
+        stream.write(content)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def _verified_manifest(path: Path) -> str:
+    manifest = path.with_name(f"{path.name}.sha256")
+    try:
+        content = path.read_bytes()
+        text = manifest.read_text(encoding="ascii")
+    except (OSError, UnicodeError) as error:
+        raise IronSulfideSupplementAuditError(
+            "IRON_SULFIDE_SUPPLEMENT_SEAL_VERIFY_FAILED"
+        ) from error
+    if (
+        len(text) != 65
+        or not text.endswith("\n")
+        or any(character not in "0123456789abcdef" for character in text[:64])
+    ):
+        _fail("IRON_SULFIDE_SUPPLEMENT_MANIFEST_INVALID")
+    digest = hashlib.sha256(content).hexdigest()
+    if digest != text[:64]:
+        _fail("IRON_SULFIDE_SUPPLEMENT_DIGEST_MISMATCH")
+    return digest
+
+
+def verify_supplement_proposal(
+    *,
+    audit: IronSulfideSupplementAuditStore,
+    expected_binding_sha256: str,
+    expected_core_binding_sha256: str,
+) -> SupplementAuditSeal:
+    """Verify the exact four-file supplement proposal without rewriting it."""
+    trusted = _digest(
+        expected_binding_sha256, "IRON_SULFIDE_SUPPLEMENT_BINDING_MISMATCH"
+    )
+    core_trusted = _digest(
+        expected_core_binding_sha256,
+        "IRON_SULFIDE_SUPPLEMENT_BINDING_MISMATCH",
+    )
+    sealed = _supplement_sealed_directory(audit)
+    correction_path = sealed / SUPPLEMENT_CORRECTION_NAME
+    binding_path = sealed / SUPPLEMENT_BINDING_NAME
+    paths = (correction_path, binding_path)
+    manifests = tuple(path.with_name(f"{path.name}.sha256") for path in paths)
+    presence = tuple(path.is_file() for path in (*paths, *manifests))
+    if not any(presence):
+        _fail("IRON_SULFIDE_SUPPLEMENT_SEAL_MISSING")
+    if not all(presence):
+        _fail("IRON_SULFIDE_SUPPLEMENT_SEAL_PARTIAL")
+    try:
+        if {path.name for path in sealed.iterdir()} != {
+            path.name for path in (*paths, *manifests)
+        }:
+            _fail("IRON_SULFIDE_SUPPLEMENT_SEAL_PARTIAL")
+    except OSError as error:
+        raise IronSulfideSupplementAuditError(
+            "IRON_SULFIDE_SUPPLEMENT_SEAL_VERIFY_FAILED"
+        ) from error
+    correction_digest = _verified_manifest(correction_path)
+    binding_digest = _verified_manifest(binding_path)
+    if binding_digest != trusted:
+        _fail("IRON_SULFIDE_SUPPLEMENT_BINDING_MISMATCH")
+    expected_correction = _canonical_jsonl(
+        tuple(decision.to_mapping() for decision in _terminal_decisions(audit))
+    )
+    if correction_path.read_bytes() != expected_correction:
+        _fail("IRON_SULFIDE_SUPPLEMENT_BINDING_MISMATCH")
+    expected_binding = _supplement_binding_payload(
+        audit=audit,
+        decision_payload_sha256=correction_digest,
+        core_binding_sha256=core_trusted,
+    )
+    if binding_path.read_bytes() != expected_binding:
+        _fail("IRON_SULFIDE_SUPPLEMENT_BINDING_MISMATCH")
+    return SupplementAuditSeal(
+        artifacts=(
+            SupplementAuditArtifact(
+                name=SUPPLEMENT_CORRECTION_NAME,
+                path=correction_path,
+                manifest_path=manifests[0],
+                sha256=correction_digest,
+                record_count=len(_terminal_decisions(audit)),
+            ),
+            SupplementAuditArtifact(
+                name=SUPPLEMENT_BINDING_NAME,
+                path=binding_path,
+                manifest_path=manifests[1],
+                sha256=binding_digest,
+                record_count=1,
+            ),
+        ),
+        binding_sha256=binding_digest,
+    )
+
+
+def seal_supplement_proposal(
+    *, audit: IronSulfideSupplementAuditStore, core_binding_sha256: str
+) -> SupplementAuditSeal:
+    """Atomically publish a terminal supplement correction proposal."""
+    core_trusted = _digest(
+        core_binding_sha256, "IRON_SULFIDE_SUPPLEMENT_BINDING_INVALID"
+    )
+    correction = _canonical_jsonl(
+        tuple(decision.to_mapping() for decision in _terminal_decisions(audit))
+    )
+    correction_digest = hashlib.sha256(correction).hexdigest()
+    binding = _supplement_binding_payload(
+        audit=audit,
+        decision_payload_sha256=correction_digest,
+        core_binding_sha256=core_trusted,
+    )
+    binding_digest = hashlib.sha256(binding).hexdigest()
+    sealed = _supplement_sealed_directory(audit)
+    if sealed.exists():
+        if not sealed.is_dir():
+            _fail("IRON_SULFIDE_SUPPLEMENT_SEAL_PARTIAL")
+        return verify_supplement_proposal(
+            audit=audit,
+            expected_binding_sha256=binding_digest,
+            expected_core_binding_sha256=core_trusted,
+        )
+    version_root = sealed.parent
+    version_root.mkdir(parents=True, exist_ok=True)
+    for stale in version_root.glob(".sealed.*.tmp"):
+        if stale.is_dir():
+            shutil.rmtree(stale, ignore_errors=True)
+    staged = Path(mkdtemp(prefix=".sealed.", suffix=".tmp", dir=version_root))
+    try:
+        for name, content in {
+            SUPPLEMENT_CORRECTION_NAME: correction,
+            SUPPLEMENT_BINDING_NAME: binding,
+        }.items():
+            _write_fsynced_file(destination=staged / name, content=content)
+            _write_fsynced_file(
+                destination=staged / f"{name}.sha256",
+                content=(hashlib.sha256(content).hexdigest() + "\n").encode("ascii"),
+            )
+        os.replace(staged, sealed)
+        return verify_supplement_proposal(
+            audit=audit,
+            expected_binding_sha256=binding_digest,
+            expected_core_binding_sha256=core_trusted,
+        )
+    except (IronSulfideSupplementAuditError, OSError) as error:
+        if staged.exists():
+            shutil.rmtree(staged, ignore_errors=True)
+        raise IronSulfideSupplementAuditError(
+            "IRON_SULFIDE_SUPPLEMENT_SEAL_WRITE_FAILED"
+        ) from error
+
+
+def _core_sealed_decisions(
+    *, core_audit: FoundationalAuditStore, expected_binding_sha256: str
+) -> tuple[LocatorAuditDecision, ...]:
+    seal = verify_correction_proposal(
+        audit=core_audit,
+        expected_binding_sha256=expected_binding_sha256,
+    )
+    correction = next(
+        artifact for artifact in seal.artifacts if artifact.name.endswith(".jsonl")
+    )
+    try:
+        return tuple(
+            LocatorAuditDecision.from_mapping(json.loads(line))
+            for line in correction.path.read_text(encoding="utf-8").splitlines()
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise IronSulfideSupplementAuditError(
+            "IRON_SULFIDE_SUPPLEMENT_CORE_AUDIT_INVALID"
+        ) from error
+
+
+def calculate_combined_hypothetical_capacity(
+    *,
+    core_audit: FoundationalAuditStore,
+    supplement_audit: IronSulfideSupplementAuditStore,
+    expected_core_binding_sha256: str,
+    expected_supplement_binding_sha256: str,
+) -> HypotheticalCapacityReport:
+    """Project both approved proposals without mutating the inventory."""
+    if core_audit.run_id != supplement_audit.run_id:
+        _fail("IRON_SULFIDE_SUPPLEMENT_CAPACITY_INVALID")
+    core_trusted = _digest(
+        expected_core_binding_sha256,
+        "IRON_SULFIDE_SUPPLEMENT_CAPACITY_INVALID",
+    )
+    core_decisions = _core_sealed_decisions(
+        core_audit=core_audit,
+        expected_binding_sha256=core_trusted,
+    )
+    verify_supplement_proposal(
+        audit=supplement_audit,
+        expected_binding_sha256=expected_supplement_binding_sha256,
+        expected_core_binding_sha256=core_trusted,
+    )
+    supplement_decisions = _terminal_decisions(supplement_audit)
+    core_promotions = tuple(
+        decision for decision in core_decisions if decision.decision == "PROMOTE_FOUNDATIONAL"
+    )
+    supplement_promotions = tuple(
+        decision
+        for decision in supplement_decisions
+        if decision.decision == "PROMOTE_FOUNDATIONAL"
+    )
+    core_keys = {(item.source_id, item.locator) for item in core_promotions}
+    supplement_keys = {
+        (item.source_id, item.locator) for item in supplement_promotions
+    }
+    if core_keys & supplement_keys:
+        _fail("IRON_SULFIDE_SUPPLEMENT_CAPACITY_INVALID")
+    promoted_keys = core_keys | supplement_keys
+    rows = supplement_audit._connection.execute(
+        """
+        select locator.source_id, locator.locator, locator.topic,
+               locator.source_role, source.parser_type
+        from index_locators as locator
+        join index_sources as source
+          on source.run_id = locator.run_id and source.source_id = locator.source_id
+        where locator.run_id = ? and locator.e1a4_available = 1
+        order by locator.source_id, locator.locator
+        """,
+        (supplement_audit.run_id,),
+    ).fetchall()
+    parser_rows = supplement_audit._connection.execute(
+        """
+        select source_id, parser_type from index_sources where run_id = ?
+        """,
+        (supplement_audit.run_id,),
+    ).fetchall()
+    parser_by_source = {
+        str(row["source_id"]): str(row["parser_type"]) for row in parser_rows
+    }
+    grouped: dict[tuple[str, str, str, str], list[str]] = {}
+    for row in rows:
+        key = (str(row["source_id"]), str(row["locator"]))
+        if key in promoted_keys:
+            continue
+        grouped.setdefault(
+            (
+                key[0],
+                str(row["topic"]),
+                str(row["source_role"]),
+                str(row["parser_type"]),
+            ),
+            [],
+        ).append(key[1])
+    for decision in core_promotions:
+        parser_type = parser_by_source.get(decision.source_id)
+        if parser_type is None or decision.proposed_topic is None:
+            _fail("IRON_SULFIDE_SUPPLEMENT_CAPACITY_INVALID")
+        grouped.setdefault(
+            (
+                decision.source_id,
+                decision.proposed_topic,
+                "foundational",
+                parser_type,
+            ),
+            [],
+        ).append(decision.locator)
+    for decision in supplement_promotions:
+        parser_type = parser_by_source.get(decision.source_id)
+        if parser_type is None:
+            _fail("IRON_SULFIDE_SUPPLEMENT_CAPACITY_INVALID")
+        grouped.setdefault(
+            (decision.source_id, "iron_sulfide", "foundational", parser_type),
+            [],
+        ).append(decision.locator)
+    counts = {
+        (topic, role): 0
+        for topic in TOPICS
+        for role in ("foundational", "supporting")
+    }
+    for (_, topic, role, _), locators in grouped.items():
+        counts[(topic, role)] += len(set(locators))
+    strata = tuple(
+        HypotheticalCapacityStratum(
+            topic=topic,
+            source_role=role,
+            fresh_locator_count=counts[(topic, role)],
+            required_locators=12,
+            sufficient=counts[(topic, role)] >= 12,
+        )
+        for topic in ("iron_sulfide", "scale", "corrosion", "paraffin")
+        for role in ("foundational", "supporting")
+    )
+    all_sufficient = all(item.sufficient for item in strata)
+    allocation_count = 0
+    if all_sufficient:
+        sources = tuple(
+            E1A3SourceMetadata(
+                source_id=source_id,
+                topic=topic,  # type: ignore[arg-type]
+                source_role=role,  # type: ignore[arg-type]
+                parser_type=parser_type,
+                locators=tuple(sorted(set(locators))),
+                eligibility_status="eligible",
+            )
+            for (source_id, topic, role, parser_type), locators in sorted(
+                grouped.items()
+            )
+        )
+        try:
+            allocations = allocate_sampling_slots(
+                slots=build_sampling_slots(),
+                sources=sources,
+            )
+            if len(allocations) == 96:
+                allocation_count = 96
+        except E1A3SamplingError:
+            allocation_count = 0
+    return HypotheticalCapacityReport(
+        strata=strata,
+        all_sufficient=all_sufficient,
+        allocation_available=allocation_count == 96,
+        allocation_count=allocation_count,
     )

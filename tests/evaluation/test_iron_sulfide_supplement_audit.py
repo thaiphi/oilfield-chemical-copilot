@@ -100,7 +100,7 @@ def _sealed_reconciliation(tmp_path: Path):
         ("page:1", "iron_sulfide", "supporting", "SUBSTANTIVE"),
         ("page:2", "iron_sulfide", "supporting", "SUBSTANTIVE"),
         ("page:3", "iron_sulfide", "supporting", "SUBSTANTIVE"),
-        ("page:4", "iron_sulfide", "supporting", "INELIGIBLE"),
+        ("page:4", "iron_sulfide", "foundational", "INELIGIBLE"),
         ("page:5", "scale", "supporting", "SUBSTANTIVE"),
         ("page:6", "iron_sulfide", "foundational", "SUBSTANTIVE"),
     )
@@ -525,4 +525,284 @@ def test_cli_sanitizes_unexpected_private_path_errors(
     assert json.loads(captured.err) == {
         "status": "IRON_SULFIDE_SUPPLEMENT_AUDIT_BLOCKED",
         "error_code": "IRON_SULFIDE_SUPPLEMENT_OPERATION_FAILED",
+    }
+
+
+def _closed_audits(tmp_path: Path):
+    from oilfield_chemical_copilot.evaluation.foundational_locator_audit import (
+        LocatorAuditDecision,
+        bind_candidate_pages,
+        initialize_audit,
+        record_locator_decision,
+        seal_correction_proposal,
+    )
+    from oilfield_chemical_copilot.evaluation.iron_sulfide_supplement_audit import (
+        bind_supplement_pages,
+        initialize_supplement_audit,
+        record_supplement_decision,
+        seal_supplement_proposal,
+    )
+
+    store, binding, source_root = _sealed_reconciliation(tmp_path)
+    pdf = source_root / "supplement.pdf"
+    core = initialize_audit(
+        store=store,
+        audit_id="foundational-locator-audit-v1",
+        snapshot_binding_sha256=binding,
+        source_drive_file_id="drive-supplement-1",
+        source_file_sha256=hashlib.sha256(pdf.read_bytes()).hexdigest(),
+    )
+    bind_candidate_pages(audit=core, pdf_path=pdf)
+    record_locator_decision(
+        audit=core,
+        record=LocatorAuditDecision.from_mapping(
+            {
+                "decision_id": "core-page-4",
+                "source_id": "source-supplement-1",
+                "locator": "page:4",
+                "decision": "PROMOTE_FOUNDATIONAL",
+                "proposed_topic": "iron_sulfide",
+                "reason_code": "SUBSTANTIVE_TARGET_EVIDENCE",
+                "page_text_sha256": hashlib.sha256(b"").hexdigest(),
+                "reviewer_id": "reviewer-1",
+                "supersedes_decision_id": None,
+                "decided_at": "2026-08-27T00:00:00Z",
+            }
+        ),
+    )
+    core_seal = seal_correction_proposal(audit=core)
+
+    supplement = initialize_supplement_audit(
+        store=store,
+        audit_id="iron-sulfide-supplement-audit-v1",
+        snapshot_binding_sha256=binding,
+        source_root=source_root,
+        promotion_target=2,
+    )
+    bind_supplement_pages(audit=supplement, source_root=source_root)
+    for page in (1, 2):
+        record_supplement_decision(
+            audit=supplement,
+            record=_decision(
+                locator=f"page:{page}", decision="PROMOTE_FOUNDATIONAL"
+            ),
+        )
+    supplement_seal = seal_supplement_proposal(
+        audit=supplement,
+        core_binding_sha256=core_seal.binding_sha256,
+    )
+    return core, supplement, core_seal, supplement_seal
+
+
+def test_supplement_seal_requires_a_registered_terminal_condition(
+    tmp_path: Path,
+) -> None:
+    from oilfield_chemical_copilot.evaluation.iron_sulfide_supplement_audit import (
+        IronSulfideSupplementAuditError,
+        record_supplement_decision,
+        seal_supplement_proposal,
+    )
+
+    audit, _ = _initialized_audit(tmp_path, promotion_target=2)
+    record_supplement_decision(
+        audit=audit,
+        record=_decision(locator="page:1", decision="PROMOTE_FOUNDATIONAL"),
+    )
+
+    with pytest.raises(
+        IronSulfideSupplementAuditError,
+        match="IRON_SULFIDE_SUPPLEMENT_AUDIT_INCOMPLETE",
+    ):
+        seal_supplement_proposal(audit=audit, core_binding_sha256="c" * 64)
+
+    audit.close()
+
+
+def test_supplement_proposal_is_atomic_complete_and_independently_verifiable(
+    tmp_path: Path,
+) -> None:
+    from oilfield_chemical_copilot.evaluation.iron_sulfide_supplement_audit import (
+        seal_supplement_proposal,
+        verify_supplement_proposal,
+    )
+
+    core, supplement, core_seal, sealed = _closed_audits(tmp_path)
+    verified = verify_supplement_proposal(
+        audit=supplement,
+        expected_binding_sha256=sealed.binding_sha256,
+        expected_core_binding_sha256=core_seal.binding_sha256,
+    )
+    resealed = seal_supplement_proposal(
+        audit=supplement,
+        core_binding_sha256=core_seal.binding_sha256,
+    )
+
+    assert len(sealed.artifacts) == 2
+    assert all(artifact.manifest_path.is_file() for artifact in sealed.artifacts)
+    assert verified == sealed
+    assert resealed == sealed
+    supplement.close()
+
+
+def test_supplement_seal_publish_failure_leaves_no_partial_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import oilfield_chemical_copilot.evaluation.iron_sulfide_supplement_audit as module
+
+    audit, _ = _initialized_audit(tmp_path, promotion_target=2)
+    for page in (1, 2):
+        module.record_supplement_decision(
+            audit=audit,
+            record=_decision(
+                locator=f"page:{page}", decision="PROMOTE_FOUNDATIONAL"
+            ),
+        )
+    sealed = module._supplement_sealed_directory(audit)
+    original_replace = module.os.replace
+    with monkeypatch.context() as context:
+        context.setattr(
+            module.os,
+            "replace",
+            lambda _source, _destination: (_ for _ in ()).throw(OSError("crash")),
+        )
+        with pytest.raises(
+            module.IronSulfideSupplementAuditError,
+            match="IRON_SULFIDE_SUPPLEMENT_SEAL_WRITE_FAILED",
+        ):
+            module.seal_supplement_proposal(
+                audit=audit,
+                core_binding_sha256="c" * 64,
+            )
+
+    assert not sealed.exists()
+    assert not tuple(sealed.parent.glob(".sealed.*.tmp"))
+    assert module.os.replace is original_replace
+    result = module.seal_supplement_proposal(
+        audit=audit,
+        core_binding_sha256="c" * 64,
+    )
+    assert result.binding_sha256
+    audit.close()
+
+
+def test_combined_capacity_moves_promotions_without_mutating_index_locators(
+    tmp_path: Path,
+) -> None:
+    from oilfield_chemical_copilot.evaluation.iron_sulfide_supplement_audit import (
+        calculate_combined_hypothetical_capacity,
+    )
+
+    core, supplement, core_seal, supplement_seal = _closed_audits(tmp_path)
+    before = tuple(
+        tuple(row)
+        for row in supplement._connection.execute(
+            """
+            select source_id, locator, topic, source_role,
+                   substantive_status, e1a3_used, e1a4_available
+            from index_locators order by source_id, locator
+            """
+        ).fetchall()
+    )
+
+    report = calculate_combined_hypothetical_capacity(
+        core_audit=core,
+        supplement_audit=supplement,
+        expected_core_binding_sha256=core_seal.binding_sha256,
+        expected_supplement_binding_sha256=supplement_seal.binding_sha256,
+    )
+
+    after = tuple(
+        tuple(row)
+        for row in supplement._connection.execute(
+            """
+            select source_id, locator, topic, source_role,
+                   substantive_status, e1a3_used, e1a4_available
+            from index_locators order by source_id, locator
+            """
+        ).fetchall()
+    )
+    iron_foundational = next(
+        item
+        for item in report.strata
+        if item.topic == "iron_sulfide" and item.source_role == "foundational"
+    )
+    assert iron_foundational.fresh_locator_count == 4
+    assert after == before
+    supplement.close()
+
+
+def test_cli_seal_verify_and_combined_capacity_are_aggregate_only(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    core, supplement, core_seal, supplement_seal = _closed_audits(tmp_path)
+    root = supplement.database_path.parent
+    supplement.close()
+    runner = _runner_module()
+    common = [
+        "--private-root",
+        str(root),
+        "--run-id",
+        "run-001",
+        "--audit-id",
+        "iron-sulfide-supplement-audit-v1",
+    ]
+
+    assert (
+        runner.cli(
+            [
+                "seal",
+                *common,
+                "--core-binding-sha256",
+                core_seal.binding_sha256,
+            ]
+        )
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "SEALED",
+        "artifact_count": 2,
+        "manifest_count": 2,
+    }
+    assert (
+        runner.cli(
+            [
+                "verify",
+                *common,
+                "--expected-binding-sha256",
+                supplement_seal.binding_sha256,
+                "--expected-core-binding-sha256",
+                core_seal.binding_sha256,
+            ]
+        )
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "VERIFIED",
+        "artifact_count": 2,
+        "manifest_count": 2,
+    }
+    assert (
+        runner.cli(
+            [
+                "capacity",
+                *common,
+                "--core-audit-id",
+                "foundational-locator-audit-v1",
+                "--expected-binding-sha256",
+                supplement_seal.binding_sha256,
+                "--expected-core-binding-sha256",
+                core_seal.binding_sha256,
+            ]
+        )
+        == 0
+    )
+    capacity = json.loads(capsys.readouterr().out)
+    assert capacity == {
+        "status": "INSUFFICIENT",
+        "all_sufficient": False,
+        "allocation_available": False,
+        "allocation_count": 0,
+        "sufficient_strata_count": 0,
     }
