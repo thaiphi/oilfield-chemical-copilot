@@ -71,6 +71,101 @@ class SupplementAuditStatus:
     needs_second_review_count: int
 
 
+SUPPLEMENT_DECISION_CONTRACTS = frozenset(
+    {
+        ("PROMOTE_FOUNDATIONAL", "GENERALIZABLE_FOUNDATIONAL_EVIDENCE"),
+        ("KEEP_SUPPORTING", "CASE_OR_APPLICATION_SPECIFIC"),
+        ("KEEP_SUPPORTING", "PRODUCT_OR_VENDOR_SPECIFIC"),
+        ("KEEP_SUPPORTING", "PROCEDURAL_OR_JOB_SPECIFIC"),
+        ("KEEP_SUPPORTING", "DATA_OR_EXAMPLE_WITHOUT_GENERAL_PRINCIPLE"),
+        ("KEEP_SUPPORTING", "TITLE_INDEX_OR_REFERENCE_ONLY"),
+        ("KEEP_SUPPORTING", "INSUFFICIENT_STANDALONE_CONTEXT"),
+        ("KEEP_SUPPORTING", "DUPLICATE_PAGE_CONTENT"),
+        ("KEEP_SUPPORTING", "WRONG_TOPIC"),
+        ("NEEDS_SECOND_REVIEW", "AMBIGUOUS_FOUNDATIONAL_ROLE"),
+    }
+)
+
+
+@dataclass(frozen=True)
+class SupplementLocatorDecision:
+    decision_id: str
+    source_id: str
+    locator: str
+    decision: str
+    reason_code: str
+    page_text_sha256: str
+    reviewer_id: str
+    supersedes_decision_id: str | None
+    decided_at: str
+
+    @classmethod
+    def from_mapping(cls, mapping: Mapping[str, object]) -> SupplementLocatorDecision:
+        code = "IRON_SULFIDE_SUPPLEMENT_DECISION_INVALID"
+        expected = {
+            "decision_id",
+            "source_id",
+            "locator",
+            "decision",
+            "reason_code",
+            "page_text_sha256",
+            "reviewer_id",
+            "supersedes_decision_id",
+            "decided_at",
+        }
+        if not isinstance(mapping, Mapping) or set(mapping) != expected:
+            _fail(code)
+        decision = _string(mapping["decision"], code)
+        reason = _string(mapping["reason_code"], code)
+        if (decision, reason) not in SUPPLEMENT_DECISION_CONTRACTS:
+            _fail(code)
+        supersedes = mapping["supersedes_decision_id"]
+        if supersedes is not None:
+            supersedes = _string(supersedes, code)
+        return cls(
+            decision_id=_string(mapping["decision_id"], code),
+            source_id=_string(mapping["source_id"], code),
+            locator=_string(mapping["locator"], code),
+            decision=decision,
+            reason_code=reason,
+            page_text_sha256=_digest(mapping["page_text_sha256"], code),
+            reviewer_id=_string(mapping["reviewer_id"], code),
+            supersedes_decision_id=supersedes,
+            decided_at=_string(mapping["decided_at"], code),
+        )
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "decision_id": self.decision_id,
+            "source_id": self.source_id,
+            "locator": self.locator,
+            "decision": self.decision,
+            "reason_code": self.reason_code,
+            "page_text_sha256": self.page_text_sha256,
+            "reviewer_id": self.reviewer_id,
+            "supersedes_decision_id": self.supersedes_decision_id,
+            "decided_at": self.decided_at,
+        }
+
+
+@dataclass(frozen=True)
+class SupplementCandidate:
+    source_id: str
+    locator: str
+    page_number: int
+    review_order: int
+    page_text_sha256: str
+
+
+@dataclass(frozen=True)
+class SupplementReviewPacket:
+    source_id: str
+    locator: str
+    page_number: int
+    page_text: str
+    page_text_sha256: str
+
+
 class IronSulfideSupplementAuditStore:
     """Handle to one supplement audit stored in reconciliation SQLite."""
 
@@ -86,6 +181,36 @@ class IronSulfideSupplementAuditStore:
         self.run_id = run_id
         self.audit_id = audit_id
         self._connection = connection
+        self._connection.row_factory = sqlite3.Row
+
+    @classmethod
+    def open(
+        cls, *, database_path: Path, run_id: str, audit_id: str
+    ) -> IronSulfideSupplementAuditStore:
+        safe_path = database_path.resolve()
+        if not safe_path.is_file():
+            _fail("IRON_SULFIDE_SUPPLEMENT_STORE_MISSING")
+        connection = sqlite3.connect(safe_path)
+        connection.row_factory = sqlite3.Row
+        connection.execute("pragma foreign_keys = on")
+        connection.execute("pragma journal_mode = wal")
+        connection.execute("pragma synchronous = full")
+        row = connection.execute(
+            """
+            select audit_id from iron_sulfide_supplement_audit_runs
+            where run_id = ? and audit_id = ?
+            """,
+            (run_id, audit_id),
+        ).fetchone()
+        if row is None:
+            connection.close()
+            _fail("IRON_SULFIDE_SUPPLEMENT_RUN_MISSING")
+        return cls(
+            database_path=safe_path,
+            run_id=_string(run_id, "IRON_SULFIDE_SUPPLEMENT_RUN_INVALID"),
+            audit_id=_string(audit_id, "IRON_SULFIDE_SUPPLEMENT_RUN_INVALID"),
+            connection=connection,
+        )
 
     def close(self) -> None:
         self._connection.close()
@@ -491,14 +616,21 @@ def supplement_audit_status(
     ).fetchone()
     if row is None:
         _fail("IRON_SULFIDE_SUPPLEMENT_RUN_MISSING")
+    current = _current_supplement_decisions(audit)
+    promotion_count = sum(
+        decision.decision == "PROMOTE_FOUNDATIONAL" for decision in current.values()
+    )
+    needs_second_review_count = sum(
+        decision.decision == "NEEDS_SECOND_REVIEW" for decision in current.values()
+    )
     return SupplementAuditStatus(
         status=str(row["status"]),
         source_count=int(row["source_count"]),
         candidate_count=int(row["candidate_count"]),
-        reviewed_count=0,
-        promotion_count=0,
-        remaining_count=int(row["candidate_count"]),
-        needs_second_review_count=0,
+        reviewed_count=len(current),
+        promotion_count=promotion_count,
+        remaining_count=int(row["candidate_count"]) - len(current),
+        needs_second_review_count=needs_second_review_count,
     )
 
 
@@ -586,3 +718,270 @@ def bind_supplement_pages(
             ),
         )
     return len(bindings)
+
+
+def _supplement_decision_records(
+    audit: IronSulfideSupplementAuditStore,
+) -> tuple[SupplementLocatorDecision, ...]:
+    rows = audit._connection.execute(
+        """
+        select decision_id, source_id, locator, decision, reason_code,
+               page_text_sha256, reviewer_id, supersedes_decision_id, decided_at
+        from iron_sulfide_supplement_audit_decisions
+        where run_id = ? and audit_id = ?
+        """,
+        (audit.run_id, audit.audit_id),
+    ).fetchall()
+    return tuple(SupplementLocatorDecision.from_mapping(dict(row)) for row in rows)
+
+
+def _current_supplement_decisions(
+    audit: IronSulfideSupplementAuditStore,
+) -> dict[tuple[str, str], SupplementLocatorDecision]:
+    decisions = _supplement_decision_records(audit)
+    by_id = {decision.decision_id: decision for decision in decisions}
+    if len(by_id) != len(decisions):
+        _fail("IRON_SULFIDE_SUPPLEMENT_DECISION_INVALID")
+    superseded: set[str] = set()
+    for decision in decisions:
+        if decision.supersedes_decision_id is None:
+            continue
+        prior = by_id.get(decision.supersedes_decision_id)
+        if (
+            prior is None
+            or prior.source_id != decision.source_id
+            or prior.locator != decision.locator
+        ):
+            _fail("IRON_SULFIDE_SUPPLEMENT_DECISION_INVALID")
+        superseded.add(prior.decision_id)
+    current: dict[tuple[str, str], SupplementLocatorDecision] = {}
+    for decision in decisions:
+        if decision.decision_id in superseded:
+            continue
+        key = (decision.source_id, decision.locator)
+        if key in current:
+            _fail("IRON_SULFIDE_SUPPLEMENT_DECISION_INVALID")
+        current[key] = decision
+    candidates = audit._connection.execute(
+        """
+        select source_id, locator, review_order
+        from iron_sulfide_supplement_audit_candidates
+        where run_id = ? and audit_id = ? order by review_order
+        """,
+        (audit.run_id, audit.audit_id),
+    ).fetchall()
+    order_by_key = {
+        (str(row["source_id"]), str(row["locator"])): int(row["review_order"])
+        for row in candidates
+    }
+    if any(key not in order_by_key for key in current):
+        _fail("IRON_SULFIDE_SUPPLEMENT_DECISION_INVALID")
+    current_orders = sorted(order_by_key[key] for key in current)
+    if current_orders != list(range(1, len(current_orders) + 1)):
+        _fail("IRON_SULFIDE_SUPPLEMENT_DECISION_OUT_OF_ORDER")
+    return current
+
+
+def _candidate_from_row(row: sqlite3.Row) -> SupplementCandidate:
+    digest = row["page_text_sha256"]
+    if digest is None:
+        _fail("IRON_SULFIDE_SUPPLEMENT_PAGE_BINDING_MISMATCH")
+    return SupplementCandidate(
+        source_id=str(row["source_id"]),
+        locator=str(row["locator"]),
+        page_number=int(row["page_number"]),
+        review_order=int(row["review_order"]),
+        page_text_sha256=_digest(
+            digest, "IRON_SULFIDE_SUPPLEMENT_PAGE_BINDING_MISMATCH"
+        ),
+    )
+
+
+def next_supplement_candidate(
+    audit: IronSulfideSupplementAuditStore,
+) -> SupplementCandidate | None:
+    """Return only the next candidate in the frozen prefix."""
+    status = supplement_audit_status(audit)
+    if status.status in {"TARGET_MET", "EXHAUSTED_INSUFFICIENT"}:
+        return None
+    current = _current_supplement_decisions(audit)
+    needs = tuple(
+        decision
+        for decision in current.values()
+        if decision.decision == "NEEDS_SECOND_REVIEW"
+    )
+    if len(needs) > 1:
+        _fail("IRON_SULFIDE_SUPPLEMENT_DECISION_INVALID")
+    if needs:
+        row = audit._connection.execute(
+            """
+            select source_id, locator, page_number, review_order, page_text_sha256
+            from iron_sulfide_supplement_audit_candidates
+            where run_id = ? and audit_id = ? and source_id = ? and locator = ?
+            """,
+            (
+                audit.run_id,
+                audit.audit_id,
+                needs[0].source_id,
+                needs[0].locator,
+            ),
+        ).fetchone()
+    else:
+        row = audit._connection.execute(
+            """
+            select source_id, locator, page_number, review_order, page_text_sha256
+            from iron_sulfide_supplement_audit_candidates
+            where run_id = ? and audit_id = ? and review_order = ?
+            """,
+            (audit.run_id, audit.audit_id, len(current) + 1),
+        ).fetchone()
+    return None if row is None else _candidate_from_row(row)
+
+
+def _set_supplement_status(audit: IronSulfideSupplementAuditStore) -> None:
+    current = _current_supplement_decisions(audit)
+    run = audit._connection.execute(
+        """
+        select candidate_count, promotion_target
+        from iron_sulfide_supplement_audit_runs
+        where run_id = ? and audit_id = ?
+        """,
+        (audit.run_id, audit.audit_id),
+    ).fetchone()
+    if run is None:
+        _fail("IRON_SULFIDE_SUPPLEMENT_RUN_MISSING")
+    promotions = sum(
+        decision.decision == "PROMOTE_FOUNDATIONAL" for decision in current.values()
+    )
+    unresolved = any(
+        decision.decision == "NEEDS_SECOND_REVIEW" for decision in current.values()
+    )
+    if not unresolved and promotions >= int(run["promotion_target"]):
+        status = "TARGET_MET"
+    elif not unresolved and len(current) == int(run["candidate_count"]):
+        status = "EXHAUSTED_INSUFFICIENT"
+    else:
+        status = "IN_PROGRESS"
+    audit._connection.execute(
+        """
+        update iron_sulfide_supplement_audit_runs set status = ?
+        where run_id = ? and audit_id = ?
+        """,
+        (status, audit.run_id, audit.audit_id),
+    )
+
+
+def record_supplement_decision(
+    *, audit: IronSulfideSupplementAuditStore, record: SupplementLocatorDecision
+) -> SupplementAuditStatus:
+    """Append one exact next-prefix decision in one SQLite transaction."""
+    safe = SupplementLocatorDecision.from_mapping(record.to_mapping())
+    candidate = next_supplement_candidate(audit)
+    if candidate is None or (
+        safe.source_id,
+        safe.locator,
+    ) != (candidate.source_id, candidate.locator):
+        _fail("IRON_SULFIDE_SUPPLEMENT_DECISION_OUT_OF_ORDER")
+    if safe.page_text_sha256 != candidate.page_text_sha256:
+        _fail("IRON_SULFIDE_SUPPLEMENT_PAGE_BINDING_MISMATCH")
+    current = _current_supplement_decisions(audit)
+    prior = current.get((candidate.source_id, candidate.locator))
+    if prior is None:
+        if safe.supersedes_decision_id is not None:
+            _fail("IRON_SULFIDE_SUPPLEMENT_DECISION_INVALID")
+    elif (
+        prior.decision != "NEEDS_SECOND_REVIEW"
+        or safe.supersedes_decision_id != prior.decision_id
+        or safe.decision == "NEEDS_SECOND_REVIEW"
+    ):
+        _fail("IRON_SULFIDE_SUPPLEMENT_DECISION_INVALID")
+    try:
+        with audit._connection:
+            audit._connection.execute(
+                """
+                insert into iron_sulfide_supplement_audit_decisions(
+                    run_id, audit_id, decision_id, source_id, locator, decision,
+                    reason_code, page_text_sha256, reviewer_id,
+                    supersedes_decision_id, decided_at
+                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    audit.run_id,
+                    audit.audit_id,
+                    safe.decision_id,
+                    safe.source_id,
+                    safe.locator,
+                    safe.decision,
+                    safe.reason_code,
+                    safe.page_text_sha256,
+                    safe.reviewer_id,
+                    safe.supersedes_decision_id,
+                    safe.decided_at,
+                ),
+            )
+            _set_supplement_status(audit)
+    except sqlite3.IntegrityError as error:
+        raise IronSulfideSupplementAuditError(
+            "IRON_SULFIDE_SUPPLEMENT_DECISION_INVALID"
+        ) from error
+    return supplement_audit_status(audit)
+
+
+def extract_supplement_page(
+    *,
+    audit: IronSulfideSupplementAuditStore,
+    source_root: Path,
+    source_id: str,
+    locator: str,
+) -> SupplementReviewPacket:
+    """Extract only the exact bound next candidate from verified PDF bytes."""
+    candidate = next_supplement_candidate(audit)
+    if candidate is None or (
+        _string(source_id, "IRON_SULFIDE_SUPPLEMENT_CANDIDATE_INVALID"),
+        _string(locator, "IRON_SULFIDE_SUPPLEMENT_CANDIDATE_INVALID"),
+    ) != (candidate.source_id, candidate.locator):
+        _fail("IRON_SULFIDE_SUPPLEMENT_DECISION_OUT_OF_ORDER")
+    source = audit._connection.execute(
+        """
+        select audited.file_sha256, indexed.source_path
+        from iron_sulfide_supplement_audit_sources as audited
+        join index_sources as indexed
+          on indexed.run_id = audited.run_id and indexed.source_id = audited.source_id
+        where audited.run_id = ? and audited.audit_id = ? and audited.source_id = ?
+        """,
+        (audit.run_id, audit.audit_id, candidate.source_id),
+    ).fetchone()
+    if source is None:
+        _fail("IRON_SULFIDE_SUPPLEMENT_SOURCE_PROVENANCE_INVALID")
+    resolved_root = source_root.resolve()
+    paths = tuple(
+        path.resolve()
+        for path in resolved_root.rglob("*")
+        if path.is_file()
+        and path.name.casefold() == _basename(source["source_path"]).casefold()
+    )
+    try:
+        if len(paths) != 1 or not paths[0].is_relative_to(resolved_root):
+            _fail("IRON_SULFIDE_SUPPLEMENT_SOURCE_PROVENANCE_INVALID")
+        content = paths[0].read_bytes()
+        if hashlib.sha256(content).hexdigest() != str(source["file_sha256"]):
+            _fail("IRON_SULFIDE_SUPPLEMENT_SOURCE_PROVENANCE_INVALID")
+        reader = PdfReader(BytesIO(content))
+        extracted = reader.pages[candidate.page_number - 1].extract_text()
+    except IronSulfideSupplementAuditError:
+        raise
+    except Exception as error:
+        raise IronSulfideSupplementAuditError(
+            "IRON_SULFIDE_SUPPLEMENT_PAGE_EXTRACTION_FAILED"
+        ) from error
+    text = (extracted or "").replace("\r\n", "\n").replace("\r", "\n")
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    if digest != candidate.page_text_sha256:
+        _fail("IRON_SULFIDE_SUPPLEMENT_PAGE_BINDING_MISMATCH")
+    return SupplementReviewPacket(
+        source_id=candidate.source_id,
+        locator=candidate.locator,
+        page_number=candidate.page_number,
+        page_text=text,
+        page_text_sha256=digest,
+    )

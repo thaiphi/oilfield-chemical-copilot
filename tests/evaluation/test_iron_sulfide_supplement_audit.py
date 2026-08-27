@@ -1,9 +1,21 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
+import io
+import json
 from pathlib import Path
 
 import pytest
+
+
+def _runner_module():
+    script = Path(__file__).parents[2] / "eval" / "audit_iron_sulfide_supplement.py"
+    spec = importlib.util.spec_from_file_location("audit_iron_sulfide_supplement", script)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _pdf(path: Path, *, pages: int = 6) -> Path:
@@ -269,3 +281,248 @@ def test_bind_supplement_pages_rejects_pdf_changed_after_initialization(
         bind_supplement_pages(audit=audit, source_root=source_root)
 
     audit.close()
+
+
+def _initialized_audit(tmp_path: Path, *, promotion_target: int = 7):
+    from oilfield_chemical_copilot.evaluation.iron_sulfide_supplement_audit import (
+        bind_supplement_pages,
+        initialize_supplement_audit,
+    )
+
+    store, binding, source_root = _sealed_reconciliation(tmp_path)
+    audit = initialize_supplement_audit(
+        store=store,
+        audit_id="iron-sulfide-supplement-audit-v1",
+        snapshot_binding_sha256=binding,
+        source_root=source_root,
+        promotion_target=promotion_target,
+    )
+    bind_supplement_pages(audit=audit, source_root=source_root)
+    return audit, source_root
+
+
+def _decision(
+    *,
+    locator: str,
+    decision: str = "KEEP_SUPPORTING",
+    decision_id: str | None = None,
+    supersedes_decision_id: str | None = None,
+):
+    from oilfield_chemical_copilot.evaluation.iron_sulfide_supplement_audit import (
+        SupplementLocatorDecision,
+    )
+
+    reason = {
+        "PROMOTE_FOUNDATIONAL": "GENERALIZABLE_FOUNDATIONAL_EVIDENCE",
+        "KEEP_SUPPORTING": "CASE_OR_APPLICATION_SPECIFIC",
+        "NEEDS_SECOND_REVIEW": "AMBIGUOUS_FOUNDATIONAL_ROLE",
+    }[decision]
+    return SupplementLocatorDecision.from_mapping(
+        {
+            "decision_id": decision_id or f"decision-{locator.replace(':', '-')}",
+            "source_id": "source-supplement-1",
+            "locator": locator,
+            "decision": decision,
+            "reason_code": reason,
+            "page_text_sha256": hashlib.sha256(b"").hexdigest(),
+            "reviewer_id": "reviewer-1",
+            "supersedes_decision_id": supersedes_decision_id,
+            "decided_at": "2026-08-27T00:00:00Z",
+        }
+    )
+
+
+def test_decisions_must_follow_frozen_candidate_order(tmp_path: Path) -> None:
+    from oilfield_chemical_copilot.evaluation.iron_sulfide_supplement_audit import (
+        IronSulfideSupplementAuditError,
+        record_supplement_decision,
+    )
+
+    audit, _ = _initialized_audit(tmp_path)
+
+    with pytest.raises(
+        IronSulfideSupplementAuditError,
+        match="IRON_SULFIDE_SUPPLEMENT_DECISION_OUT_OF_ORDER",
+    ):
+        record_supplement_decision(audit=audit, record=_decision(locator="page:2"))
+
+    audit.close()
+
+
+def test_target_promotions_close_review_without_using_unreviewed_suffix(
+    tmp_path: Path,
+) -> None:
+    from oilfield_chemical_copilot.evaluation.iron_sulfide_supplement_audit import (
+        next_supplement_candidate,
+        record_supplement_decision,
+        supplement_audit_status,
+    )
+
+    audit, _ = _initialized_audit(tmp_path, promotion_target=2)
+    record_supplement_decision(
+        audit=audit,
+        record=_decision(locator="page:1", decision="PROMOTE_FOUNDATIONAL"),
+    )
+    record_supplement_decision(
+        audit=audit,
+        record=_decision(locator="page:2", decision="PROMOTE_FOUNDATIONAL"),
+    )
+
+    status = supplement_audit_status(audit)
+    assert status.status == "TARGET_MET"
+    assert status.reviewed_count == 2
+    assert status.promotion_count == 2
+    assert status.remaining_count == 1
+    assert next_supplement_candidate(audit) is None
+    audit.close()
+
+
+def test_second_review_blocks_progress_until_append_only_resolution(
+    tmp_path: Path,
+) -> None:
+    from oilfield_chemical_copilot.evaluation.iron_sulfide_supplement_audit import (
+        next_supplement_candidate,
+        record_supplement_decision,
+        supplement_audit_status,
+    )
+
+    audit, _ = _initialized_audit(tmp_path)
+    record_supplement_decision(
+        audit=audit,
+        record=_decision(
+            locator="page:1",
+            decision="NEEDS_SECOND_REVIEW",
+            decision_id="review-page-1",
+        ),
+    )
+    assert supplement_audit_status(audit).needs_second_review_count == 1
+    assert next_supplement_candidate(audit).locator == "page:1"
+
+    record_supplement_decision(
+        audit=audit,
+        record=_decision(
+            locator="page:1",
+            decision_id="resolve-page-1",
+            supersedes_decision_id="review-page-1",
+        ),
+    )
+
+    assert supplement_audit_status(audit).needs_second_review_count == 0
+    assert next_supplement_candidate(audit).locator == "page:2"
+    assert (
+        audit._connection.execute(
+            "select count(*) from iron_sulfide_supplement_audit_decisions"
+        ).fetchone()[0]
+        == 2
+    )
+    audit.close()
+
+
+def test_extract_supplement_page_returns_only_the_bound_next_page(
+    tmp_path: Path,
+) -> None:
+    from oilfield_chemical_copilot.evaluation.iron_sulfide_supplement_audit import (
+        extract_supplement_page,
+        next_supplement_candidate,
+    )
+
+    audit, source_root = _initialized_audit(tmp_path)
+    candidate = next_supplement_candidate(audit)
+
+    packet = extract_supplement_page(
+        audit=audit,
+        source_root=source_root,
+        source_id=candidate.source_id,
+        locator=candidate.locator,
+    )
+
+    assert packet.source_id == "source-supplement-1"
+    assert packet.locator == "page:1"
+    assert packet.page_number == 1
+    assert packet.page_text == ""
+    assert packet.page_text_sha256 == hashlib.sha256(b"").hexdigest()
+    audit.close()
+
+
+def test_cli_next_and_record_keep_private_packet_out_of_stdout(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    audit, source_root = _initialized_audit(tmp_path)
+    root = audit.database_path.parent
+    audit.close()
+    runner = _runner_module()
+    common = [
+        "--private-root",
+        str(root),
+        "--run-id",
+        "run-001",
+        "--audit-id",
+        "iron-sulfide-supplement-audit-v1",
+    ]
+    packet = root / "iron-sulfide-supplement-audit" / "v1" / "packet.json"
+
+    assert (
+        runner.cli(
+            [
+                "next",
+                *common,
+                "--source-root",
+                str(source_root),
+                "--packet-output",
+                str(packet),
+            ]
+        )
+        == 0
+    )
+    stdout = json.loads(capsys.readouterr().out)
+    assert stdout == {
+        "status": "IN_PROGRESS",
+        "source_count": 1,
+        "candidate_count": 3,
+        "reviewed_count": 0,
+        "promotion_count": 0,
+        "remaining_count": 3,
+        "needs_second_review_count": 0,
+    }
+    private_packet = json.loads(packet.read_text(encoding="utf-8"))
+    assert private_packet["locator"] == "page:1"
+    assert private_packet["source_id"] == "source-supplement-1"
+
+    monkeypatch.setattr(
+        runner.sys,
+        "stdin",
+        io.StringIO(json.dumps(_decision(locator="page:1").to_mapping())),
+    )
+    assert runner.cli(["record", *common]) == 0
+    recorded = json.loads(capsys.readouterr().out)
+    assert recorded["reviewed_count"] == 1
+    assert recorded["remaining_count"] == 2
+    assert "source_id" not in recorded
+    assert "locator" not in recorded
+
+
+def test_cli_sanitizes_unexpected_private_path_errors(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner_module()
+    root = tmp_path / ".private" / "corpus-reconciliation" / "v1"
+    root.mkdir(parents=True)
+    private_path = root / "secret.pdf"
+    monkeypatch.setattr(
+        runner,
+        "_open_audit",
+        lambda _args: (_ for _ in ()).throw(OSError(str(private_path))),
+    )
+
+    assert runner.cli(["status", "--private-root", str(root)]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert str(private_path) not in captured.err
+    assert json.loads(captured.err) == {
+        "status": "IRON_SULFIDE_SUPPLEMENT_AUDIT_BLOCKED",
+        "error_code": "IRON_SULFIDE_SUPPLEMENT_OPERATION_FAILED",
+    }

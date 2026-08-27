@@ -154,7 +154,7 @@ git commit -m "feat: add iron sulfide supplement audit contracts"
 - Consumes: one bound next candidate and its exact mounted PDF.
 - Produces: `next_supplement_candidate(...)`, `extract_supplement_page(...)`, `record_supplement_decision(...)`, and aggregate-only CLI commands `init`, `next`, `record`, and `status`.
 
-- [ ] **Step 1: Write failing tests for strict prefix order, decision contracts, and early stop**
+- [x] **Step 1: Write failing tests for strict prefix order, decision contracts, and early stop**
 
 ```python
 def test_decisions_must_follow_frozen_candidate_order(tmp_path: Path) -> None:
@@ -181,13 +181,13 @@ def test_seventh_promotion_closes_review_without_reviewing_unused_suffix(
     assert status.remaining_count == 2
 ```
 
-- [ ] **Step 2: Run review tests and verify RED**
+- [x] **Step 2: Run review tests and verify RED**
 
 Run: `python -m pytest -q tests/evaluation/test_iron_sulfide_supplement_audit.py -k "decision or target or cli"`
 
 Expected: FAIL because review APIs and CLI do not exist.
 
-- [ ] **Step 3: Implement exact review contracts and aggregate-only CLI**
+- [x] **Step 3: Implement exact review contracts and aggregate-only CLI**
 
 Allow only:
 
@@ -208,13 +208,13 @@ SUPPLEMENT_DECISION_CONTRACTS = {
 
 Require the decision to target the exact next `review_order` and match its bound page-text digest. A `NEEDS_SECOND_REVIEW` row blocks advancement until one append-only superseding decision resolves that same candidate. After seven current promotions, expose `TARGET_MET` and no next candidate. If every candidate is reviewed with fewer than seven promotions, expose `EXHAUSTED_INSUFFICIENT`. Write private review packets atomically beneath the audit root; stdout and stderr contain aggregate status/error codes only.
 
-- [ ] **Step 4: Run review tests and verify GREEN**
+- [x] **Step 4: Run review tests and verify GREEN**
 
 Run: `python -m pytest -q tests/evaluation/test_iron_sulfide_supplement_audit.py -k "decision or target or cli"`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit Task 2**
+- [x] **Step 5: Commit Task 2**
 
 ```powershell
 git add -- src/oilfield_chemical_copilot/evaluation/iron_sulfide_supplement_audit.py eval/audit_iron_sulfide_supplement.py tests/evaluation/test_iron_sulfide_supplement_audit.py
