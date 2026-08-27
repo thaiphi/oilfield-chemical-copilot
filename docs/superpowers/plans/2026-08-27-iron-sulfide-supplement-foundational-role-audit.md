@@ -261,7 +261,7 @@ Run: `python -m pytest -q tests/evaluation/test_iron_sulfide_supplement_audit.py
 
 Expected: FAIL because supplement sealing and combined capacity do not exist.
 
-- [x] **Step 3: Implement immutable v1 seal and combined projection**
+- [x] **Step 3: Implement immutable v2 seal and combined projection**
 
 Publish exactly four files under the ignored supplement audit root using one atomic directory rename: canonical current-prefix decisions JSONL, its SHA-256 manifest, an audit binding JSON, and its manifest. Bind schema version, reconciliation binding, source-set digest, candidate-set digest, page-binding digest, stop rule, reviewed-prefix length, decision digest, and the verified core-PDF v2 binding digest. Reject extra files, partial publication, stale manifests, decision gaps, unresolved decisions, or a seal that differs from current SQLite state.
 
@@ -289,23 +289,23 @@ git commit -m "feat: seal iron sulfide supplement proposal"
 - Consumes: the 252 frozen provenance-eligible pages and Tasks 1-3 controller.
 - Produces: durable prefix decisions, a verified supplement proposal, and aggregate combined-capacity status.
 
-- [ ] **Step 1: Initialize and bind the exact supplement candidate set**
+- [x] **Step 1: Initialize and bind the exact supplement candidate set**
 
 Authenticate the active reconciliation seal, resolve only the approved supplement folder, verify all admitted mounted PDFs against sealed local hashes, bind every candidate page digest, and report aggregate counts only.
 
-- [ ] **Step 2: Review and persist the deterministic prefix**
+- [x] **Step 2: Review and persist the deterministic prefix**
 
 For each next page, judge foundational role using the frozen definition. Persist the decision immediately. Render and inspect a page when extracted text does not resolve diagrams, tables, or page context. Do not skip ahead or batch uncommitted decisions.
 
-- [ ] **Step 3: Resolve every second-review decision**
+- [x] **Step 3: Resolve every second-review decision**
 
 Use append-only supersession. Do not advance or seal while the current prefix ends in `NEEDS_SECOND_REVIEW`.
 
-- [ ] **Step 4: Stop only at the registered terminal condition**
+- [x] **Step 4: Stop only at the registered terminal condition**
 
 Stop when seven promotions are current or the full eligible set is exhausted. Do not review or use the suffix after `TARGET_MET`.
 
-- [ ] **Step 5: Seal, independently verify, and calculate combined capacity**
+- [x] **Step 5: Seal, independently verify, and calculate combined capacity**
 
 Publish the private atomic seal, verify it without writing, verify the core-PDF v2 seal, and run the combined no-write capacity and allocator calculation. Do not apply either proposal.
 
@@ -321,11 +321,11 @@ Publish the private atomic seal, verify it without writing, verify the core-PDF 
 - Consumes: verified private aggregate results only.
 - Produces: synchronized public gate status and a reviewable tracked commit.
 
-- [ ] **Step 1: Update public documents with aggregates only**
+- [x] **Step 1: Update public documents with aggregates only**
 
 Record eligible source/page counts, reviewed-prefix and decision totals when safe to disclose, terminal status, seal verification, eight-stratum capacity status, allocator availability, and the next approval gate. Never include private identifiers, filenames, locators, page text, paths, or hashes.
 
-- [ ] **Step 2: Run focused and full verification**
+- [x] **Step 2: Run focused and full verification**
 
 ```powershell
 python -m pytest -q tests/evaluation/test_iron_sulfide_supplement_audit.py
@@ -338,13 +338,24 @@ git ls-files .private
 git status --short
 ```
 
-- [ ] **Step 3: Request independent review before mapping application or E1a-4 sampling**
+- [x] **Step 3: Request independent review before mapping application or E1a-4 sampling**
 
 Review only controller code, tests, aggregate public status, and private artifact contract/digest verification. The reviewer must not inspect private paths, files, page text, identifiers, decisions, or hashes.
 
-- [ ] **Step 4: Commit the tracked implementation and aggregate result**
+- [x] **Step 4: Commit the tracked implementation and aggregate result**
 
 ```powershell
 git add -- src/oilfield_chemical_copilot/evaluation/iron_sulfide_supplement_audit.py eval/audit_iron_sulfide_supplement.py tests/evaluation/test_iron_sulfide_supplement_audit.py docs/superpowers/plans/2026-08-27-iron-sulfide-supplement-foundational-role-audit.md docs/superpowers/plans/2026-08-26-foundational-locator-evidence-audit.md docs/superpowers/plans/2026-08-19-e1a4-requirements-aware-evidence-gate.md docs/CURRICULUM_REMEDIATION_BACKLOG.md
 git commit -m "feat: audit iron sulfide supplement evidence"
 ```
+
+## Execution Result — 2026-08-27
+
+- Scope and identity: the authenticated reconciliation admitted 17 supplement PDFs and froze 252 fresh, substantive Iron Sulfide supporting pages. Every admitted mounted PDF and candidate page binding passed the fail-closed identity contract.
+- Review result: the deterministic review stopped at its registered early-stop condition after a 10-page prefix. Seven pages qualified as generalizable foundational evidence, three remained supporting, and zero decisions required second review. The unused 242-page suffix was not reviewed or used.
+- Artifact result: the stricter private v2 supplement proposal contains two artifacts and two manifests published by one atomic directory rename. It freezes the exact approved source-root identity and authenticates the core-PDF v2 proposal from the same SQLite database and reconciliation snapshot. A separate no-write verification passed; the earlier v1 supplement seal is preserved as superseded history.
+- Combined capacity result: the verified no-write projection satisfies all eight topic/role strata and the exact deterministic 96-slot allocator succeeds. No E1a-4 sampling frame was written.
+- Mutation boundary: neither correction proposal has been applied. Locator roles, Qdrant, retrieval, ingestion, and the index remain unchanged.
+- Verification result: 98 focused reconciliation/audit tests and the full 685-test suite passed with 2 skips. Ruff and diff checks passed, and Git tracks no private artifact.
+- Independent review: the stricter v2 corrections and aggregate public status were approved with no Critical, Important, or Minor findings. The reviewer inspected no private material.
+- Decision: the audit and reconciliation gates are closed. Neither proposal has been applied. The next explicit authorization is whether to apply the two verified correction proposals and then seal the deterministic private E1a-4 population; ingestion, reindexing, retrieval, and Qdrant changes remain unauthorized.

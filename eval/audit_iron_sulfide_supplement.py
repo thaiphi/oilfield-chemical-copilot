@@ -68,8 +68,10 @@ def _parser() -> argparse.ArgumentParser:
     command("record")
     command("status")
     seal = command("seal")
+    seal.add_argument("--core-audit-id", required=True)
     seal.add_argument("--core-binding-sha256", required=True)
     verify = command("verify")
+    verify.add_argument("--core-audit-id", required=True)
     verify.add_argument("--expected-binding-sha256", required=True)
     verify.add_argument("--expected-core-binding-sha256", required=True)
     capacity = command("capacity")
@@ -212,21 +214,41 @@ def cli(argv: Sequence[str] | None = None) -> int:
                 record=SupplementLocatorDecision.from_mapping(_read_stdin_mapping()),
             )
         if args.command == "seal":
-            sealed = seal_supplement_proposal(
-                audit=audit,
-                core_binding_sha256=args.core_binding_sha256,
+            core = FoundationalAuditStore.open(
+                database_path=audit.database_path,
+                run_id=args.run_id,
+                audit_id=args.core_audit_id,
             )
+            try:
+                sealed = seal_supplement_proposal(
+                    audit=audit,
+                    core_audit=core,
+                    core_binding_sha256=args.core_binding_sha256,
+                )
+            finally:
+                core.close()
             output = {
                 "status": "SEALED",
                 "artifact_count": len(sealed.artifacts),
                 "manifest_count": len(sealed.artifacts),
             }
         elif args.command == "verify":
-            sealed = verify_supplement_proposal(
-                audit=audit,
-                expected_binding_sha256=args.expected_binding_sha256,
-                expected_core_binding_sha256=args.expected_core_binding_sha256,
+            core = FoundationalAuditStore.open(
+                database_path=audit.database_path,
+                run_id=args.run_id,
+                audit_id=args.core_audit_id,
             )
+            try:
+                sealed = verify_supplement_proposal(
+                    audit=audit,
+                    core_audit=core,
+                    expected_binding_sha256=args.expected_binding_sha256,
+                    expected_core_binding_sha256=(
+                        args.expected_core_binding_sha256
+                    ),
+                )
+            finally:
+                core.close()
             output = {
                 "status": "VERIFIED",
                 "artifact_count": len(sealed.artifacts),

@@ -29,6 +29,7 @@ from oilfield_chemical_copilot.evaluation.e1a3_sampling import (
 )
 from oilfield_chemical_copilot.evaluation.foundational_locator_audit import (
     FoundationalAuditStore,
+    FoundationalLocatorAuditError,
     HypotheticalCapacityReport,
     HypotheticalCapacityStratum,
     LocatorAuditDecision,
@@ -36,9 +37,9 @@ from oilfield_chemical_copilot.evaluation.foundational_locator_audit import (
 )
 
 
-SUPPLEMENT_ARTIFACT_VERSION = "v1"
-SUPPLEMENT_CORRECTION_NAME = "iron-sulfide-supplement-corrections.v1.jsonl"
-SUPPLEMENT_BINDING_NAME = "audit-binding.v1.json"
+SUPPLEMENT_ARTIFACT_VERSION = "v2"
+SUPPLEMENT_CORRECTION_NAME = "iron-sulfide-supplement-corrections.v2.jsonl"
+SUPPLEMENT_BINDING_NAME = "audit-binding.v2.json"
 
 
 class IronSulfideSupplementAuditError(RuntimeError):
@@ -80,6 +81,14 @@ def _canonical_digest(records: tuple[Mapping[str, object], ...]) -> str:
         ensure_ascii=False,
     ).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+def _source_root_digest(source_root: Path) -> str:
+    resolved = source_root.resolve()
+    if not resolved.is_dir():
+        _fail("IRON_SULFIDE_SUPPLEMENT_SOURCE_ROOT_INVALID")
+    normalized = os.path.normcase(str(resolved))
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -266,6 +275,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             candidate_count integer not null,
             promotion_target integer not null,
             status text not null,
+            source_root_sha256 text not null,
             primary key (run_id, audit_id)
         );
         create table if not exists iron_sulfide_supplement_audit_sources (
@@ -305,6 +315,17 @@ def _create_schema(connection: sqlite3.Connection) -> None:
         );
         """
     )
+    columns = {
+        str(row[1])
+        for row in connection.execute(
+            "pragma table_info(iron_sulfide_supplement_audit_runs)"
+        ).fetchall()
+    }
+    if "source_root_sha256" not in columns:
+        connection.execute(
+            "alter table iron_sulfide_supplement_audit_runs "
+            "add column source_root_sha256 text"
+        )
 
 
 def _current_accept(connection: sqlite3.Connection, *, run_id: str, match_key: str) -> bool:
@@ -560,17 +581,18 @@ def initialize_supplement_audit(
     )
     source_digest = _canonical_digest(source_payload)
     candidate_digest = _canonical_digest(candidate_payload)
+    source_root_digest = _source_root_digest(source_root)
     _create_schema(store._connection)
     existing = store._connection.execute(
         """
         select snapshot_binding_sha256, source_set_sha256, candidate_set_sha256,
-               source_count, candidate_count, promotion_target
+               source_count, candidate_count, promotion_target, source_root_sha256
         from iron_sulfide_supplement_audit_runs
         where run_id = ? and audit_id = ?
         """,
         (store.run_id, safe_audit_id),
     ).fetchone()
-    expected = (
+    expected_without_root = (
         binding_digest,
         source_digest,
         candidate_digest,
@@ -578,19 +600,36 @@ def initialize_supplement_audit(
         len(candidate_payload),
         target,
     )
-    if existing is not None and tuple(existing) != expected:
-        _fail("IRON_SULFIDE_SUPPLEMENT_BINDING_CONFLICT")
+    if existing is not None:
+        if tuple(existing)[:6] != expected_without_root:
+            _fail("IRON_SULFIDE_SUPPLEMENT_BINDING_CONFLICT")
+        stored_root = existing["source_root_sha256"]
+        if stored_root is not None and str(stored_root) != source_root_digest:
+            _fail("IRON_SULFIDE_SUPPLEMENT_SOURCE_ROOT_MISMATCH")
     with store._connection:
+        if existing is not None and existing["source_root_sha256"] is None:
+            store._connection.execute(
+                """
+                update iron_sulfide_supplement_audit_runs
+                set source_root_sha256 = ? where run_id = ? and audit_id = ?
+                """,
+                (source_root_digest, store.run_id, safe_audit_id),
+            )
         store._connection.execute(
             """
             insert into iron_sulfide_supplement_audit_runs(
                 run_id, audit_id, snapshot_binding_sha256, source_set_sha256,
                 candidate_set_sha256, source_count, candidate_count,
-                promotion_target, status
-            ) values (?, ?, ?, ?, ?, ?, ?, ?, 'IN_PROGRESS')
+                promotion_target, status, source_root_sha256
+            ) values (?, ?, ?, ?, ?, ?, ?, ?, 'IN_PROGRESS', ?)
             on conflict(run_id, audit_id) do nothing
             """,
-            (store.run_id, safe_audit_id, *expected),
+            (
+                store.run_id,
+                safe_audit_id,
+                *expected_without_root,
+                source_root_digest,
+            ),
         )
         if existing is None:
             store._connection.executemany(
@@ -676,8 +715,20 @@ def bind_supplement_pages(
 ) -> int:
     """Bind every candidate page to text from the same verified PDF bytes."""
     resolved_root = source_root.resolve()
-    if not resolved_root.is_dir():
-        _fail("IRON_SULFIDE_SUPPLEMENT_SOURCE_ROOT_INVALID")
+    expected_root = audit._connection.execute(
+        """
+        select source_root_sha256 from iron_sulfide_supplement_audit_runs
+        where run_id = ? and audit_id = ?
+        """,
+        (audit.run_id, audit.audit_id),
+    ).fetchone()
+    if (
+        expected_root is None
+        or expected_root["source_root_sha256"] is None
+        or _source_root_digest(resolved_root)
+        != str(expected_root["source_root_sha256"])
+    ):
+        _fail("IRON_SULFIDE_SUPPLEMENT_SOURCE_ROOT_MISMATCH")
     mounted_by_name: dict[str, list[Path]] = {}
     for path in resolved_root.rglob("*"):
         if path.is_file():
@@ -1119,7 +1170,8 @@ def _supplement_binding_payload(
     run = audit._connection.execute(
         """
         select snapshot_binding_sha256, source_set_sha256, candidate_set_sha256,
-               source_count, candidate_count, promotion_target, status
+               source_count, candidate_count, promotion_target, status,
+               source_root_sha256
         from iron_sulfide_supplement_audit_runs
         where run_id = ? and audit_id = ?
         """,
@@ -1129,7 +1181,7 @@ def _supplement_binding_payload(
         _fail("IRON_SULFIDE_SUPPLEMENT_RUN_MISSING")
     decisions = _terminal_decisions(audit)
     binding = {
-        "schema_version": 1,
+        "schema_version": 2,
         "run_id": audit.run_id,
         "audit_id": audit.audit_id,
         "snapshot_binding_sha256": _digest(
@@ -1141,6 +1193,10 @@ def _supplement_binding_payload(
         ),
         "candidate_set_sha256": _digest(
             run["candidate_set_sha256"],
+            "IRON_SULFIDE_SUPPLEMENT_BINDING_INVALID",
+        ),
+        "source_root_sha256": _digest(
+            run["source_root_sha256"],
             "IRON_SULFIDE_SUPPLEMENT_BINDING_INVALID",
         ),
         "page_binding_sha256": _page_binding_digest(audit),
@@ -1206,9 +1262,60 @@ def _verified_manifest(path: Path) -> str:
     return digest
 
 
+def _authenticate_core_proposal(
+    *,
+    core_audit: FoundationalAuditStore,
+    supplement_audit: IronSulfideSupplementAuditStore,
+    expected_core_binding_sha256: str,
+) -> str:
+    trusted = _digest(
+        expected_core_binding_sha256,
+        "IRON_SULFIDE_SUPPLEMENT_CORE_AUDIT_INVALID",
+    )
+    if (
+        core_audit.database_path.resolve()
+        != supplement_audit.database_path.resolve()
+        or core_audit.run_id != supplement_audit.run_id
+    ):
+        _fail("IRON_SULFIDE_SUPPLEMENT_CORE_AUDIT_INVALID")
+    core_run = core_audit._connection.execute(
+        """
+        select snapshot_binding_sha256 from foundational_audit_runs
+        where run_id = ? and audit_id = ?
+        """,
+        (core_audit.run_id, core_audit.audit_id),
+    ).fetchone()
+    supplement_run = supplement_audit._connection.execute(
+        """
+        select snapshot_binding_sha256
+        from iron_sulfide_supplement_audit_runs
+        where run_id = ? and audit_id = ?
+        """,
+        (supplement_audit.run_id, supplement_audit.audit_id),
+    ).fetchone()
+    if (
+        core_run is None
+        or supplement_run is None
+        or str(core_run["snapshot_binding_sha256"])
+        != str(supplement_run["snapshot_binding_sha256"])
+    ):
+        _fail("IRON_SULFIDE_SUPPLEMENT_CORE_AUDIT_INVALID")
+    try:
+        verify_correction_proposal(
+            audit=core_audit,
+            expected_binding_sha256=trusted,
+        )
+    except FoundationalLocatorAuditError as error:
+        raise IronSulfideSupplementAuditError(
+            "IRON_SULFIDE_SUPPLEMENT_CORE_AUDIT_INVALID"
+        ) from error
+    return trusted
+
+
 def verify_supplement_proposal(
     *,
     audit: IronSulfideSupplementAuditStore,
+    core_audit: FoundationalAuditStore,
     expected_binding_sha256: str,
     expected_core_binding_sha256: str,
 ) -> SupplementAuditSeal:
@@ -1216,9 +1323,10 @@ def verify_supplement_proposal(
     trusted = _digest(
         expected_binding_sha256, "IRON_SULFIDE_SUPPLEMENT_BINDING_MISMATCH"
     )
-    core_trusted = _digest(
-        expected_core_binding_sha256,
-        "IRON_SULFIDE_SUPPLEMENT_BINDING_MISMATCH",
+    core_trusted = _authenticate_core_proposal(
+        core_audit=core_audit,
+        supplement_audit=audit,
+        expected_core_binding_sha256=expected_core_binding_sha256,
     )
     sealed = _supplement_sealed_directory(audit)
     correction_path = sealed / SUPPLEMENT_CORRECTION_NAME
@@ -1277,11 +1385,16 @@ def verify_supplement_proposal(
 
 
 def seal_supplement_proposal(
-    *, audit: IronSulfideSupplementAuditStore, core_binding_sha256: str
+    *,
+    audit: IronSulfideSupplementAuditStore,
+    core_audit: FoundationalAuditStore,
+    core_binding_sha256: str,
 ) -> SupplementAuditSeal:
     """Atomically publish a terminal supplement correction proposal."""
-    core_trusted = _digest(
-        core_binding_sha256, "IRON_SULFIDE_SUPPLEMENT_BINDING_INVALID"
+    core_trusted = _authenticate_core_proposal(
+        core_audit=core_audit,
+        supplement_audit=audit,
+        expected_core_binding_sha256=core_binding_sha256,
     )
     correction = _canonical_jsonl(
         tuple(decision.to_mapping() for decision in _terminal_decisions(audit))
@@ -1299,6 +1412,7 @@ def seal_supplement_proposal(
             _fail("IRON_SULFIDE_SUPPLEMENT_SEAL_PARTIAL")
         return verify_supplement_proposal(
             audit=audit,
+            core_audit=core_audit,
             expected_binding_sha256=binding_digest,
             expected_core_binding_sha256=core_trusted,
         )
@@ -1321,6 +1435,7 @@ def seal_supplement_proposal(
         os.replace(staged, sealed)
         return verify_supplement_proposal(
             audit=audit,
+            core_audit=core_audit,
             expected_binding_sha256=binding_digest,
             expected_core_binding_sha256=core_trusted,
         )
@@ -1361,11 +1476,10 @@ def calculate_combined_hypothetical_capacity(
     expected_supplement_binding_sha256: str,
 ) -> HypotheticalCapacityReport:
     """Project both approved proposals without mutating the inventory."""
-    if core_audit.run_id != supplement_audit.run_id:
-        _fail("IRON_SULFIDE_SUPPLEMENT_CAPACITY_INVALID")
-    core_trusted = _digest(
-        expected_core_binding_sha256,
-        "IRON_SULFIDE_SUPPLEMENT_CAPACITY_INVALID",
+    core_trusted = _authenticate_core_proposal(
+        core_audit=core_audit,
+        supplement_audit=supplement_audit,
+        expected_core_binding_sha256=expected_core_binding_sha256,
     )
     core_decisions = _core_sealed_decisions(
         core_audit=core_audit,
@@ -1373,6 +1487,7 @@ def calculate_combined_hypothetical_capacity(
     )
     verify_supplement_proposal(
         audit=supplement_audit,
+        core_audit=core_audit,
         expected_binding_sha256=expected_supplement_binding_sha256,
         expected_core_binding_sha256=core_trusted,
     )

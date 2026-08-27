@@ -283,6 +283,37 @@ def test_bind_supplement_pages_rejects_pdf_changed_after_initialization(
     audit.close()
 
 
+def test_bind_pages_rejects_an_identically_named_unfrozen_source_root(
+    tmp_path: Path,
+) -> None:
+    from oilfield_chemical_copilot.evaluation.iron_sulfide_supplement_audit import (
+        IronSulfideSupplementAuditError,
+        bind_supplement_pages,
+        initialize_supplement_audit,
+    )
+
+    store, binding, source_root = _sealed_reconciliation(tmp_path)
+    audit = initialize_supplement_audit(
+        store=store,
+        audit_id="iron-sulfide-supplement-audit-v1",
+        snapshot_binding_sha256=binding,
+        source_root=source_root,
+        promotion_target=7,
+    )
+    unfrozen_root = tmp_path / "other" / source_root.name
+    unfrozen_root.mkdir(parents=True)
+    original = source_root / "supplement.pdf"
+    (unfrozen_root / original.name).write_bytes(original.read_bytes())
+
+    with pytest.raises(
+        IronSulfideSupplementAuditError,
+        match="IRON_SULFIDE_SUPPLEMENT_SOURCE_ROOT_MISMATCH",
+    ):
+        bind_supplement_pages(audit=audit, source_root=unfrozen_root)
+
+    audit.close()
+
+
 def _initialized_audit(tmp_path: Path, *, promotion_target: int = 7):
     from oilfield_chemical_copilot.evaluation.iron_sulfide_supplement_audit import (
         bind_supplement_pages,
@@ -528,7 +559,7 @@ def test_cli_sanitizes_unexpected_private_path_errors(
     }
 
 
-def _closed_audits(tmp_path: Path):
+def _terminal_audits(tmp_path: Path):
     from oilfield_chemical_copilot.evaluation.foundational_locator_audit import (
         LocatorAuditDecision,
         bind_candidate_pages,
@@ -540,7 +571,6 @@ def _closed_audits(tmp_path: Path):
         bind_supplement_pages,
         initialize_supplement_audit,
         record_supplement_decision,
-        seal_supplement_proposal,
     )
 
     store, binding, source_root = _sealed_reconciliation(tmp_path)
@@ -587,11 +617,67 @@ def _closed_audits(tmp_path: Path):
                 locator=f"page:{page}", decision="PROMOTE_FOUNDATIONAL"
             ),
         )
+    return core, supplement, core_seal
+
+
+def _closed_audits(tmp_path: Path):
+    from oilfield_chemical_copilot.evaluation.iron_sulfide_supplement_audit import (
+        seal_supplement_proposal,
+    )
+
+    core, supplement, core_seal = _terminal_audits(tmp_path)
     supplement_seal = seal_supplement_proposal(
         audit=supplement,
+        core_audit=core,
         core_binding_sha256=core_seal.binding_sha256,
     )
     return core, supplement, core_seal, supplement_seal
+
+
+def test_seal_authenticates_core_proposal_before_publication(tmp_path: Path) -> None:
+    from oilfield_chemical_copilot.evaluation.iron_sulfide_supplement_audit import (
+        IronSulfideSupplementAuditError,
+        seal_supplement_proposal,
+    )
+
+    core, supplement, _ = _terminal_audits(tmp_path)
+
+    with pytest.raises(
+        IronSulfideSupplementAuditError,
+        match="IRON_SULFIDE_SUPPLEMENT_CORE_AUDIT_INVALID",
+    ):
+        seal_supplement_proposal(
+            audit=supplement,
+            core_audit=core,
+            core_binding_sha256="c" * 64,
+        )
+
+    supplement.close()
+
+
+def test_seal_rejects_core_proposal_from_another_database(tmp_path: Path) -> None:
+    from oilfield_chemical_copilot.evaluation.iron_sulfide_supplement_audit import (
+        IronSulfideSupplementAuditError,
+        seal_supplement_proposal,
+    )
+
+    foreign_core, foreign_supplement, foreign_seal = _terminal_audits(
+        tmp_path / "foreign"
+    )
+    _local_core, local_supplement, _ = _terminal_audits(tmp_path / "local")
+
+    with pytest.raises(
+        IronSulfideSupplementAuditError,
+        match="IRON_SULFIDE_SUPPLEMENT_CORE_AUDIT_INVALID",
+    ):
+        seal_supplement_proposal(
+            audit=local_supplement,
+            core_audit=foreign_core,
+            core_binding_sha256=foreign_seal.binding_sha256,
+        )
+
+    foreign_supplement.close()
+    local_supplement.close()
 
 
 def test_supplement_seal_requires_a_registered_terminal_condition(
@@ -599,21 +685,35 @@ def test_supplement_seal_requires_a_registered_terminal_condition(
 ) -> None:
     from oilfield_chemical_copilot.evaluation.iron_sulfide_supplement_audit import (
         IronSulfideSupplementAuditError,
-        record_supplement_decision,
         seal_supplement_proposal,
     )
 
-    audit, _ = _initialized_audit(tmp_path, promotion_target=2)
-    record_supplement_decision(
-        audit=audit,
-        record=_decision(locator="page:1", decision="PROMOTE_FOUNDATIONAL"),
-    )
+    core, audit, core_seal = _terminal_audits(tmp_path)
+    with audit._connection:
+        audit._connection.execute(
+            """
+            delete from iron_sulfide_supplement_audit_decisions
+            where run_id = ? and audit_id = ? and locator = 'page:2'
+            """,
+            (audit.run_id, audit.audit_id),
+        )
+        audit._connection.execute(
+            """
+            update iron_sulfide_supplement_audit_runs set status = 'IN_PROGRESS'
+            where run_id = ? and audit_id = ?
+            """,
+            (audit.run_id, audit.audit_id),
+        )
 
     with pytest.raises(
         IronSulfideSupplementAuditError,
         match="IRON_SULFIDE_SUPPLEMENT_AUDIT_INCOMPLETE",
     ):
-        seal_supplement_proposal(audit=audit, core_binding_sha256="c" * 64)
+        seal_supplement_proposal(
+            audit=audit,
+            core_audit=core,
+            core_binding_sha256=core_seal.binding_sha256,
+        )
 
     audit.close()
 
@@ -629,11 +729,13 @@ def test_supplement_proposal_is_atomic_complete_and_independently_verifiable(
     core, supplement, core_seal, sealed = _closed_audits(tmp_path)
     verified = verify_supplement_proposal(
         audit=supplement,
+        core_audit=core,
         expected_binding_sha256=sealed.binding_sha256,
         expected_core_binding_sha256=core_seal.binding_sha256,
     )
     resealed = seal_supplement_proposal(
         audit=supplement,
+        core_audit=core,
         core_binding_sha256=core_seal.binding_sha256,
     )
 
@@ -650,14 +752,7 @@ def test_supplement_seal_publish_failure_leaves_no_partial_artifact(
 ) -> None:
     import oilfield_chemical_copilot.evaluation.iron_sulfide_supplement_audit as module
 
-    audit, _ = _initialized_audit(tmp_path, promotion_target=2)
-    for page in (1, 2):
-        module.record_supplement_decision(
-            audit=audit,
-            record=_decision(
-                locator=f"page:{page}", decision="PROMOTE_FOUNDATIONAL"
-            ),
-        )
+    core, audit, core_seal = _terminal_audits(tmp_path)
     sealed = module._supplement_sealed_directory(audit)
     original_replace = module.os.replace
     with monkeypatch.context() as context:
@@ -672,7 +767,8 @@ def test_supplement_seal_publish_failure_leaves_no_partial_artifact(
         ):
             module.seal_supplement_proposal(
                 audit=audit,
-                core_binding_sha256="c" * 64,
+                core_audit=core,
+                core_binding_sha256=core_seal.binding_sha256,
             )
 
     assert not sealed.exists()
@@ -680,7 +776,8 @@ def test_supplement_seal_publish_failure_leaves_no_partial_artifact(
     assert module.os.replace is original_replace
     result = module.seal_supplement_proposal(
         audit=audit,
-        core_binding_sha256="c" * 64,
+        core_audit=core,
+        core_binding_sha256=core_seal.binding_sha256,
     )
     assert result.binding_sha256
     audit.close()
@@ -754,6 +851,8 @@ def test_cli_seal_verify_and_combined_capacity_are_aggregate_only(
             [
                 "seal",
                 *common,
+                "--core-audit-id",
+                "foundational-locator-audit-v1",
                 "--core-binding-sha256",
                 core_seal.binding_sha256,
             ]
@@ -770,6 +869,8 @@ def test_cli_seal_verify_and_combined_capacity_are_aggregate_only(
             [
                 "verify",
                 *common,
+                "--core-audit-id",
+                "foundational-locator-audit-v1",
                 "--expected-binding-sha256",
                 supplement_seal.binding_sha256,
                 "--expected-core-binding-sha256",
