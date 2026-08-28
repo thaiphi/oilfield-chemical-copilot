@@ -1531,6 +1531,62 @@ def test_mapping_cli_uses_one_sqlite_path_and_closes_every_opened_store(
     assert capsys.readouterr().err == ""
 
 
+@pytest.mark.parametrize("operation_fails", [False, True])
+def test_mapping_cli_attempts_every_close_and_sanitizes_close_failures(
+    trust_chain: _TrustChain,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    operation_fails: bool,
+) -> None:
+    import eval.apply_e1a4_role_corrections as runner
+
+    closed: list[str] = []
+    real_store_close = runner.ReconciliationStore.close
+    real_core_close = runner.FoundationalAuditStore.close
+    real_supplement_close = runner.IronSulfideSupplementAuditStore.close
+
+    def close_store(instance: object) -> None:
+        closed.append("store")
+        real_store_close(instance)  # type: ignore[arg-type]
+        raise RuntimeError("private store close detail")
+
+    def close_core(instance: object) -> None:
+        closed.append("core")
+        real_core_close(instance)  # type: ignore[arg-type]
+        raise RuntimeError("private core close detail")
+
+    def close_supplement(instance: object) -> None:
+        closed.append("supplement")
+        real_supplement_close(instance)  # type: ignore[arg-type]
+        raise RuntimeError("private supplement close detail")
+
+    monkeypatch.setattr(runner.ReconciliationStore, "close", close_store)
+    monkeypatch.setattr(runner.FoundationalAuditStore, "close", close_core)
+    monkeypatch.setattr(
+        runner.IronSulfideSupplementAuditStore, "close", close_supplement
+    )
+    if operation_fails:
+        monkeypatch.setattr(
+            runner,
+            "seal_e1a4_role_mapping",
+            lambda **_kwargs: (_ for _ in ()).throw(
+                runner.E1A4MappingApplicationError(
+                    "E1A4_MAPPING_AUTHENTICATION_FAILED"
+                )
+            ),
+        )
+
+    assert runner.cli(_mapping_runner_args(trust_chain, "apply")) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert json.loads(captured.err) == {
+        "status": "E1A4_ROLE_MAPPING_BLOCKED",
+        "error_code": "E1A4_ROLE_MAPPING_CLOSE_FAILED",
+    }
+    assert closed == ["supplement", "core", "store"]
+    assert "private" not in captured.err
+
+
 @pytest.mark.parametrize("mode", ["malformed", "unexpected"])
 def test_mapping_cli_sanitizes_failures_without_private_values(
     trust_chain: _TrustChain,

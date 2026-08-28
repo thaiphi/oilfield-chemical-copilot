@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import suppress
 from dataclasses import dataclass
+import errno
 import hashlib
 import json
 import os
@@ -44,6 +44,7 @@ from oilfield_chemical_copilot.evaluation.foundational_locator_audit import (  #
 )
 from oilfield_chemical_copilot.evaluation.index_preflight import (  # noqa: E402
     E1IndexPreflightError,
+    IndexFingerprint,
     verify_e1_index_contract,
 )
 from oilfield_chemical_copilot.evaluation.iron_sulfide_supplement_audit import (  # noqa: E402
@@ -64,12 +65,30 @@ _EXPECTED_PATHS = frozenset(
         f"manifests/{ALLOCATION_NAME.removesuffix('.json')}.sha256",
     }
 )
+_MAPPING_BINDING_FIELDS = frozenset(
+    {
+        "schema_version",
+        "reconciliation_run_id",
+        "reconciliation_binding_sha256",
+        "core_binding_sha256",
+        "supplement_binding_sha256",
+        "e1a3_allocation_sha256",
+        "mapping_payload_sha256",
+        "source_record_count",
+        "unique_locator_count",
+        "stratum_locator_counts",
+        "allocator_available",
+        "allocator_slot_count",
+        "e1a3_excluded_before_allocation",
+    }
+)
 _SAFE_CODES = frozenset(
     {
         "E1A4_SAMPLING_FRAME_ARGUMENT_INVALID",
         "E1A4_SAMPLING_FRAME_PREFLIGHT_FAILED",
         "E1A4_SAMPLING_FRAME_MAPPING_UNTRUSTED",
         "E1A4_SAMPLING_FRAME_MAPPING_INVALID",
+        "E1A4_SAMPLING_FRAME_CLOSE_FAILED",
         "E1A4_SAMPLING_FRAME_INDEX_UNTRUSTED",
         "E1A4_SAMPLING_FRAME_E1A3_UNTRUSTED",
         "E1A4_SAMPLING_FRAME_E1A3_REUSE",
@@ -223,6 +242,19 @@ def _mapping_kwargs(values: Mapping[str, object]) -> dict[str, object]:
     }
 
 
+def _close_mapping_stores(*connections: object | None) -> None:
+    close_failed = False
+    for connection in connections:
+        if connection is None:
+            continue
+        try:
+            connection.close()  # type: ignore[attr-defined]
+        except Exception:
+            close_failed = True
+    if close_failed:
+        _fail("E1A4_SAMPLING_FRAME_CLOSE_FAILED")
+
+
 def _verify_mapping_trust(**values: object) -> object:
     root = Path(values["reconciliation_root"]).resolve()
     database_path = (root / "reconciliation.sqlite").resolve()
@@ -262,39 +294,65 @@ def _verify_mapping_trust(**values: object) -> object:
     ):
         _fail("E1A4_SAMPLING_FRAME_MAPPING_UNTRUSTED")
     finally:
-        for connection in (supplement, core, store):
-            if connection is not None:
-                with suppress(Exception):
-                    connection.close()
+        _close_mapping_stores(supplement, core, store)
 
 
-def _mapping_payload(seal: object) -> tuple[object, ...]:
+def _mapping_payload(
+    seal: object, *, expected_mapping_binding_sha256: str
+) -> tuple[object, ...]:
     try:
         artifacts = getattr(seal, "artifacts")
-        artifact = next(
+        mapping_artifact = next(
             item
             for item in artifacts
             if item.name == "role-mapping.v1.json"
         )
-        content = artifact.path.read_bytes()
-        if hashlib.sha256(content).hexdigest() != _digest(
-            artifact.sha256, "E1A4_SAMPLING_FRAME_MAPPING_INVALID"
+        binding_artifact = next(
+            item
+            for item in artifacts
+            if item.name == "mapping-binding.v1.json"
+        )
+        mapping_content = mapping_artifact.path.read_bytes()
+        binding_content = binding_artifact.path.read_bytes()
+        binding_digest = hashlib.sha256(binding_content).hexdigest()
+        if binding_digest != _digest(
+            expected_mapping_binding_sha256,
+            "E1A4_SAMPLING_FRAME_MAPPING_INVALID",
+        ) or binding_digest != _digest(
+            binding_artifact.sha256,
+            "E1A4_SAMPLING_FRAME_MAPPING_INVALID",
         ):
             _fail("E1A4_SAMPLING_FRAME_MAPPING_INVALID")
-        payload = json.loads(content)
+        binding = json.loads(binding_content)
+        if (
+            not isinstance(binding, dict)
+            or set(binding) != _MAPPING_BINDING_FIELDS
+            or type(binding["schema_version"]) is not int
+            or binding["schema_version"] != 1
+            or _canonical(binding) != binding_content
+            or _digest(
+                binding["mapping_payload_sha256"],
+                "E1A4_SAMPLING_FRAME_MAPPING_INVALID",
+            )
+            != hashlib.sha256(mapping_content).hexdigest()
+        ):
+            _fail("E1A4_SAMPLING_FRAME_MAPPING_INVALID")
+        payload = json.loads(mapping_content)
         if (
             not isinstance(payload, dict)
             or set(payload) != {"schema_version", "sources"}
             or type(payload["schema_version"]) is not int
             or payload["schema_version"] != 1
             or not isinstance(payload["sources"], list)
-            or _canonical(payload) != content
+            or _canonical(payload) != mapping_content
         ):
             _fail("E1A4_SAMPLING_FRAME_MAPPING_INVALID")
         sources = validate_mapping_sources(payload["sources"])
         if (
-            type(artifact.record_count) is not int
-            or len(sources) != artifact.record_count
+            type(binding["source_record_count"]) is not int
+            or len(sources) != binding["source_record_count"]
+            or type(mapping_artifact.record_count) is not int
+            or len(sources) != mapping_artifact.record_count
         ):
             _fail("E1A4_SAMPLING_FRAME_MAPPING_INVALID")
         return sources
@@ -306,6 +364,53 @@ def _mapping_payload(seal: object) -> tuple[object, ...]:
 
 def _frame_directory(output_root: Path) -> Path:
     return output_root / "e1a4" / "sampling-frame" / "v1"
+
+
+def _index_fingerprint_from_bytes(content: bytes) -> IndexFingerprint:
+    try:
+        payload = json.loads(content.decode("utf-8"))
+        if not isinstance(payload, dict) or set(payload) != {
+            "chunk_count",
+            "distinct_source_count",
+            "embedding_models",
+            "embedding_dimensions",
+            "inventory_sha256",
+        }:
+            _fail("E1A4_SAMPLING_FRAME_INDEX_UNTRUSTED")
+        chunk_count = payload["chunk_count"]
+        source_count = payload["distinct_source_count"]
+        models = payload["embedding_models"]
+        dimensions = payload["embedding_dimensions"]
+        inventory_digest = payload["inventory_sha256"]
+        if (
+            type(chunk_count) is not int
+            or chunk_count < 1
+            or type(source_count) is not int
+            or source_count < 1
+            or not isinstance(models, list)
+            or not models
+            or any(not isinstance(model, str) or not model for model in models)
+            or not isinstance(dimensions, list)
+            or not dimensions
+            or any(
+                type(dimension) is not int or dimension < 1
+                for dimension in dimensions
+            )
+            or not isinstance(inventory_digest, str)
+            or len(inventory_digest) != 64
+        ):
+            _fail("E1A4_SAMPLING_FRAME_INDEX_UNTRUSTED")
+        return IndexFingerprint(
+            chunk_count=chunk_count,
+            distinct_source_count=source_count,
+            embedding_models=tuple(models),
+            embedding_dimensions=tuple(dimensions),
+            inventory_sha256=inventory_digest,
+        )
+    except E1A4SamplingFrameError:
+        raise
+    except (KeyError, TypeError, UnicodeError, json.JSONDecodeError):
+        _fail("E1A4_SAMPLING_FRAME_INDEX_UNTRUSTED")
 
 
 def _expected_frame(**values: object) -> tuple[dict[str, object], dict[str, object]]:
@@ -324,18 +429,25 @@ def _expected_frame(**values: object) -> tuple[dict[str, object], dict[str, obje
     contract_path = Path(values["index_contract_path"])
     try:
         contract_before = contract_path.read_bytes()
-        verify_e1_index_contract(
+        verified_fingerprint = verify_e1_index_contract(
             database_url=str(values["database_url"]),
             contract_path=contract_path,
         )
         contract_after = contract_path.read_bytes()
     except (E1IndexPreflightError, OSError, TypeError, ValueError):
         _fail("E1A4_SAMPLING_FRAME_INDEX_UNTRUSTED")
-    if contract_before != contract_after:
+    if (
+        contract_before != contract_after
+        or _index_fingerprint_from_bytes(contract_after)
+        != verified_fingerprint
+    ):
         _fail("E1A4_SAMPLING_FRAME_INDEX_UNTRUSTED")
     index_contract_digest = hashlib.sha256(contract_after).hexdigest()
 
-    sources = _mapping_payload(mapping_seal)
+    sources = _mapping_payload(
+        mapping_seal,
+        expected_mapping_binding_sha256=expected_mapping_binding,
+    )
     try:
         prior = load_e1a3_prior_allocation(
             payload_path=Path(values["e1a3_allocation_path"]),
@@ -440,6 +552,61 @@ def _manifest_name(payload_name: str) -> str:
     return f"{payload_name.removesuffix('.json')}.sha256"
 
 
+def _rename_no_replace(staged: Path, final: Path) -> None:
+    """Atomically publish one directory and fail if the destination exists."""
+    if os.name == "nt":
+        os.rename(staged, final)
+        return
+
+    import ctypes
+
+    library = ctypes.CDLL(None, use_errno=True)
+    source = os.fsencode(staged)
+    destination = os.fsencode(final)
+    if sys.platform.startswith("linux"):
+        renameat2 = getattr(library, "renameat2", None)
+        if renameat2 is None:
+            raise OSError(errno.ENOTSUP, "exclusive rename unavailable")
+        renameat2.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        renameat2.restype = ctypes.c_int
+        result = renameat2(-100, source, -100, destination, 1)
+    elif sys.platform == "darwin":
+        renamex_np = getattr(library, "renamex_np", None)
+        if renamex_np is None:
+            raise OSError(errno.ENOTSUP, "exclusive rename unavailable")
+        renamex_np.argtypes = (
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        renamex_np.restype = ctypes.c_int
+        result = renamex_np(source, destination, 0x00000004)
+    else:
+        raise OSError(errno.ENOTSUP, "exclusive rename unavailable")
+    if result != 0:
+        error_number = ctypes.get_errno()
+        if error_number == errno.EEXIST:
+            raise FileExistsError(error_number, os.strerror(error_number), final)
+        raise OSError(error_number, os.strerror(error_number), final)
+
+
+def _remove_owned_publication(final: Path, identity: os.stat_result | None) -> None:
+    if identity is None:
+        return
+    try:
+        current = final.stat()
+    except OSError:
+        return
+    if os.path.samestat(identity, current):
+        shutil.rmtree(final, ignore_errors=True)
+
+
 def verify_sampling_frame(
     *,
     source_register: Mapping[str, object],
@@ -513,13 +680,9 @@ def _publish_sampling_frame(
         )
     parent = final.parent
     staged: Path | None = None
-    published = False
+    published_identity: os.stat_result | None = None
     try:
         parent.mkdir(parents=True, exist_ok=True)
-        for stale in parent.glob(".v1.*.tmp"):
-            shutil.rmtree(stale)
-        if tuple(parent.glob(".v1.*.tmp")):
-            _fail("E1A4_SAMPLING_FRAME_WRITE_FAILED")
         staged = Path(mkdtemp(prefix=".v1.", suffix=".tmp", dir=parent))
         (staged / "sealed").mkdir()
         (staged / "manifests").mkdir()
@@ -542,8 +705,8 @@ def _publish_sampling_frame(
                     stream.write(value)
                     stream.flush()
                     os.fsync(stream.fileno())
-        os.replace(staged, final)
-        published = True
+        published_identity = staged.stat()
+        _rename_no_replace(staged, final)
         staged = None
         return verify_sampling_frame(
             source_register=source_register,
@@ -551,14 +714,12 @@ def _publish_sampling_frame(
             output_root=output_root,
         )
     except E1A4SamplingFrameError:
-        if published and final.exists():
-            shutil.rmtree(final, ignore_errors=True)
+        _remove_owned_publication(final, published_identity)
         if staged is not None and staged.exists():
             shutil.rmtree(staged, ignore_errors=True)
         raise
     except Exception as error:
-        if published and final.exists():
-            shutil.rmtree(final, ignore_errors=True)
+        _remove_owned_publication(final, published_identity)
         if staged is not None and staged.exists():
             shutil.rmtree(staged, ignore_errors=True)
         raise E1A4SamplingFrameError(

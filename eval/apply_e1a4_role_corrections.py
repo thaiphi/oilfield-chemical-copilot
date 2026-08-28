@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import suppress
 import json
 from pathlib import Path
 import sys
@@ -102,6 +101,21 @@ def _source_record_count(seal: object) -> int:
     return count
 
 
+def _close_stores(*connections: object | None) -> None:
+    close_failed = False
+    for connection in connections:
+        if connection is None:
+            continue
+        try:
+            connection.close()  # type: ignore[attr-defined]
+        except Exception:
+            close_failed = True
+    if close_failed:
+        raise E1A4MappingApplicationError(
+            "E1A4_ROLE_MAPPING_CLOSE_FAILED"
+        )
+
+
 def _operate(args: argparse.Namespace) -> dict[str, object]:
     root = args.reconciliation_root.resolve()
     database_path = (root / "reconciliation.sqlite").resolve()
@@ -166,15 +180,15 @@ def _operate(args: argparse.Namespace) -> dict[str, object]:
             "allocator_slot_count": 96,
         }
     finally:
-        for connection in (supplement, core, store):
-            if connection is not None:
-                with suppress(Exception):
-                    connection.close()
+        _close_stores(supplement, core, store)
 
 
 def _safe_code(error: Exception) -> str:
     value = str(error)
-    if value == "E1A4_ROLE_MAPPING_ARGUMENT_INVALID":
+    if value in {
+        "E1A4_ROLE_MAPPING_ARGUMENT_INVALID",
+        "E1A4_ROLE_MAPPING_CLOSE_FAILED",
+    }:
         return value
     if isinstance(error, E1A4MappingApplicationError) and value in _MAPPING_CODES:
         return value

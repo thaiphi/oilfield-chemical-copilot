@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -17,6 +18,7 @@ from oilfield_chemical_copilot.evaluation.e1a4_sampling import (
     mapping_sources_as_sampling_metadata,
     validate_mapping_sources,
 )
+from oilfield_chemical_copilot.evaluation.index_preflight import IndexFingerprint
 
 
 def _mapped(
@@ -221,31 +223,87 @@ def _frame_mapping_sources() -> list[dict[str, object]]:
     return sources
 
 
-def _fake_mapping_seal(tmp_path: Path) -> tuple[object, str]:
+def _mapping_fixture_bytes() -> tuple[bytes, bytes]:
     mapping = {
         "schema_version": 1,
         "sources": _frame_mapping_sources(),
     }
-    path = tmp_path / "role-mapping.v1.json"
-    content = (
+    mapping_content = (
         json.dumps(mapping, sort_keys=True, separators=(",", ":")) + "\n"
     ).encode()
-    path.write_bytes(content)
-    binding = "b" * 64
+    binding = {
+        "schema_version": 1,
+        "reconciliation_run_id": "synthetic-run",
+        "reconciliation_binding_sha256": "1" * 64,
+        "core_binding_sha256": "2" * 64,
+        "supplement_binding_sha256": "3" * 64,
+        "e1a3_allocation_sha256": "c" * 64,
+        "mapping_payload_sha256": sha256(mapping_content).hexdigest(),
+        "source_record_count": 10,
+        "unique_locator_count": 98,
+        "stratum_locator_counts": {
+            "iron_sulfide:foundational": 13,
+            "iron_sulfide:supporting": 13,
+            "scale:foundational": 12,
+            "scale:supporting": 12,
+            "corrosion:foundational": 12,
+            "corrosion:supporting": 12,
+            "paraffin:foundational": 12,
+            "paraffin:supporting": 12,
+        },
+        "allocator_available": True,
+        "allocator_slot_count": 96,
+        "e1a3_excluded_before_allocation": True,
+    }
+    binding_content = (
+        json.dumps(binding, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode()
+    return mapping_content, binding_content
+
+
+def _fake_mapping_seal(tmp_path: Path) -> tuple[object, str]:
+    mapping_content, binding_content = _mapping_fixture_bytes()
+    mapping_path = tmp_path / "role-mapping.v1.json"
+    binding_path = tmp_path / "mapping-binding.v1.json"
+    mapping_path.write_bytes(mapping_content)
+    binding_path.write_bytes(binding_content)
+    binding = sha256(binding_content).hexdigest()
     return (
         SimpleNamespace(
             artifacts=(
                 SimpleNamespace(
                     name="role-mapping.v1.json",
-                    path=path,
-                    sha256=sha256(content).hexdigest(),
+                    path=mapping_path,
+                    sha256=sha256(mapping_content).hexdigest(),
                     record_count=10,
+                ),
+                SimpleNamespace(
+                    name="mapping-binding.v1.json",
+                    path=binding_path,
+                    sha256=binding,
+                    record_count=1,
                 ),
             ),
             binding_sha256=binding,
         ),
         binding,
     )
+
+
+def _index_fingerprint(inventory_sha256: str = "d" * 64) -> IndexFingerprint:
+    return IndexFingerprint(
+        chunk_count=98,
+        distinct_source_count=10,
+        embedding_models=("synthetic-model",),
+        embedding_dimensions=(3,),
+        inventory_sha256=inventory_sha256,
+    )
+
+
+def _index_contract_bytes(fingerprint: IndexFingerprint) -> bytes:
+    return (
+        json.dumps(fingerprint.to_mapping(), sort_keys=True) + "\n"
+    ).encode()
 
 
 def _fake_prior() -> SimpleNamespace:
@@ -260,6 +318,7 @@ def _fake_prior() -> SimpleNamespace:
 
 
 def _frame_kwargs(tmp_path: Path) -> dict[str, object]:
+    _, binding_content = _mapping_fixture_bytes()
     return {
         "reconciliation_root": tmp_path / ".private" / "corpus-reconciliation" / "v1",
         "run_id": "synthetic-run",
@@ -269,7 +328,7 @@ def _frame_kwargs(tmp_path: Path) -> dict[str, object]:
         "expected_core_binding_sha256": "2" * 64,
         "expected_supplement_binding_sha256": "3" * 64,
         "mapping_root": tmp_path / "mapping",
-        "expected_mapping_binding_sha256": "b" * 64,
+        "expected_mapping_binding_sha256": sha256(binding_content).hexdigest(),
         "e1a3_allocation_path": tmp_path / "e1a3" / "allocation.json",
         "e1a3_allocation_manifest_path": tmp_path / "e1a3" / "allocation.sha256",
         "e1a3_private_root": tmp_path / "e1a3",
@@ -328,7 +387,7 @@ def _patch_frame_trust(
     monkeypatch.setattr(
         runner,
         "verify_e1_index_contract",
-        lambda **_kwargs: order.append("index") or SimpleNamespace(),
+        lambda **_kwargs: order.append("index") or _index_fingerprint(),
     )
     monkeypatch.setattr(
         runner,
@@ -364,7 +423,9 @@ def _patch_frame_trust(
     for path in presence:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.touch()
-    Path(kwargs["index_contract_path"]).write_text("synthetic-contract\n")
+    Path(kwargs["index_contract_path"]).write_bytes(
+        _index_contract_bytes(_index_fingerprint())
+    )
     return order
 
 
@@ -404,6 +465,113 @@ def test_frame_sealer_authenticates_in_order_and_publishes_exact_frame(
             for item in allocation["allocations"]
         }
     ) == 96
+
+
+def test_public_frame_rejects_mapping_swapped_after_trust_verification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import eval.seal_e1a4_sampling_frame as runner
+
+    _patch_frame_trust(runner, tmp_path, monkeypatch)
+    seal, _ = _fake_mapping_seal(tmp_path)
+    mapping_artifact = next(
+        artifact
+        for artifact in seal.artifacts
+        if artifact.name == "role-mapping.v1.json"
+    )
+    payload = json.loads(mapping_artifact.path.read_text())
+    payload["sources"][0]["parser_type"] = "swapped-parser"
+    swapped = (
+        json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode()
+
+    def verify_then_swap(**_kwargs: object) -> object:
+        mapping_artifact.path.write_bytes(swapped)
+        mapping_artifact.sha256 = sha256(swapped).hexdigest()
+        return seal
+
+    monkeypatch.setattr(runner, "_verify_mapping_trust", verify_then_swap)
+
+    with pytest.raises(
+        runner.E1A4SamplingFrameError,
+        match="E1A4_SAMPLING_FRAME_MAPPING_INVALID",
+    ):
+        runner.seal_sampling_frame(**_frame_kwargs(tmp_path))
+    assert not (tmp_path / "output" / "e1a4" / "sampling-frame" / "v1").exists()
+
+
+def test_public_frame_allocator_is_called_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import eval.seal_e1a4_sampling_frame as runner
+
+    _patch_frame_trust(runner, tmp_path, monkeypatch)
+    real_allocate = runner.allocate_sampling_slots
+    calls = 0
+
+    def allocate_once(**kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        return real_allocate(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(runner, "allocate_sampling_slots", allocate_once)
+
+    result = runner.seal_sampling_frame(**_frame_kwargs(tmp_path))
+
+    assert result.slot_count == 96
+    assert calls == 1
+
+
+@pytest.mark.parametrize("mutation", ["short", "duplicate", "coverage"])
+def test_public_frame_rejects_malformed_allocator_results(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    import eval.seal_e1a4_sampling_frame as runner
+
+    _patch_frame_trust(runner, tmp_path, monkeypatch)
+    valid = runner.allocate_sampling_slots(
+        slots=build_sampling_slots(),
+        sources=runner.mapping_sources_as_sampling_metadata(
+            runner.validate_mapping_sources(_frame_mapping_sources())
+        ),
+    )
+    calls = 0
+
+    def malformed(**_kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        if mutation == "short":
+            return valid[:-1]
+        if mutation == "duplicate":
+            return (
+                valid[0],
+                replace(
+                    valid[1],
+                    source_id=valid[0].source_id,
+                    locator=valid[0].locator,
+                ),
+                *valid[2:],
+            )
+        return tuple(
+            replace(
+                item,
+                topic="iron_sulfide",
+                source_role="foundational",
+            )
+            for item in valid
+        )
+
+    monkeypatch.setattr(runner, "allocate_sampling_slots", malformed)
+
+    with pytest.raises(
+        runner.E1A4SamplingFrameError,
+        match="E1A4_SAMPLING_FRAME_ALLOCATION_INVALID",
+    ):
+        runner.seal_sampling_frame(**_frame_kwargs(tmp_path))
+    assert calls == 1
+    assert not (tmp_path / "output" / "e1a4" / "sampling-frame" / "v1").exists()
 
 
 def test_frame_verification_recomputes_exact_bytes_without_writing(
@@ -510,6 +678,35 @@ def test_frame_rejects_altered_index_contract_before_allocation(
     assert calls == 1
 
 
+def test_frame_rejects_index_contract_a_to_b_to_a_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import eval.seal_e1a4_sampling_frame as runner
+
+    _patch_frame_trust(runner, tmp_path, monkeypatch)
+    contract_path = Path(_frame_kwargs(tmp_path)["index_contract_path"])
+    original = contract_path.read_bytes()
+    verified_fingerprint = _index_fingerprint("e" * 64)
+
+    def verify_different_fingerprint(**_kwargs: object) -> IndexFingerprint:
+        contract_path.write_bytes(
+            _index_contract_bytes(verified_fingerprint)
+        )
+        contract_path.write_bytes(original)
+        return verified_fingerprint
+
+    monkeypatch.setattr(
+        runner, "verify_e1_index_contract", verify_different_fingerprint
+    )
+
+    with pytest.raises(
+        runner.E1A4SamplingFrameError,
+        match="E1A4_SAMPLING_FRAME_INDEX_UNTRUSTED",
+    ):
+        runner.seal_sampling_frame(**_frame_kwargs(tmp_path))
+    assert not (tmp_path / "output" / "e1a4" / "sampling-frame" / "v1").exists()
+
+
 def test_frame_publication_failure_leaves_no_final_or_staging_directory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -517,8 +714,8 @@ def test_frame_publication_failure_leaves_no_final_or_staging_directory(
 
     _patch_frame_trust(runner, tmp_path, monkeypatch)
     monkeypatch.setattr(
-        runner.os,
-        "replace",
+        runner,
+        "_rename_no_replace",
         lambda *_args: (_ for _ in ()).throw(OSError("private path")),
     )
 
@@ -529,6 +726,37 @@ def test_frame_publication_failure_leaves_no_final_or_staging_directory(
         runner.seal_sampling_frame(**_frame_kwargs(tmp_path))
     parent = tmp_path / "output" / "e1a4" / "sampling-frame"
     assert not (parent / "v1").exists()
+    assert not tuple(parent.glob(".v1.*.tmp"))
+
+
+def test_frame_publication_race_preserves_concurrent_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import eval.seal_e1a4_sampling_frame as runner
+
+    _patch_frame_trust(runner, tmp_path, monkeypatch)
+    parent = tmp_path / "output" / "e1a4" / "sampling-frame"
+    final = parent / "v1"
+
+    def concurrent_publish(_staged: Path, destination: Path) -> None:
+        assert destination == final
+        destination.mkdir()
+        (destination / "concurrent-owner").write_text("preserve me")
+        raise FileExistsError("private concurrent detail")
+
+    monkeypatch.setattr(
+        runner,
+        "_rename_no_replace",
+        concurrent_publish,
+        raising=False,
+    )
+
+    with pytest.raises(
+        runner.E1A4SamplingFrameError,
+        match="E1A4_SAMPLING_FRAME_WRITE_FAILED",
+    ):
+        runner.seal_sampling_frame(**_frame_kwargs(tmp_path))
+    assert (final / "concurrent-owner").read_text() == "preserve me"
     assert not tuple(parent.glob(".v1.*.tmp"))
 
 
@@ -556,6 +784,60 @@ def test_sampling_preflight_checks_presence_without_opening_payloads(
     assert runner.cli(["--preflight"] + _frame_cli_args(tmp_path)) == 0
 
 
+@pytest.mark.parametrize("verification_fails", [False, True])
+def test_frame_mapping_trust_attempts_every_close_and_blocks_on_close_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    verification_fails: bool,
+) -> None:
+    import eval.seal_e1a4_sampling_frame as runner
+
+    seal, _ = _fake_mapping_seal(tmp_path)
+    closed: list[str] = []
+
+    class FailingClose:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def close(self) -> None:
+            closed.append(self.name)
+            raise RuntimeError(f"private close detail {self.name}")
+
+    store = FailingClose("store")
+    core = FailingClose("core")
+    supplement = FailingClose("supplement")
+    monkeypatch.setattr(
+        runner.ReconciliationStore,
+        "open",
+        classmethod(lambda _cls, **_kwargs: store),
+    )
+    monkeypatch.setattr(
+        runner.FoundationalAuditStore,
+        "open",
+        classmethod(lambda _cls, **_kwargs: core),
+    )
+    monkeypatch.setattr(
+        runner.IronSulfideSupplementAuditStore,
+        "open",
+        classmethod(lambda _cls, **_kwargs: supplement),
+    )
+    def verify(**_kwargs: object) -> object:
+        if verification_fails:
+            raise runner.E1A4MappingApplicationError(
+                "E1A4_MAPPING_AUTHENTICATION_FAILED"
+            )
+        return seal
+
+    monkeypatch.setattr(runner, "verify_e1a4_role_mapping", verify)
+
+    with pytest.raises(
+        runner.E1A4SamplingFrameError,
+        match="E1A4_SAMPLING_FRAME_CLOSE_FAILED",
+    ):
+        runner._verify_mapping_trust(**_frame_kwargs(tmp_path))
+    assert closed == ["supplement", "core", "store"]
+
+
 def test_sampling_cli_sanitizes_unexpected_failure_without_private_values(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -578,6 +860,33 @@ def test_sampling_cli_sanitizes_unexpected_failure_without_private_values(
         "error_code": "E1A4_SAMPLING_FRAME_OPERATION_FAILED",
     }
     assert private not in captured.err
+
+
+def test_sampling_cli_sanitizes_store_close_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import eval.seal_e1a4_sampling_frame as runner
+
+    monkeypatch.setattr(runner, "_presence_preflight", lambda _args: None)
+    monkeypatch.setattr(
+        runner,
+        "seal_sampling_frame",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            runner.E1A4SamplingFrameError(
+                "E1A4_SAMPLING_FRAME_CLOSE_FAILED"
+            )
+        ),
+    )
+
+    assert runner.cli(["seal"] + _frame_cli_args(tmp_path)) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert json.loads(captured.err) == {
+        "status": "E1A4_SAMPLING_FRAME_BLOCKED",
+        "error_code": "E1A4_SAMPLING_FRAME_CLOSE_FAILED",
+    }
 
 
 @pytest.mark.parametrize(
