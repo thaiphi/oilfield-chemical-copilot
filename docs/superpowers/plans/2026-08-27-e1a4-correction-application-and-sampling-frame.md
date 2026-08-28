@@ -334,7 +334,7 @@ git commit -m "feat: apply verified e1a4 role corrections"
 - Produces CLI commands `apply`, `verify`, sampling `--preflight`, sampling seal, and sampling verify.
 - Consumes the mapping APIs from Task 2, `verify_e1_index_contract`, and the fixed E1a-3 sampling primitives.
 
-- [ ] **Step 1: Write failing CLI and frame-sealer tests**
+- [x] **Step 1: Write failing CLI and frame-sealer tests**
 
 Assert exact aggregate outputs:
 
@@ -356,7 +356,7 @@ assert frame_output == {
 
 Add tests that stdout/stderr never expose paths, IDs, locators, or hashes; preflight opens no private payload; malformed arguments and unexpected exceptions become fixed safe codes; mapping verification occurs before index access; an altered index contract blocks; mixed-role records survive into the source register; E1a-3 locators cannot enter allocations; and a publication failure leaves no `sampling-frame/v1` directory or staging directory.
 
-- [ ] **Step 2: Run Task 3 tests and verify RED**
+- [x] **Step 2: Run Task 3 tests and verify RED**
 
 ```powershell
 python -m pytest tests/evaluation/test_e1a4_mapping_application.py tests/evaluation/test_e1a4_sampling.py -k "cli or frame or preflight" -q
@@ -364,11 +364,11 @@ python -m pytest tests/evaluation/test_e1a4_mapping_application.py tests/evaluat
 
 Expected: failures because the runner files do not exist.
 
-- [ ] **Step 3: Implement the mapping runner**
+- [x] **Step 3: Implement the mapping runner**
 
 `eval/apply_e1a4_role_corrections.py` must accept explicit reconciliation root, run/audit IDs, expected reconciliation/core/supplement bindings, E1a-3 allocation paths/root, and `apply|verify`. It opens all stores from the same SQLite path, calls only Task 2 APIs, closes every connection, and prints aggregate JSON. It sanitizes every known or unexpected failure.
 
-- [ ] **Step 4: Implement the standalone sampling-frame runner**
+- [x] **Step 4: Implement the standalone sampling-frame runner**
 
 `eval/seal_e1a4_sampling_frame.py` must not import or load the E1a-3 role configuration. It accepts explicit mapping/reconciliation trust anchors, E1a-3 allocation paths, database URL, and index contract.
 
@@ -384,7 +384,7 @@ e1a4/sampling-frame/v1/
 
 The source register binds `mapping_binding_sha256`, `index_contract_sha256`, and `e1a3_allocation_sha256`. The allocation binds the source-register and E1a-3 allocation digests. Stage the complete `v1` directory beside its final path, fsync all files, rename once, then independently verify exact file set and current expected bytes.
 
-- [ ] **Step 5: Run Task 3 tests, focused regressions, and Ruff**
+- [x] **Step 5: Run Task 3 tests, focused regressions, and Ruff**
 
 ```powershell
 python -m pytest tests/evaluation/test_e1a4_sampling.py tests/evaluation/test_e1a4_mapping_application.py -q
@@ -395,7 +395,7 @@ git diff --check
 
 Expected: all checks pass.
 
-- [ ] **Step 6: Commit Task 3**
+- [x] **Step 6: Commit Task 3**
 
 ```powershell
 git add -- src/oilfield_chemical_copilot/evaluation/e1a4_sampling.py src/oilfield_chemical_copilot/evaluation/e1a4_mapping_application.py eval/apply_e1a4_role_corrections.py eval/seal_e1a4_sampling_frame.py tests/evaluation/test_e1a4_sampling.py tests/evaluation/test_e1a4_mapping_application.py
