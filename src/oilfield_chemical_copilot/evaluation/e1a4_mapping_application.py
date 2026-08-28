@@ -82,6 +82,18 @@ class E1A4MappingSeal:
 
 
 @dataclass(frozen=True)
+class _InventoryRow:
+    source_id: str
+    locator: str
+    topic: str
+    source_role: str
+    substantive_status: str
+    e1a3_used: int
+    e1a4_available: int
+    parser_type: str
+
+
+@dataclass(frozen=True)
 class _Authenticated:
     run_id: str
     reconciliation_binding: str
@@ -91,6 +103,7 @@ class _Authenticated:
     prior_keys: frozenset[str]
     core_candidates: frozenset[tuple[str, str]]
     supplement_candidates: frozenset[tuple[str, str]]
+    inventory: tuple[_InventoryRow, ...]
     core: tuple[LocatorAuditDecision, ...]
     supplement: tuple[SupplementLocatorDecision, ...]
 
@@ -98,9 +111,20 @@ class _Authenticated:
 def _sealed_decisions(artifacts: object, kind: str) -> tuple[object, ...]:
     try:
         correction = next(item for item in artifacts if item.name.endswith(".jsonl"))
-        lines = correction.path.read_text(encoding="utf-8").splitlines()
+        content = correction.path.read_bytes()
+        if hashlib.sha256(content).hexdigest() != _digest(correction.sha256):
+            _fail("E1A4_MAPPING_AUTHENTICATION_FAILED")
+        if content and not content.endswith(b"\n"):
+            _fail("E1A4_MAPPING_AUTHENTICATION_FAILED")
+        lines = content.decode("utf-8").splitlines()
         parser = LocatorAuditDecision if kind == "core" else SupplementLocatorDecision
-        return tuple(parser.from_mapping(json.loads(line)) for line in lines)
+        decisions = tuple(parser.from_mapping(json.loads(line)) for line in lines)
+        canonical = b"".join(
+            _canonical(decision.to_mapping()) for decision in decisions
+        )
+        if canonical != content or len(decisions) != correction.record_count:
+            _fail("E1A4_MAPPING_AUTHENTICATION_FAILED")
+        return decisions
     except (
         AttributeError,
         FoundationalLocatorAuditError,
@@ -121,12 +145,25 @@ def _authenticate_mapping_inputs(**kwargs: object) -> _Authenticated:
     supplement = kwargs["supplement_audit"]
     if not isinstance(store, ReconciliationStore) or not isinstance(core, FoundationalAuditStore) or not isinstance(supplement, IronSulfideSupplementAuditStore):
         _fail("E1A4_MAPPING_AUTHENTICATION_FAILED")
+    snapshot_started = False
     try:
         expected_reconciliation = _digest(kwargs["expected_reconciliation_binding_sha256"])
         expected_core = _digest(kwargs["expected_core_binding_sha256"])
         expected_supplement = _digest(kwargs["expected_supplement_binding_sha256"])
         if core.database_path.resolve() != supplement.database_path.resolve() or core.database_path.resolve() != (store.root / "reconciliation.sqlite").resolve() or core.run_id != store.run_id or supplement.run_id != store.run_id:
             _fail("E1A4_MAPPING_AUTHENTICATION_FAILED")
+        connections = {
+            id(connection): connection
+            for connection in (
+                store._connection,
+                core._connection,
+                supplement._connection,
+            )
+        }
+        if any(connection.in_transaction for connection in connections.values()):
+            _fail("E1A4_MAPPING_AUTHENTICATION_FAILED")
+        store._connection.execute("begin immediate")
+        snapshot_started = True
         verify_reconciliation_snapshots(root=store.root, store=store, expected_binding_sha256=expected_reconciliation)
         core_snapshot = core._connection.execute(
             "select snapshot_binding_sha256 from foundational_audit_runs where run_id = ? and audit_id = ?",
@@ -173,13 +210,52 @@ def _authenticate_mapping_inputs(**kwargs: object) -> _Authenticated:
         supplement_decisions = _sealed_decisions(
             supplement_seal.artifacts, "supplement"
         )
-        rows = store._connection.execute(
-            """
-            select source_id, locator from index_locators
-            where run_id = ? and e1a3_used = 1
-            """,
-            (store.run_id,),
-        ).fetchall()
+        inventory = tuple(
+            _InventoryRow(
+                source_id=str(row["source_id"]),
+                locator=str(row["locator"]),
+                topic=str(row["topic"]),
+                source_role=str(row["source_role"]),
+                substantive_status=str(row["substantive_status"]),
+                e1a3_used=int(row["e1a3_used"]),
+                e1a4_available=int(row["e1a4_available"]),
+                parser_type=str(row["parser_type"]),
+            )
+            for row in store._connection.execute(
+                """
+                select locator.source_id, locator.locator, locator.topic,
+                       locator.source_role, locator.substantive_status,
+                       locator.e1a3_used, locator.e1a4_available,
+                       source.parser_type
+                from index_locators locator join index_sources source
+                  on source.run_id = locator.run_id
+                 and source.source_id = locator.source_id
+                where locator.run_id = ?
+                order by locator.source_id, locator.locator
+                """,
+                (store.run_id,),
+            ).fetchall()
+        )
+        e1a3_keys = frozenset(
+            f"{row.source_id}:{row.locator}"
+            for row in inventory
+            if row.e1a3_used == 1
+        )
+        if e1a3_keys != prior.locator_keys:
+            _fail("E1A4_MAPPING_E1A3_EXCLUSION_MISMATCH")
+        authenticated = _Authenticated(
+            run_id=store.run_id,
+            reconciliation_binding=expected_reconciliation,
+            core_binding=core_seal.binding_sha256,
+            supplement_binding=supplement_seal.binding_sha256,
+            prior_digest=prior.payload_sha256,
+            prior_keys=prior.locator_keys,
+            core_candidates=core_candidates,
+            supplement_candidates=supplement_candidates,
+            inventory=inventory,
+            core=core_decisions,  # type: ignore[arg-type]
+            supplement=supplement_decisions,  # type: ignore[arg-type]
+        )
     except E1A4MappingApplicationError:
         raise
     except (
@@ -194,23 +270,13 @@ def _authenticate_mapping_inputs(**kwargs: object) -> _Authenticated:
         ValueError,
     ):
         _fail("E1A4_MAPPING_AUTHENTICATION_FAILED")
-    if frozenset(f"{row['source_id']}:{row['locator']}" for row in rows) != prior.locator_keys:
-        _fail("E1A4_MAPPING_E1A3_EXCLUSION_MISMATCH")
-    return _Authenticated(
-        run_id=store.run_id,
-        reconciliation_binding=expected_reconciliation,
-        core_binding=core_seal.binding_sha256,
-        supplement_binding=supplement_seal.binding_sha256,
-        prior_digest=prior.payload_sha256,
-        prior_keys=prior.locator_keys,
-        core_candidates=core_candidates,
-        supplement_candidates=supplement_candidates,
-        core=core_decisions,  # type: ignore[arg-type]
-        supplement=supplement_decisions,  # type: ignore[arg-type]
-    )
+    finally:
+        if snapshot_started:
+            store._connection.rollback()
+    return authenticated
 
 
-def _project_mapping_sources(auth: _Authenticated, *, store: ReconciliationStore) -> tuple[object, ...]:
+def _project_mapping_sources(auth: _Authenticated) -> tuple[object, ...]:
     if any(
         item.decision not in {"PROMOTE_FOUNDATIONAL", "KEEP_INELIGIBLE"}
         for item in auth.core
@@ -235,36 +301,28 @@ def _project_mapping_sources(auth: _Authenticated, *, store: ReconciliationStore
     supplement_keys = {(item.source_id, item.locator) for item in supplement}
     if any(f"{source_id}:{locator}" in auth.prior_keys for source_id, locator in core_keys | supplement_keys):
         _fail("E1A4_MAPPING_PROMOTION_INVALID")
-    rows = store._connection.execute("""
-        select locator.source_id, locator.locator, locator.topic, locator.source_role,
-               locator.substantive_status, locator.e1a3_used, locator.e1a4_available,
-               source.parser_type
-        from index_locators locator join index_sources source
-        on source.run_id = locator.run_id and source.source_id = locator.source_id
-        where locator.run_id = ? order by locator.source_id, locator.locator
-    """, (store.run_id,)).fetchall()
-    inventory = {(str(row["source_id"]), str(row["locator"])): row for row in rows}
+    inventory = {(row.source_id, row.locator): row for row in auth.inventory}
     for item in core:
         row = inventory.get((item.source_id, item.locator))
-        if row is None or row["source_role"] != "foundational" or row["substantive_status"] != "INELIGIBLE" or row["e1a3_used"] != 0 or item.proposed_topic not in TOPICS:
+        if row is None or row.source_role != "foundational" or row.substantive_status != "INELIGIBLE" or row.e1a3_used != 0 or item.proposed_topic not in TOPICS:
             _fail("E1A4_MAPPING_PROMOTION_INVALID")
     for item in supplement:
         row = inventory.get((item.source_id, item.locator))
-        if row is None or row["source_role"] != "supporting" or row["substantive_status"] != "SUBSTANTIVE" or row["topic"] != "iron_sulfide" or row["e1a3_used"] != 0 or row["e1a4_available"] != 1:
+        if row is None or row.source_role != "supporting" or row.substantive_status != "SUBSTANTIVE" or row.topic != "iron_sulfide" or row.e1a3_used != 0 or row.e1a4_available != 1:
             _fail("E1A4_MAPPING_PROMOTION_INVALID")
     grouped: dict[tuple[str, str, str, str], list[str]] = {}
     promoted = core_keys | supplement_keys
     for key, row in inventory.items():
         if key in promoted:
             continue
-        if row["e1a4_available"] == 1 and row["e1a3_used"] == 0 and row["substantive_status"] == "SUBSTANTIVE":
-            grouped.setdefault((str(row["source_id"]), str(row["topic"]), str(row["source_role"]), str(row["parser_type"])), []).append(str(row["locator"]))
+        if row.e1a4_available == 1 and row.e1a3_used == 0 and row.substantive_status == "SUBSTANTIVE":
+            grouped.setdefault((row.source_id, row.topic, row.source_role, row.parser_type), []).append(row.locator)
     for item in core:
         row = inventory[(item.source_id, item.locator)]
-        grouped.setdefault((item.source_id, str(item.proposed_topic), "foundational", str(row["parser_type"])), []).append(item.locator)
+        grouped.setdefault((item.source_id, str(item.proposed_topic), "foundational", row.parser_type), []).append(item.locator)
     for item in supplement:
         row = inventory[(item.source_id, item.locator)]
-        grouped.setdefault((item.source_id, "iron_sulfide", "foundational", str(row["parser_type"])), []).append(item.locator)
+        grouped.setdefault((item.source_id, "iron_sulfide", "foundational", row.parser_type), []).append(item.locator)
     values = tuple({"source_id": source_id, "topic": topic, "source_role": role, "parser_type": parser, "locators": sorted(set(locators))} for (source_id, topic, role, parser), locators in sorted(grouped.items()))
     try:
         sources = validate_mapping_sources(values)
@@ -307,7 +365,7 @@ def _mapping_binding(*, authenticated: _Authenticated, mapping: Mapping[str, obj
 
 def build_e1a4_role_mapping(*, store: ReconciliationStore, core_audit: FoundationalAuditStore, supplement_audit: IronSulfideSupplementAuditStore, expected_reconciliation_binding_sha256: str, expected_core_binding_sha256: str, expected_supplement_binding_sha256: str, e1a3_allocation_path: Path, e1a3_allocation_manifest_path: Path, e1a3_private_root: Path) -> tuple[dict[str, object], dict[str, object]]:
     authenticated = _authenticate_mapping_inputs(store=store, core_audit=core_audit, supplement_audit=supplement_audit, expected_reconciliation_binding_sha256=expected_reconciliation_binding_sha256, expected_core_binding_sha256=expected_core_binding_sha256, expected_supplement_binding_sha256=expected_supplement_binding_sha256, e1a3_allocation_path=e1a3_allocation_path, e1a3_allocation_manifest_path=e1a3_allocation_manifest_path, e1a3_private_root=e1a3_private_root)
-    mapping = _mapping_payload(_project_mapping_sources(authenticated, store=store))
+    mapping = _mapping_payload(_project_mapping_sources(authenticated))
     return mapping, _mapping_binding(authenticated=authenticated, mapping=mapping)
 
 

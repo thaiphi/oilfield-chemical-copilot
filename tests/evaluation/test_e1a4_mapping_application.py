@@ -5,6 +5,7 @@ import hashlib
 from pathlib import Path
 import json
 import shutil
+import sqlite3
 from tempfile import mkdtemp
 from types import SimpleNamespace
 
@@ -856,6 +857,22 @@ def _authenticated(chain: _TrustChain):
     return module._authenticate_mapping_inputs(**chain.inputs())
 
 
+def _replace_inventory_row(
+    authenticated: object,
+    *,
+    source_id: str,
+    locator: str,
+    **changes: object,
+):
+    rows = tuple(
+        replace(row, **changes)
+        if (row.source_id, row.locator) == (source_id, locator)
+        else row
+        for row in authenticated.inventory  # type: ignore[attr-defined]
+    )
+    return replace(authenticated, inventory=rows)
+
+
 def test_mapping_application_rejects_overlapping_proposal_keys(
     trust_chain: _TrustChain,
 ) -> None:
@@ -878,8 +895,7 @@ def test_mapping_application_rejects_overlapping_proposal_keys(
         match="E1A4_MAPPING_PROMOTION_OVERLAP",
     ):
         module._project_mapping_sources(
-            replace(authenticated, supplement=(supplement_overlap,)),
-            store=trust_chain.store,
+            replace(authenticated, supplement=(supplement_overlap,))
         )
 
 
@@ -891,17 +907,6 @@ def test_mapping_application_rejects_promotion_outside_frozen_candidates(
 
     authenticated = _authenticated(trust_chain)
     if proposal == "core":
-        with trust_chain.store._connection:
-            trust_chain.store._connection.execute(
-                """
-                insert into index_locators(
-                    run_id, source_id, locator, topic, source_role,
-                    substantive_status, e1a3_used, e1a4_available
-                ) values (?, 'core-source', 'page:999', 'unassigned',
-                          'foundational', 'INELIGIBLE', 0, 0)
-                """,
-                (trust_chain.store.run_id,),
-            )
         altered = replace(
             authenticated,
             core=(replace(authenticated.core[0], locator="page:999"),),
@@ -922,7 +927,7 @@ def test_mapping_application_rejects_promotion_outside_frozen_candidates(
         E1A4MappingApplicationError,
         match="E1A4_MAPPING_PROMOTION_INVALID",
     ):
-        module._project_mapping_sources(altered, store=trust_chain.store)
+        module._project_mapping_sources(altered)
 
 
 @pytest.mark.parametrize("mutation", ["role", "status", "topic"])
@@ -939,25 +944,23 @@ def test_mapping_application_enforces_core_pre_application_rules(
             + authenticated.core[1:],
         )
     else:
-        column, value = (
+        field, value = (
             ("source_role", "supporting")
             if mutation == "role"
             else ("substantive_status", "SUBSTANTIVE")
         )
-        with trust_chain.store._connection:
-            trust_chain.store._connection.execute(
-                f"""
-                update index_locators set {column} = ?
-                where run_id = ? and source_id = 'core-source' and locator = 'page:1'
-                """,
-                (value, trust_chain.store.run_id),
-            )
+        authenticated = _replace_inventory_row(
+            authenticated,
+            source_id="core-source",
+            locator="page:1",
+            **{field: value},
+        )
 
     with pytest.raises(
         E1A4MappingApplicationError,
         match="E1A4_MAPPING_PROMOTION_INVALID",
     ):
-        module._project_mapping_sources(authenticated, store=trust_chain.store)
+        module._project_mapping_sources(authenticated)
 
 
 @pytest.mark.parametrize("mutation", ["role", "status", "topic"])
@@ -967,25 +970,23 @@ def test_mapping_application_enforces_supplement_pre_application_rules(
     import oilfield_chemical_copilot.evaluation.e1a4_mapping_application as module
 
     authenticated = _authenticated(trust_chain)
-    column, value = {
+    field, value = {
         "role": ("source_role", "foundational"),
         "status": ("substantive_status", "INELIGIBLE"),
         "topic": ("topic", "scale"),
     }[mutation]
-    with trust_chain.store._connection:
-        trust_chain.store._connection.execute(
-            f"""
-            update index_locators set {column} = ?
-            where run_id = ? and source_id = 'supplement-source' and locator = 'page:1'
-            """,
-            (value, trust_chain.store.run_id),
-        )
+    authenticated = _replace_inventory_row(
+        authenticated,
+        source_id="supplement-source",
+        locator="page:1",
+        **{field: value},
+    )
 
     with pytest.raises(
         E1A4MappingApplicationError,
         match="E1A4_MAPPING_PROMOTION_INVALID",
     ):
-        module._project_mapping_sources(authenticated, store=trust_chain.store)
+        module._project_mapping_sources(authenticated)
 
 
 @pytest.mark.parametrize("proposal", ["core", "supplement"])
@@ -1022,7 +1023,7 @@ def test_mapping_application_rejects_unresolved_proposal_decision(
         E1A4MappingApplicationError,
         match="E1A4_MAPPING_PROPOSAL_UNRESOLVED",
     ):
-        module._project_mapping_sources(altered, store=trust_chain.store)
+        module._project_mapping_sources(altered)
 
 
 @pytest.mark.parametrize(
@@ -1046,20 +1047,18 @@ def test_mapping_application_rejects_each_insufficient_required_stratum(
             )
             + authenticated.core[1:],
         )
-    with trust_chain.store._connection:
-        trust_chain.store._connection.execute(
-            """
-            update index_locators set substantive_status = 'INELIGIBLE'
-            where run_id = ? and source_id = ? and locator = 'fresh:01'
-            """,
-            (trust_chain.store.run_id, _source_id(topic, role)),
-        )
+    authenticated = _replace_inventory_row(
+        authenticated,
+        source_id=_source_id(topic, role),
+        locator="fresh:01",
+        substantive_status="INELIGIBLE",
+    )
 
     with pytest.raises(
         E1A4MappingApplicationError,
         match="E1A4_MAPPING_STRATUM_INSUFFICIENT",
     ):
-        module._project_mapping_sources(authenticated, store=trust_chain.store)
+        module._project_mapping_sources(authenticated)
 
 
 def test_mapping_application_sanitizes_allocator_failure_and_calls_once(
@@ -1255,3 +1254,139 @@ def test_mapping_verification_rejects_sqlite_state_drift_without_rewriting_seal(
             **trust_chain.inputs(),  # type: ignore[arg-type]
         )
     assert _artifact_state(root) == before
+
+
+def _invoke_public_mapping_operation(
+    chain: _TrustChain,
+    operation: str,
+    *,
+    mapping_binding: str | None = None,
+) -> object:
+    if operation == "build":
+        return build_e1a4_role_mapping(**chain.inputs())  # type: ignore[arg-type]
+    if operation == "seal":
+        return seal_e1a4_role_mapping(
+            output_root=chain.output_root,
+            **chain.inputs(),  # type: ignore[arg-type]
+        )
+    assert operation == "verify" and mapping_binding is not None
+    return verify_e1a4_role_mapping(
+        output_root=chain.output_root,
+        expected_mapping_binding_sha256=mapping_binding,
+        **chain.inputs(),  # type: ignore[arg-type]
+    )
+
+
+def _prepare_public_verify(chain: _TrustChain, operation: str) -> str | None:
+    if operation != "verify":
+        return None
+    return seal_e1a4_role_mapping(
+        output_root=chain.output_root,
+        **chain.inputs(),  # type: ignore[arg-type]
+    ).binding_sha256
+
+
+def _swap_verified_correction_file(chain: _TrustChain, proposal: str) -> None:
+    directory = (
+        chain.store.root
+        / (
+            "foundational-locator-audit"
+            if proposal == "core"
+            else "iron-sulfide-supplement-audit"
+        )
+        / "v2"
+        / "sealed"
+    )
+    correction_path = next(directory.glob("*.jsonl"))
+    records = [
+        json.loads(line)
+        for line in correction_path.read_text(encoding="utf-8").splitlines()
+    ]
+    if proposal == "core":
+        records[0].update(
+            {
+                "decision": "KEEP_INELIGIBLE",
+                "proposed_topic": None,
+                "reason_code": "NO_TARGET_TOPIC",
+            }
+        )
+    else:
+        records[0].update(
+            {
+                "decision": "KEEP_SUPPORTING",
+                "reason_code": "CASE_OR_APPLICATION_SPECIFIC",
+            }
+        )
+    correction_path.write_bytes(
+        b"".join(_canonical_json(record) for record in records)
+    )
+
+
+@pytest.mark.parametrize("operation", ["build", "seal", "verify"])
+@pytest.mark.parametrize("proposal", ["core", "supplement"])
+def test_public_mapping_operations_reject_post_verification_correction_swap(
+    trust_chain: _TrustChain,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    proposal: str,
+) -> None:
+    import oilfield_chemical_copilot.evaluation.e1a4_mapping_application as module
+
+    mapping_binding = _prepare_public_verify(trust_chain, operation)
+    real_verify = module.verify_supplement_proposal
+
+    def verify_then_swap(**kwargs: object):
+        result = real_verify(**kwargs)  # type: ignore[arg-type]
+        _swap_verified_correction_file(trust_chain, proposal)
+        return result
+
+    monkeypatch.setattr(module, "verify_supplement_proposal", verify_then_swap)
+    with pytest.raises(
+        E1A4MappingApplicationError,
+        match="E1A4_MAPPING_AUTHENTICATION_FAILED",
+    ):
+        _invoke_public_mapping_operation(
+            trust_chain,
+            operation,
+            mapping_binding=mapping_binding,
+        )
+
+
+@pytest.mark.parametrize("operation", ["build", "seal", "verify"])
+def test_public_mapping_operations_reject_post_verification_sqlite_drift(
+    trust_chain: _TrustChain,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    import oilfield_chemical_copilot.evaluation.e1a4_mapping_application as module
+
+    mapping_binding = _prepare_public_verify(trust_chain, operation)
+    real_verify = module.verify_supplement_proposal
+
+    def verify_then_drift(**kwargs: object):
+        result = real_verify(**kwargs)  # type: ignore[arg-type]
+        with sqlite3.connect(
+            trust_chain.store.root / "reconciliation.sqlite", timeout=0
+        ) as connection:
+            connection.execute(
+                """
+                update index_locators set substantive_status = 'INELIGIBLE'
+                where run_id = ? and source_id = ? and locator = 'fresh:01'
+                """,
+                (
+                    trust_chain.store.run_id,
+                    _source_id("scale", "supporting"),
+                ),
+            )
+        return result
+
+    monkeypatch.setattr(module, "verify_supplement_proposal", verify_then_drift)
+    with pytest.raises(
+        E1A4MappingApplicationError,
+        match="E1A4_MAPPING_AUTHENTICATION_FAILED",
+    ):
+        _invoke_public_mapping_operation(
+            trust_chain,
+            operation,
+            mapping_binding=mapping_binding,
+        )
