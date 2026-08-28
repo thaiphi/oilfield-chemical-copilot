@@ -79,6 +79,10 @@ def test_prior_allocation_requires_manifest_and_exact_96_unique_keys(tmp_path: P
         (lambda payload: payload.update({"extra": "field"}), "E1A4_PRIOR_ALLOCATION_INVALID"),
         (lambda payload: payload.update({"schema_version": True}), "E1A4_PRIOR_ALLOCATION_INVALID"),
         (
+            lambda payload: payload["allocations"][0].pop("parser_type"),
+            "E1A4_PRIOR_ALLOCATION_INVALID",
+        ),
+        (
             lambda payload: payload["allocations"][0].update({"replicate": True}),
             "E1A4_PRIOR_ALLOCATION_INVALID",
         ),
@@ -156,12 +160,13 @@ def test_prior_allocation_rejects_manifest_noncanonical_digest_and_external_path
 def test_mapping_sources_preserve_mixed_roles_for_one_source() -> None:
     sources = validate_mapping_sources(
         (
-            _mapped("source-a", "iron_sulfide", "foundational", ("page:1",)),
             _mapped("source-a", "iron_sulfide", "supporting", ("page:2",)),
+            _mapped("source-a", "iron_sulfide", "foundational", ("page:1",)),
         )
     )
 
     assert {item.source_role for item in sources} == {"foundational", "supporting"}
+    assert tuple(item.source_role for item in sources) == ("foundational", "supporting")
     metadata = mapping_sources_as_sampling_metadata(sources)
     assert {item.source_role for item in metadata} == {"foundational", "supporting"}
     assert {item.eligibility_status for item in metadata} == {"eligible"}
