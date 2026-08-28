@@ -354,7 +354,7 @@ assert frame_output == {
 }
 ```
 
-Add tests that stdout/stderr never expose paths, IDs, locators, or hashes; preflight opens no private payload; malformed arguments and unexpected exceptions become fixed safe codes; mapping verification occurs before index access; an altered index contract blocks; mixed-role records survive into the source register; E1a-3 locators cannot enter allocations; and a publication failure leaves no `sampling-frame/v1` directory or staging directory.
+Add tests that stdout/stderr never expose paths, IDs, locators, or hashes; preflight opens no private payload; malformed arguments and unexpected exceptions become fixed safe codes; mapping verification occurs before index access; an altered index contract blocks; mixed-role records survive into the source register; E1a-3 locators cannot enter allocations; and frame publication is fail-closed: no recursive/path-based deletion occurs, any pre-existing `.v1.*.tmp` staging entry causes a fixed write failure and is preserved, and residue from a failed current publication is preserved and blocks verification/retry until explicit cleanup. Successful publication remains atomic no-replace.
 
 - [x] **Step 2: Run Task 3 tests and verify RED**
 

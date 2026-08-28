@@ -155,8 +155,9 @@ The public output is limited to status, source-record count, eight sufficient st
 ## Recovery And Idempotence
 
 - Mapping decisions already persist in reconciliation SQLite and are not replayed or rewritten.
-- A crash before the atomic rename leaves no visible mapping seal; stale staging directories are removed before retry.
-- A crash before the sampling-frame atomic publish leaves no visible sampling frame.
+- A crash before the mapping atomic rename leaves no visible mapping seal; mapping stale staging directories are removed before retry under the mapping publisher's recovery policy.
+- Sampling-frame publication is fail-closed: the publisher performs no recursive or path-based deletion. Any pre-existing staging entry, or residue from a failed current publication, is preserved for explicit/manual review and blocks verification or retry until explicitly cleaned up.
+- A successful sampling-frame publication is atomic no-replace; a failed publication does not claim a clean state or silently remove frame/staging residue.
 - A complete existing seal is verified and returned; it is never overwritten.
 - A partial, extra-file, stale-manifest, or current-state mismatch blocks the run.
 
