@@ -713,6 +713,7 @@ def test_frame_publication_failure_leaves_no_final_or_staging_directory(
     import eval.seal_e1a4_sampling_frame as runner
 
     _patch_frame_trust(runner, tmp_path, monkeypatch)
+    rename_no_replace = runner._rename_no_replace
     monkeypatch.setattr(
         runner,
         "_rename_no_replace",
@@ -727,6 +728,55 @@ def test_frame_publication_failure_leaves_no_final_or_staging_directory(
     parent = tmp_path / "output" / "e1a4" / "sampling-frame"
     assert not (parent / "v1").exists()
     assert not tuple(parent.glob(".v1.*.tmp"))
+
+    monkeypatch.setattr(runner, "_rename_no_replace", rename_no_replace)
+    sealed = runner.seal_sampling_frame(**_frame_kwargs(tmp_path))
+    assert runner.verify_current_sampling_frame(
+        **_frame_kwargs(tmp_path)
+    ) == sealed
+
+
+def test_frame_retry_removes_abandoned_staging_before_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import eval.seal_e1a4_sampling_frame as runner
+
+    _patch_frame_trust(runner, tmp_path, monkeypatch)
+    parent = tmp_path / "output" / "e1a4" / "sampling-frame"
+    abandoned = parent / ".v1.abandoned.tmp"
+    abandoned.mkdir(parents=True)
+    (abandoned / "sentinel").write_text("synthetic private material")
+
+    sealed = runner.seal_sampling_frame(**_frame_kwargs(tmp_path))
+
+    assert not abandoned.exists()
+    assert not tuple(parent.glob(".v1.*.tmp"))
+    assert runner.verify_current_sampling_frame(
+        **_frame_kwargs(tmp_path)
+    ) == sealed
+
+
+def test_frame_publisher_lock_fails_closed_then_releases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import eval.seal_e1a4_sampling_frame as runner
+
+    _patch_frame_trust(runner, tmp_path, monkeypatch)
+    parent = tmp_path / "output" / "e1a4" / "sampling-frame"
+    parent.mkdir(parents=True)
+
+    with runner._publisher_lock(parent):
+        with pytest.raises(
+            runner.E1A4SamplingFrameError,
+            match="E1A4_SAMPLING_FRAME_WRITE_FAILED",
+        ):
+            runner.seal_sampling_frame(**_frame_kwargs(tmp_path))
+        assert not (parent / "v1").exists()
+
+    sealed = runner.seal_sampling_frame(**_frame_kwargs(tmp_path))
+    assert runner.verify_current_sampling_frame(
+        **_frame_kwargs(tmp_path)
+    ) == sealed
 
 
 def test_frame_publication_race_preserves_concurrent_destination(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from dataclasses import dataclass
 import errno
 import hashlib
@@ -10,9 +11,10 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import sys
 from tempfile import mkdtemp
-from typing import Mapping, Sequence
+from typing import BinaryIO, Iterator, Mapping, Sequence
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -55,6 +57,7 @@ from oilfield_chemical_copilot.evaluation.iron_sulfide_supplement_audit import (
 
 SOURCE_REGISTER_NAME = "source-register.v1.json"
 ALLOCATION_NAME = "sampling-allocation.v1.json"
+_PUBLISH_LOCK_NAME = ".v1.publish.lock"
 _EXPECTED_PATHS = frozenset(
     {
         "sealed",
@@ -596,6 +599,91 @@ def _rename_no_replace(staged: Path, final: Path) -> None:
         raise OSError(error_number, os.strerror(error_number), final)
 
 
+@contextmanager
+def _publisher_lock(parent: Path) -> Iterator[None]:
+    """Hold an OS-released exclusive lock for the whole publication attempt."""
+    stream: BinaryIO | None = None
+    unlock = None
+    try:
+        stream = (parent / _PUBLISH_LOCK_NAME).open("a+b")
+        stream.seek(0, os.SEEK_END)
+        if stream.tell() == 0:
+            stream.write(b"0")
+            stream.flush()
+            os.fsync(stream.fileno())
+        stream.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+
+            def unlock() -> None:
+                assert stream is not None
+                stream.seek(0)
+                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+
+        elif os.name == "posix":
+            import fcntl
+
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+            def unlock() -> None:
+                assert stream is not None
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+        else:
+            raise OSError(errno.ENOTSUP, "publisher lock unavailable")
+    except Exception as error:
+        if stream is not None:
+            try:
+                stream.close()
+            except Exception:
+                pass
+        raise E1A4SamplingFrameError(
+            "E1A4_SAMPLING_FRAME_WRITE_FAILED"
+        ) from error
+
+    try:
+        yield
+    finally:
+        cleanup_error: Exception | None = None
+        try:
+            assert unlock is not None
+            unlock()
+        except Exception as error:
+            cleanup_error = error
+        try:
+            assert stream is not None
+            stream.close()
+        except Exception as error:
+            cleanup_error = cleanup_error or error
+        if cleanup_error is not None:
+            raise E1A4SamplingFrameError(
+                "E1A4_SAMPLING_FRAME_WRITE_FAILED"
+            ) from cleanup_error
+
+
+def _is_staging_name(name: str) -> bool:
+    middle = name.removeprefix(".v1.").removesuffix(".tmp")
+    return name.startswith(".v1.") and name.endswith(".tmp") and bool(middle)
+
+
+def _remove_abandoned_staging(parent: Path) -> None:
+    resolved_parent = parent.resolve(strict=True)
+    for candidate in parent.iterdir():
+        if not _is_staging_name(candidate.name):
+            continue
+        candidate_stat = candidate.lstat()
+        if stat.S_ISLNK(candidate_stat.st_mode):
+            raise OSError(errno.EPERM, "unsafe staging directory")
+        if not stat.S_ISDIR(candidate_stat.st_mode):
+            continue
+        resolved = candidate.resolve(strict=True)
+        if resolved.parent != resolved_parent:
+            raise OSError(errno.EPERM, "unsafe staging directory")
+        shutil.rmtree(resolved)
+
+
 def _remove_owned_publication(final: Path, identity: os.stat_result | None) -> None:
     if identity is None:
         return
@@ -672,47 +760,49 @@ def _publish_sampling_frame(
     output_root: Path,
 ) -> E1A4SamplingFrameSeal:
     final = _frame_directory(output_root)
-    if final.exists():
-        return verify_sampling_frame(
-            source_register=source_register,
-            allocation=allocation,
-            output_root=output_root,
-        )
     parent = final.parent
     staged: Path | None = None
     published_identity: os.stat_result | None = None
     try:
         parent.mkdir(parents=True, exist_ok=True)
-        staged = Path(mkdtemp(prefix=".v1.", suffix=".tmp", dir=parent))
-        (staged / "sealed").mkdir()
-        (staged / "manifests").mkdir()
-        for name, content in (
-            (SOURCE_REGISTER_NAME, _canonical(source_register)),
-            (ALLOCATION_NAME, _canonical(allocation)),
-        ):
-            payload_path = staged / "sealed" / name
-            manifest_path = staged / "manifests" / _manifest_name(name)
-            for path, value in (
-                (payload_path, content),
-                (
-                    manifest_path,
-                    (
-                        hashlib.sha256(content).hexdigest() + "\n"
-                    ).encode("ascii"),
-                ),
+        with _publisher_lock(parent):
+            _remove_abandoned_staging(parent)
+            if final.exists():
+                return verify_sampling_frame(
+                    source_register=source_register,
+                    allocation=allocation,
+                    output_root=output_root,
+                )
+            staged = Path(mkdtemp(prefix=".v1.", suffix=".tmp", dir=parent))
+            (staged / "sealed").mkdir()
+            (staged / "manifests").mkdir()
+            for name, content in (
+                (SOURCE_REGISTER_NAME, _canonical(source_register)),
+                (ALLOCATION_NAME, _canonical(allocation)),
             ):
-                with path.open("xb") as stream:
-                    stream.write(value)
-                    stream.flush()
-                    os.fsync(stream.fileno())
-        published_identity = staged.stat()
-        _rename_no_replace(staged, final)
-        staged = None
-        return verify_sampling_frame(
-            source_register=source_register,
-            allocation=allocation,
-            output_root=output_root,
-        )
+                payload_path = staged / "sealed" / name
+                manifest_path = staged / "manifests" / _manifest_name(name)
+                for path, value in (
+                    (payload_path, content),
+                    (
+                        manifest_path,
+                        (
+                            hashlib.sha256(content).hexdigest() + "\n"
+                        ).encode("ascii"),
+                    ),
+                ):
+                    with path.open("xb") as stream:
+                        stream.write(value)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+            published_identity = staged.stat()
+            _rename_no_replace(staged, final)
+            staged = None
+            return verify_sampling_frame(
+                source_register=source_register,
+                allocation=allocation,
+                output_root=output_root,
+            )
     except E1A4SamplingFrameError:
         _remove_owned_publication(final, published_identity)
         if staged is not None and staged.exists():
