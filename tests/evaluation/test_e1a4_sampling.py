@@ -790,15 +790,30 @@ def test_frame_publisher_lock_fails_closed_then_releases(
 
 
 def _fake_windows_mutex(
-    wait_result: int, on_create: object | None = None
+    wait_result: int,
+    on_create: object | None = None,
+    create_error: Exception | None = None,
 ) -> tuple[SimpleNamespace, list[tuple[object, ...]]]:
     events: list[tuple[object, ...]] = []
 
-    def create_mutex(name: str) -> int:
-        events.append(("create", name))
+    def owner_sid() -> str:
+        events.append(("owner-sid",))
+        return "S-1-5-21-111-222-333-1001"
+
+    def build_security_attributes(policy: str) -> SimpleNamespace:
+        events.append(("build-security", policy))
+        return SimpleNamespace(attributes="secure-attributes", descriptor=77)
+
+    def create_mutex(name: str, attributes: object) -> int:
+        events.append(("create", name, attributes))
         if callable(on_create):
             on_create()
+        if create_error is not None:
+            raise create_error
         return 91
+
+    def free_security_descriptor(security: object) -> None:
+        events.append(("free-security", security))
 
     def wait(handle: int, timeout_ms: int) -> int:
         events.append(("wait", handle, timeout_ms))
@@ -812,7 +827,10 @@ def _fake_windows_mutex(
 
     return (
         SimpleNamespace(
+            owner_sid=owner_sid,
+            build_security_attributes=build_security_attributes,
             create_mutex=create_mutex,
+            free_security_descriptor=free_security_descriptor,
             wait=wait,
             release_mutex=release_mutex,
             close_handle=close_handle,
@@ -851,11 +869,21 @@ def test_windows_mutex_acquired_or_abandoned_never_opens_lock_path(
     with runner._publisher_lock(parent):
         pass
 
-    mutex_name = str(events[0][1])
-    assert mutex_name.startswith("Local\\E1A4SamplingFrame-")
-    assert len(mutex_name.removeprefix("Local\\E1A4SamplingFrame-")) == 64
+    policy = str(events[1][1])
+    assert policy == (
+        "O:S-1-5-21-111-222-333-1001"
+        "D:P"
+        "(A;;0x001F0001;;;S-1-5-21-111-222-333-1001)"
+        "(A;;0x001F0001;;;SY)"
+    )
+    assert "WD" not in policy
+    mutex_name = str(events[2][1])
+    assert mutex_name.startswith("Global\\E1A4SamplingFrame-")
+    assert len(mutex_name.removeprefix("Global\\E1A4SamplingFrame-")) == 64
     assert str(parent) not in mutex_name
-    assert events[1:] == [
+    assert events[2][2] == "secure-attributes"
+    assert events[3:] == [
+        ("free-security", SimpleNamespace(attributes="secure-attributes", descriptor=77)),
         ("wait", 91, 0),
         ("release", 91),
         ("close", 91),
@@ -880,7 +908,43 @@ def test_windows_mutex_contention_closes_without_release(
         with runner._publisher_lock(parent):
             pass
 
-    assert [event[0] for event in events] == ["create", "wait", "close"]
+    assert [event[0] for event in events] == [
+        "owner-sid",
+        "build-security",
+        "create",
+        "free-security",
+        "wait",
+        "close",
+    ]
+    assert not (parent / ".v1.publish.lock").exists()
+
+
+def test_windows_mutex_access_denial_frees_security_and_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import eval.seal_e1a4_sampling_frame as runner
+
+    parent = tmp_path / "sampling-frame"
+    parent.mkdir()
+    api, events = _fake_windows_mutex(
+        0,
+        create_error=PermissionError("private access detail"),
+    )
+    monkeypatch.setattr(runner, "_windows_mutex_api", lambda: api)
+
+    with pytest.raises(
+        runner.E1A4SamplingFrameError,
+        match="^E1A4_SAMPLING_FRAME_WRITE_FAILED$",
+    ):
+        with runner._publisher_lock(parent):
+            pass
+
+    assert [event[0] for event in events] == [
+        "owner-sid",
+        "build-security",
+        "create",
+        "free-security",
+    ]
     assert not (parent / ".v1.publish.lock").exists()
 
 
@@ -907,7 +971,10 @@ def test_windows_mutex_parent_swap_never_mutates_replacement(
         pass
 
     assert [event[0] for event in events] == [
+        "owner-sid",
+        "build-security",
         "create",
+        "free-security",
         "wait",
         "release",
         "close",

@@ -604,14 +604,37 @@ _WAIT_ABANDONED = 0x00000080
 _WAIT_TIMEOUT = 0x00000102
 
 
+@dataclass(frozen=True)
+class _WindowsSecurity:
+    attributes: object
+    descriptor: object
+
+
 class _NativeWindowsMutex:
     def __init__(self) -> None:
         import ctypes
         from ctypes import wintypes
 
+        class SID_AND_ATTRIBUTES(ctypes.Structure):
+            _fields_ = (
+                ("Sid", wintypes.LPVOID),
+                ("Attributes", wintypes.DWORD),
+            )
+
+        class TOKEN_USER(ctypes.Structure):
+            _fields_ = (("User", SID_AND_ATTRIBUTES),)
+
+        class SECURITY_ATTRIBUTES(ctypes.Structure):
+            _fields_ = (
+                ("nLength", wintypes.DWORD),
+                ("lpSecurityDescriptor", wintypes.LPVOID),
+                ("bInheritHandle", wintypes.BOOL),
+            )
+
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
         kernel32.CreateMutexW.argtypes = (
-            wintypes.LPVOID,
+            ctypes.POINTER(SECURITY_ATTRIBUTES),
             wintypes.BOOL,
             wintypes.LPCWSTR,
         )
@@ -622,11 +645,125 @@ class _NativeWindowsMutex:
         kernel32.ReleaseMutex.restype = wintypes.BOOL
         kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
         kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.GetCurrentProcess.argtypes = ()
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel32.LocalFree.argtypes = (wintypes.HLOCAL,)
+        kernel32.LocalFree.restype = wintypes.HLOCAL
+        advapi32.OpenProcessToken.argtypes = (
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.HANDLE),
+        )
+        advapi32.OpenProcessToken.restype = wintypes.BOOL
+        advapi32.GetTokenInformation.argtypes = (
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.LPDWORD,
+        )
+        advapi32.GetTokenInformation.restype = wintypes.BOOL
+        advapi32.ConvertSidToStringSidW.argtypes = (
+            wintypes.LPVOID,
+            ctypes.POINTER(wintypes.LPWSTR),
+        )
+        advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
+        advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = (
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.LPVOID),
+            wintypes.LPDWORD,
+        )
+        advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = (
+            wintypes.BOOL
+        )
         self._ctypes = ctypes
         self._kernel32 = kernel32
+        self._advapi32 = advapi32
+        self._TOKEN_USER = TOKEN_USER
+        self._SECURITY_ATTRIBUTES = SECURITY_ATTRIBUTES
 
-    def create_mutex(self, name: str) -> int:
-        handle = self._kernel32.CreateMutexW(None, False, name)
+    def owner_sid(self) -> str:
+        token = self._ctypes.c_void_p()
+        if not self._advapi32.OpenProcessToken(
+            self._kernel32.GetCurrentProcess(),
+            0x0008,
+            self._ctypes.byref(token),
+        ):
+            raise OSError(self._ctypes.get_last_error(), "token unavailable")
+        try:
+            required = self._ctypes.c_ulong()
+            self._advapi32.GetTokenInformation(token, 1, None, 0, required)
+            if required.value == 0:
+                raise OSError(self._ctypes.get_last_error(), "token query failed")
+            buffer = self._ctypes.create_string_buffer(required.value)
+            if not self._advapi32.GetTokenInformation(
+                token,
+                1,
+                self._ctypes.cast(buffer, self._ctypes.c_void_p),
+                required.value,
+                required,
+            ):
+                raise OSError(self._ctypes.get_last_error(), "token query failed")
+            token_user = self._ctypes.cast(
+                buffer,
+                self._ctypes.POINTER(self._TOKEN_USER),
+            ).contents
+            sid_text = self._ctypes.c_wchar_p()
+            if not self._advapi32.ConvertSidToStringSidW(
+                token_user.User.Sid,
+                self._ctypes.byref(sid_text),
+            ):
+                raise OSError(
+                    self._ctypes.get_last_error(),
+                    "SID conversion failed",
+                )
+            try:
+                if sid_text.value is None:
+                    raise OSError(errno.EIO, "SID conversion failed")
+                return sid_text.value
+            finally:
+                if self._kernel32.LocalFree(sid_text):
+                    raise OSError(
+                        self._ctypes.get_last_error(),
+                        "SID free failed",
+                    )
+        finally:
+            if not self._kernel32.CloseHandle(token):
+                raise OSError(self._ctypes.get_last_error(), "token close failed")
+
+    def build_security_attributes(self, policy: str) -> _WindowsSecurity:
+        descriptor = self._ctypes.c_void_p()
+        if not self._advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            policy,
+            1,
+            self._ctypes.byref(descriptor),
+            None,
+        ):
+            raise OSError(
+                self._ctypes.get_last_error(),
+                "security descriptor conversion failed",
+            )
+        attributes = self._SECURITY_ATTRIBUTES(
+            self._ctypes.sizeof(self._SECURITY_ATTRIBUTES),
+            descriptor,
+            False,
+        )
+        return _WindowsSecurity(attributes=attributes, descriptor=descriptor)
+
+    def free_security_descriptor(self, security: _WindowsSecurity) -> None:
+        if self._kernel32.LocalFree(security.descriptor):
+            raise OSError(
+                self._ctypes.get_last_error(),
+                "security descriptor free failed",
+            )
+
+    def create_mutex(self, name: str, attributes: object) -> int:
+        handle = self._kernel32.CreateMutexW(
+            self._ctypes.byref(attributes),
+            False,
+            name,
+        )
         if not handle:
             raise OSError(self._ctypes.get_last_error(), "mutex creation failed")
         return int(handle)
@@ -651,7 +788,21 @@ def _windows_mutex_name(parent: Path) -> str:
     resolved = parent.resolve(strict=True)
     canonical = os.path.normcase(os.path.normpath(str(resolved)))
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-    return f"Local\\E1A4SamplingFrame-{digest}"
+    return f"Global\\E1A4SamplingFrame-{digest}"
+
+
+def _windows_mutex_policy(owner_sid: str) -> str:
+    parts = owner_sid.split("-")
+    if len(parts) < 3 or parts[0] != "S" or not all(
+        part.isdecimal() for part in parts[1:]
+    ):
+        raise OSError(errno.EINVAL, "invalid owner SID")
+    # CreateMutexW reopens with full access; grant it only to owner and System.
+    return (
+        f"O:{owner_sid}D:P"
+        f"(A;;0x001F0001;;;{owner_sid})"
+        "(A;;0x001F0001;;;SY)"
+    )
 
 
 @contextmanager
@@ -660,7 +811,15 @@ def _windows_publisher_lock(parent: Path) -> Iterator[None]:
     handle: int | None = None
     acquired = False
     try:
-        handle = api.create_mutex(_windows_mutex_name(parent))
+        policy = _windows_mutex_policy(api.owner_sid())
+        security = api.build_security_attributes(policy)
+        try:
+            handle = api.create_mutex(
+                _windows_mutex_name(parent),
+                security.attributes,
+            )
+        finally:
+            api.free_security_descriptor(security)
         outcome = api.wait(handle, 0)
         if outcome not in {_WAIT_OBJECT_0, _WAIT_ABANDONED}:
             error_number = errno.EBUSY if outcome == _WAIT_TIMEOUT else errno.EIO
