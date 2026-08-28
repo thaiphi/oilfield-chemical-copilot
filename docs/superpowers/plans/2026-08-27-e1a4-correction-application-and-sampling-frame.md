@@ -411,19 +411,19 @@ git commit -m "feat: seal corrected e1a4 sampling frame"
 - Consumes: current verified reconciliation, core v2, supplement v2, E1a-3 allocation, index contract, and read-only database URL.
 - Produces: verified private role mapping and metadata-only 96-slot frame.
 
-- [ ] **Step 1: Run aggregate-only preflight**
+- [x] **Step 1: Run aggregate-only preflight**
 
 Require presence of the reconciliation database/seal, both correction seals, E1a-3 allocation plus manifest, index contract, configured database URL, absent sampling frame, and writable ignored private roots. Print booleans/status only.
 
-- [ ] **Step 2: Seal and independently verify the role mapping**
+- [x] **Step 2: Seal and independently verify the role mapping**
 
 Run the application CLI once, capture aggregate status, then run its no-write verify command against the new mapping binding digest. Require eight sufficient strata and allocator slot count 96.
 
-- [ ] **Step 3: Seal and independently verify the sampling frame**
+- [x] **Step 3: Seal and independently verify the sampling frame**
 
 Run the frame sealer once, then run its no-write verification path using the direct mapping and frame binding trust anchors. Require exact four-file presence, exact manifests, source register validity, 96 unique slot identities, 96 unique source-locator keys, all four topics, both roles, and zero E1a-3 locator reuse.
 
-- [ ] **Step 4: Confirm mutation boundaries**
+- [x] **Step 4: Confirm mutation boundaries**
 
 Verify reconciliation `index_sources` and `index_locators` still equal the active sealed snapshots; rerun reconciliation verification; confirm E1a-3 artifact manifests are unchanged; confirm no Qdrant, PostgreSQL write, retrieval, ingestion, model, question, or claim artifact was created.
 
