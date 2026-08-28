@@ -10,7 +10,6 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import shutil
 import stat
 import sys
 from tempfile import mkdtemp
@@ -1011,37 +1010,10 @@ def _is_staging_name(name: str) -> bool:
 
 
 def _remove_abandoned_staging(parent: Path) -> None:
-    resolved_parent = parent.resolve(strict=True)
     for candidate in parent.iterdir():
         if not _is_staging_name(candidate.name):
             continue
-        candidate_stat = candidate.lstat()
-        if stat.S_ISLNK(candidate_stat.st_mode):
-            raise OSError(errno.EPERM, "unsafe staging directory")
-        if not stat.S_ISDIR(candidate_stat.st_mode):
-            continue
-        resolved = candidate.resolve(strict=True)
-        if resolved.parent != resolved_parent:
-            raise OSError(errno.EPERM, "unsafe staging directory")
-        current = candidate.lstat()
-        if (
-            stat.S_ISLNK(current.st_mode)
-            or not stat.S_ISDIR(current.st_mode)
-            or not os.path.samestat(candidate_stat, current)
-        ):
-            raise OSError(errno.EAGAIN, "staging directory changed")
-        shutil.rmtree(resolved)
-
-
-def _remove_owned_publication(final: Path, identity: os.stat_result | None) -> None:
-    if identity is None:
-        return
-    try:
-        current = final.stat()
-    except OSError:
-        return
-    if os.path.samestat(identity, current):
-        shutil.rmtree(final, ignore_errors=True)
+        raise OSError(errno.EBUSY, "abandoned staging requires manual review")
 
 
 def _read_posix_frame_members(
@@ -1317,7 +1289,6 @@ def _publish_sampling_frame(
     final = _frame_directory(output_root)
     parent = final.parent
     staged: Path | None = None
-    published_identity: os.stat_result | None = None
     try:
         parent.mkdir(parents=True, exist_ok=True)
         with _publisher_lock(parent):
@@ -1356,7 +1327,6 @@ def _publish_sampling_frame(
                                 stream.write(value)
                                 stream.flush()
                                 os.fsync(stream.fileno())
-                    published_identity = staged.stat()
                     _rename_no_replace(staged, final)
                     staged = None
                     result = verify_sampling_frame(
@@ -1365,14 +1335,8 @@ def _publish_sampling_frame(
                         output_root=output_root,
                     )
             except E1A4SamplingFrameError:
-                _remove_owned_publication(final, published_identity)
-                if staged is not None and staged.exists():
-                    shutil.rmtree(staged, ignore_errors=True)
                 raise
             except Exception as error:
-                _remove_owned_publication(final, published_identity)
-                if staged is not None and staged.exists():
-                    shutil.rmtree(staged, ignore_errors=True)
                 raise E1A4SamplingFrameError(
                     "E1A4_SAMPLING_FRAME_WRITE_FAILED"
                 ) from error

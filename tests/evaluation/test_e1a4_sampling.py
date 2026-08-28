@@ -6,7 +6,7 @@ import json
 import os
 from pathlib import Path
 import stat
-from threading import Event, Thread, current_thread
+from threading import Thread, current_thread
 from types import SimpleNamespace
 
 import pytest
@@ -751,7 +751,7 @@ def test_frame_rejects_index_contract_a_to_b_to_a_race(
     assert not (tmp_path / "output" / "e1a4" / "sampling-frame" / "v1").exists()
 
 
-def test_frame_publication_failure_leaves_no_final_or_staging_directory(
+def test_frame_publication_failure_preserves_owned_staging_for_manual_review(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import eval.seal_e1a4_sampling_frame as runner
@@ -771,16 +771,17 @@ def test_frame_publication_failure_leaves_no_final_or_staging_directory(
         runner.seal_sampling_frame(**_frame_kwargs(tmp_path))
     parent = tmp_path / "output" / "e1a4" / "sampling-frame"
     assert not (parent / "v1").exists()
-    assert not tuple(parent.glob(".v1.*.tmp"))
+    assert len(tuple(parent.glob(".v1.*.tmp"))) == 1
 
     monkeypatch.setattr(runner, "_rename_no_replace", rename_no_replace)
-    sealed = runner.seal_sampling_frame(**_frame_kwargs(tmp_path))
-    assert runner.verify_current_sampling_frame(
-        **_frame_kwargs(tmp_path)
-    ) == sealed
+    with pytest.raises(
+        runner.E1A4SamplingFrameError,
+        match="E1A4_SAMPLING_FRAME_WRITE_FAILED",
+    ):
+        runner.seal_sampling_frame(**_frame_kwargs(tmp_path))
 
 
-def test_frame_retry_removes_abandoned_staging_before_publication(
+def test_frame_blocks_and_preserves_abandoned_staging_before_publication(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import eval.seal_e1a4_sampling_frame as runner
@@ -791,13 +792,14 @@ def test_frame_retry_removes_abandoned_staging_before_publication(
     abandoned.mkdir(parents=True)
     (abandoned / "sentinel").write_text("synthetic private material")
 
-    sealed = runner.seal_sampling_frame(**_frame_kwargs(tmp_path))
+    with pytest.raises(
+        runner.E1A4SamplingFrameError,
+        match="E1A4_SAMPLING_FRAME_WRITE_FAILED",
+    ):
+        runner.seal_sampling_frame(**_frame_kwargs(tmp_path))
 
-    assert not abandoned.exists()
-    assert not tuple(parent.glob(".v1.*.tmp"))
-    assert runner.verify_current_sampling_frame(
-        **_frame_kwargs(tmp_path)
-    ) == sealed
+    assert (abandoned / "sentinel").read_text() == "synthetic private material"
+    assert not (parent / "v1").exists()
 
 
 def test_frame_verifier_rejects_symlinked_final_directory(
@@ -879,7 +881,7 @@ def test_frame_verifier_rejects_fifo_member_without_blocking(
     assert process.exitcode == 0
 
 
-def test_abandoned_staging_cleanup_does_not_delete_replacement(
+def test_abandoned_staging_detection_does_not_resolve_or_delete_entry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import eval.seal_e1a4_sampling_frame as runner
@@ -889,26 +891,18 @@ def test_abandoned_staging_cleanup_does_not_delete_replacement(
     candidate = parent / ".v1.abandoned.tmp"
     candidate.mkdir()
     (candidate / "owned").write_text("owned")
-    parked = parent / ".v1.parked.tmp"
-    original_resolve = Path.resolve
-    replaced = False
-
-    def replace_after_identity(path: Path, *args: object, **kwargs: object) -> Path:
-        nonlocal replaced
-        if path == candidate and not replaced:
-            replaced = True
-            candidate.rename(parked)
-            candidate.mkdir()
-            (candidate / "replacement").write_text("must survive")
-        return original_resolve(path, *args, **kwargs)
-
-    monkeypatch.setattr(Path, "resolve", replace_after_identity)
+    monkeypatch.setattr(
+        Path,
+        "resolve",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("staging detection must not resolve")
+        ),
+    )
 
     with pytest.raises(OSError):
         runner._remove_abandoned_staging(parent)
 
-    assert (candidate / "replacement").read_text() == "must survive"
-    assert (parked / "owned").read_text() == "owned"
+    assert (candidate / "owned").read_text() == "owned"
 
 
 class _FakeFrameWindowsReader:
@@ -1621,17 +1615,13 @@ def test_posix_final_component_swap_fails_before_flock(
     assert not fake_flock.calls
 
 
-def test_failed_publisher_cleans_owned_final_before_releasing_lock(
+def test_failed_publisher_preserves_owned_final_for_manual_review(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import eval.seal_e1a4_sampling_frame as runner
 
     _patch_frame_trust(runner, tmp_path, monkeypatch)
     real_verify = runner.verify_sampling_frame
-    real_remove = runner._remove_owned_publication
-    cleanup_started = Event()
-    publisher_two_done = Event()
-    results: dict[str, object] = {}
 
     def fail_first_verification(**kwargs: object) -> object:
         if current_thread().name == "publisher-1":
@@ -1640,38 +1630,25 @@ def test_failed_publisher_cleans_owned_final_before_releasing_lock(
             )
         return real_verify(**kwargs)
 
-    def coordinated_remove(final: Path, identity: object) -> None:
-        if current_thread().name == "publisher-1":
-            cleanup_started.set()
-            assert publisher_two_done.wait(10)
-        real_remove(final, identity)
-
     monkeypatch.setattr(runner, "verify_sampling_frame", fail_first_verification)
-    monkeypatch.setattr(runner, "_remove_owned_publication", coordinated_remove)
+    failures: list[BaseException] = []
 
-    def publish(name: str) -> None:
+    def publish() -> None:
         try:
-            results[name] = runner.seal_sampling_frame(**_frame_kwargs(tmp_path))
-        except runner.E1A4SamplingFrameError as error:
-            results[name] = error
-        finally:
-            if name == "publisher-2":
-                publisher_two_done.set()
+            runner.seal_sampling_frame(**_frame_kwargs(tmp_path))
+        except BaseException as error:
+            failures.append(error)
 
-    first = Thread(target=publish, args=("publisher-1",), name="publisher-1")
-    second = Thread(target=publish, args=("publisher-2",), name="publisher-2")
+    first = Thread(target=publish, name="publisher-1")
     first.start()
-    assert cleanup_started.wait(10)
-    second.start()
     first.join(10)
-    second.join(10)
 
     assert not first.is_alive()
-    assert not second.is_alive()
-    assert str(results["publisher-1"]) == "E1A4_SAMPLING_FRAME_VERIFY_FAILED"
-    assert str(results["publisher-2"]) == "E1A4_SAMPLING_FRAME_WRITE_FAILED"
+    assert [str(error) for error in failures] == [
+        "E1A4_SAMPLING_FRAME_VERIFY_FAILED"
+    ]
     parent = tmp_path / "output" / "e1a4" / "sampling-frame"
-    assert not (parent / "v1").exists()
+    assert (parent / "v1").exists()
     assert not tuple(parent.glob(".v1.*.tmp"))
 
 
@@ -1703,7 +1680,7 @@ def test_frame_publication_race_preserves_concurrent_destination(
     ):
         runner.seal_sampling_frame(**_frame_kwargs(tmp_path))
     assert (final / "concurrent-owner").read_text() == "preserve me"
-    assert not tuple(parent.glob(".v1.*.tmp"))
+    assert len(tuple(parent.glob(".v1.*.tmp"))) == 1
 
 
 def test_sampling_preflight_checks_presence_without_opening_payloads(
