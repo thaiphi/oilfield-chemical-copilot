@@ -1038,6 +1038,23 @@ def _read_posix_member(descriptor: int, *, os_api: object) -> bytes:
         chunks.append(chunk)
 
 
+def _attempt_resource_closes(
+    resources: tuple[object | None, ...],
+    *,
+    close: object,
+    first_error: BaseException | None = None,
+) -> BaseException | None:
+    for resource in resources:
+        if resource is None:
+            continue
+        try:
+            close(resource)
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
+    return first_error
+
+
 def _read_posix_sealed_members(
     sealed: Path, *, os_api: object | None = None
 ) -> dict[str, bytes]:
@@ -1045,7 +1062,11 @@ def _read_posix_sealed_members(
         os_api = os
     directory_flag = _required_posix_flag(os_api, "O_DIRECTORY")
     nofollow_flag = _required_posix_flag(os_api, "O_NOFOLLOW")
+    nonblock_flag = _required_posix_flag(os_api, "O_NONBLOCK")
     directory_descriptor: int | None = None
+    body_error: BaseException | None = None
+    cleanup_error: BaseException | None = None
+    captured: dict[str, bytes] = {}
     try:
         directory_descriptor = os_api.open(
             sealed,
@@ -1060,45 +1081,84 @@ def _read_posix_sealed_members(
         entries = set(os_api.listdir(directory_descriptor))
         if entries != _NAMES:
             _fail("E1A4_MAPPING_SEAL_PARTIAL")
-        captured: dict[str, bytes] = {}
         for name in sorted(_NAMES):
             descriptor: int | None = None
             current_descriptor: int | None = None
+            member_error: BaseException | None = None
             try:
+                before = _posix_member_snapshot(
+                    os_api.stat(
+                        name,
+                        dir_fd=directory_descriptor,
+                        follow_symlinks=False,
+                    )
+                )
                 descriptor = os_api.open(
                     name,
                     os_api.O_RDONLY
                     | nofollow_flag
+                    | nonblock_flag
                     | getattr(os_api, "O_CLOEXEC", 0),
                     dir_fd=directory_descriptor,
                 )
-                before = _posix_member_snapshot(os_api.fstat(descriptor))
+                opened = _posix_member_snapshot(os_api.fstat(descriptor))
+                if before != opened:
+                    raise OSError(errno.EAGAIN, "sealed member changed")
                 content = _read_posix_member(descriptor, os_api=os_api)
                 after = _posix_member_snapshot(os_api.fstat(descriptor))
+                current_preopen = _posix_member_snapshot(
+                    os_api.stat(
+                        name,
+                        dir_fd=directory_descriptor,
+                        follow_symlinks=False,
+                    )
+                )
                 current_descriptor = os_api.open(
                     name,
                     os_api.O_RDONLY
                     | nofollow_flag
+                    | nonblock_flag
                     | getattr(os_api, "O_CLOEXEC", 0),
                     dir_fd=directory_descriptor,
                 )
                 current = _posix_member_snapshot(
                     os_api.fstat(current_descriptor)
                 )
-                if before != after or before != current:
+                if (
+                    current_preopen != current
+                    or before != after
+                    or before != current
+                ):
                     raise OSError(errno.EAGAIN, "sealed member changed")
                 captured[name] = content
-            finally:
-                for opened in (current_descriptor, descriptor):
-                    if opened is not None:
-                        os_api.close(opened)
+            except BaseException as error:
+                member_error = error
+            cleanup_error = _attempt_resource_closes(
+                (current_descriptor, descriptor),
+                close=os_api.close,
+                first_error=cleanup_error,
+            )
+            if member_error is not None:
+                raise member_error
+            if cleanup_error is not None:
+                break
         final_directory = os_api.fstat(directory_descriptor)
         if not os.path.samestat(directory_stat, final_directory):
             raise OSError(errno.EAGAIN, "sealed directory changed")
-        return captured
-    finally:
-        if directory_descriptor is not None:
-            os_api.close(directory_descriptor)
+    except BaseException as error:
+        body_error = error
+    cleanup_error = _attempt_resource_closes(
+        (directory_descriptor,),
+        close=os_api.close,
+        first_error=cleanup_error,
+    )
+    if cleanup_error is not None:
+        if body_error is not None:
+            raise cleanup_error from body_error
+        raise cleanup_error
+    if body_error is not None:
+        raise body_error
+    return captured
 
 
 class _NativeWindowsSealReader:
@@ -1400,14 +1460,17 @@ def _read_windows_sealed_members(
     if api is None:
         api = _windows_seal_reader_api()
     directory: object | None = None
+    body_error: BaseException | None = None
+    cleanup_error: BaseException | None = None
+    captured: dict[str, bytes] = {}
     try:
         directory = api.open_directory(sealed)
         if api.directory_entries(directory) != set(_NAMES):
             _fail("E1A4_MAPPING_SEAL_PARTIAL")
-        captured: dict[str, bytes] = {}
         for name in sorted(_NAMES):
             member: object | None = None
             current: object | None = None
+            member_error: BaseException | None = None
             try:
                 member = api.open_member(directory, name)
                 before = api.member_snapshot(member)
@@ -1418,14 +1481,31 @@ def _read_windows_sealed_members(
                 if before != after or before != current_snapshot:
                     raise OSError(errno.EAGAIN, "sealed member changed")
                 captured[name] = content
-            finally:
-                for handle in (current, member):
-                    if handle is not None:
-                        api.close_handle(handle)
-        return captured
-    finally:
-        if directory is not None:
-            api.close_handle(directory)
+            except BaseException as error:
+                member_error = error
+            cleanup_error = _attempt_resource_closes(
+                (current, member),
+                close=api.close_handle,
+                first_error=cleanup_error,
+            )
+            if member_error is not None:
+                raise member_error
+            if cleanup_error is not None:
+                break
+    except BaseException as error:
+        body_error = error
+    cleanup_error = _attempt_resource_closes(
+        (directory,),
+        close=api.close_handle,
+        first_error=cleanup_error,
+    )
+    if cleanup_error is not None:
+        if body_error is not None:
+            raise cleanup_error from body_error
+        raise cleanup_error
+    if body_error is not None:
+        raise body_error
+    return captured
 
 
 def _read_sealed_members(sealed: Path) -> dict[str, bytes]:

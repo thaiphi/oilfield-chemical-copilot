@@ -6,6 +6,7 @@ from pathlib import Path
 import json
 import shutil
 import sqlite3
+import stat
 from tempfile import mkdtemp
 from threading import Event, Thread, current_thread
 from types import SimpleNamespace
@@ -1873,10 +1874,12 @@ class _FakeMappingWindowsSealReader:
         *,
         replaced_name: str | None = None,
         unsafe_name: str | None = None,
+        fail_close: object | None = None,
     ) -> None:
         self.members = members
         self.replaced_name = replaced_name
         self.unsafe_name = unsafe_name
+        self.fail_close = fail_close
         self.opens: dict[str, int] = {}
         self.reads: dict[str, int] = {}
         self.closed: list[object] = []
@@ -1909,6 +1912,8 @@ class _FakeMappingWindowsSealReader:
 
     def close_handle(self, handle: object) -> None:
         self.closed.append(handle)
+        if handle == self.fail_close:
+            raise OSError("synthetic close failure")
 
 
 def test_mapping_verifier_rejects_member_replacement_race(
@@ -2013,6 +2018,184 @@ def test_mapping_verifier_missing_native_safe_open_fails_closed(
         module._verify_mapping_directory(
             mapping, binding, mapping_root, seal.binding_sha256
         )
+
+
+class _FakeMappingPosixSealOS:
+    O_RDONLY = 0x01
+    O_CLOEXEC = 0x02
+    O_DIRECTORY = 0x04
+    O_NOFOLLOW = 0x08
+    O_NONBLOCK = 0x10
+
+    def __init__(
+        self,
+        members: dict[str, bytes],
+        *,
+        fifo_name: str | None = None,
+        fail_close: int | None = None,
+    ) -> None:
+        self.members = members
+        self.fifo_name = fifo_name
+        self.fail_close = fail_close
+        self.events: list[tuple[object, ...]] = []
+        self.closed: list[int] = []
+        self.open_counts: dict[str, int] = {}
+        self.descriptors: dict[int, str] = {}
+        self.read_done: set[int] = set()
+        self.directory_stat = SimpleNamespace(
+            st_mode=stat.S_IFDIR | 0o700,
+            st_dev=1,
+            st_ino=10,
+        )
+        self.member_stats = {
+            name: SimpleNamespace(
+                st_mode=(
+                    stat.S_IFIFO | 0o600
+                    if name == fifo_name
+                    else stat.S_IFREG | 0o600
+                ),
+                st_nlink=1,
+                st_dev=1,
+                st_ino=100 + index,
+                st_size=len(content),
+                st_mtime_ns=1,
+                st_ctime_ns=1,
+            )
+            for index, (name, content) in enumerate(sorted(members.items()))
+        }
+
+    def open(
+        self,
+        path: object,
+        flags: int,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        if dir_fd is None:
+            self.events.append(("open-directory", path, flags))
+            return 10
+        name = str(path)
+        self.events.append(("open-member", name, flags, dir_fd))
+        if name == self.fifo_name:
+            raise AssertionError("blocking FIFO open attempted")
+        generation = self.open_counts.get(name, 0)
+        self.open_counts[name] = generation + 1
+        descriptor = 20 + 2 * list(sorted(self.members)).index(name) + generation
+        self.descriptors[descriptor] = name
+        return descriptor
+
+    def fstat(self, descriptor: int) -> object:
+        self.events.append(("fstat", descriptor))
+        if descriptor == 10:
+            return self.directory_stat
+        return self.member_stats[self.descriptors[descriptor]]
+
+    def stat(
+        self, path: object, *, dir_fd: int, follow_symlinks: bool
+    ) -> object:
+        name = str(path)
+        self.events.append(("stat-member", name, dir_fd, follow_symlinks))
+        return self.member_stats[name]
+
+    def listdir(self, descriptor: int) -> list[str]:
+        self.events.append(("listdir", descriptor))
+        return list(self.members)
+
+    def read(self, descriptor: int, _count: int) -> bytes:
+        self.events.append(("read", descriptor))
+        if descriptor in self.read_done:
+            return b""
+        self.read_done.add(descriptor)
+        return self.members[self.descriptors[descriptor]]
+
+    def close(self, descriptor: int) -> None:
+        self.events.append(("close", descriptor))
+        self.closed.append(descriptor)
+        if descriptor == self.fail_close:
+            raise OSError("synthetic close failure")
+
+
+def test_mapping_posix_fifo_is_rejected_before_nonblocking_open() -> None:
+    import oilfield_chemical_copilot.evaluation.e1a4_mapping_application as module
+
+    members = {name: f"{name}\n".encode() for name in module._NAMES}
+    fifo_name = "role-mapping.v1.json"
+    fake_os = _FakeMappingPosixSealOS(members, fifo_name=fifo_name)
+
+    with pytest.raises(OSError, match="unsafe sealed member"):
+        module._read_posix_sealed_members(Path("sealed"), os_api=fake_os)
+
+    assert any(event[:2] == ("stat-member", fifo_name) for event in fake_os.events)
+    assert not any(
+        event[:2] == ("open-member", fifo_name) for event in fake_os.events
+    )
+    member_opens = [
+        event for event in fake_os.events if event[0] == "open-member"
+    ]
+    assert member_opens
+    assert all(event[2] & fake_os.O_NONBLOCK for event in member_opens)
+    for event in member_opens:
+        open_index = fake_os.events.index(event)
+        assert any(
+            prior[:2] == ("stat-member", event[1])
+            for prior in fake_os.events[:open_index]
+        )
+
+
+def test_mapping_posix_close_failure_attempts_all_member_and_directory_closes(
+    mapping_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import oilfield_chemical_copilot.evaluation.e1a4_mapping_application as module
+
+    mapping, binding = _payloads()
+    seal = module._publish_mapping_directory(mapping, binding, mapping_root)
+    sealed = module._mapping_directory(mapping_root)
+    members = {name: (sealed / name).read_bytes() for name in module._NAMES}
+    fake_os = _FakeMappingPosixSealOS(members, fail_close=21)
+    monkeypatch.setattr(
+        module,
+        "_read_sealed_members",
+        lambda _sealed: module._read_posix_sealed_members(
+            _sealed, os_api=fake_os
+        ),
+    )
+
+    with pytest.raises(
+        E1A4MappingApplicationError,
+        match="^E1A4_MAPPING_SEAL_VERIFY_FAILED$",
+    ):
+        module._verify_mapping_directory(
+            mapping, binding, mapping_root, seal.binding_sha256
+        )
+
+    assert fake_os.closed[:3] == [21, 20, 10]
+
+
+def test_mapping_windows_close_failure_attempts_all_member_and_directory_closes(
+    mapping_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import oilfield_chemical_copilot.evaluation.e1a4_mapping_application as module
+
+    mapping, binding = _payloads()
+    seal = module._publish_mapping_directory(mapping, binding, mapping_root)
+    sealed = module._mapping_directory(mapping_root)
+    members = {name: (sealed / name).read_bytes() for name in module._NAMES}
+    first_name = sorted(module._NAMES)[0]
+    current = (first_name, 2)
+    original = (first_name, 1)
+    api = _FakeMappingWindowsSealReader(members, fail_close=current)
+    monkeypatch.setattr(module, "_windows_seal_reader_api", lambda: api)
+    monkeypatch.setattr(module.os, "name", "nt")
+
+    with pytest.raises(
+        E1A4MappingApplicationError,
+        match="^E1A4_MAPPING_SEAL_VERIFY_FAILED$",
+    ):
+        module._verify_mapping_directory(
+            mapping, binding, mapping_root, seal.binding_sha256
+        )
+
+    assert api.closed[:3] == [current, original, "directory"]
 
 
 def _mapping_runner_args(
