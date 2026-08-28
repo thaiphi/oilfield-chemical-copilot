@@ -1071,18 +1071,22 @@ def _read_posix_frame_members(
             ) != names:
                 _fail("E1A4_SAMPLING_FRAME_PARTIAL")
             for name in sorted(names):
+                member_fd: int | None = None
+                current_fd: int | None = None
+                member_error: BaseException | None = None
+                close_error: BaseException | None = None
                 before = _mapping_application._posix_member_snapshot(
                     os_api.stat(name, dir_fd=child_fd, follow_symlinks=False)
                 )
-                member_fd = os_api.open(
-                    name,
-                    os_api.O_RDONLY
-                    | nofollow_flag
-                    | nonblock_flag
-                    | getattr(os_api, "O_CLOEXEC", 0),
-                    dir_fd=child_fd,
-                )
                 try:
+                    member_fd = os_api.open(
+                        name,
+                        os_api.O_RDONLY
+                        | nofollow_flag
+                        | nonblock_flag
+                        | getattr(os_api, "O_CLOEXEC", 0),
+                        dir_fd=child_fd,
+                    )
                     if before != _mapping_application._posix_member_snapshot(
                         os_api.fstat(member_fd)
                     ):
@@ -1096,12 +1100,103 @@ def _read_posix_frame_members(
                         os_api.fstat(member_fd)
                     ):
                         raise OSError(errno.EAGAIN, "frame member changed")
-                finally:
-                    os_api.close(member_fd)
+                    current_preopen = _mapping_application._posix_member_snapshot(
+                        os_api.stat(
+                            name, dir_fd=child_fd, follow_symlinks=False
+                        )
+                    )
+                    current_fd = os_api.open(
+                        name,
+                        os_api.O_RDONLY
+                        | nofollow_flag
+                        | nonblock_flag
+                        | getattr(os_api, "O_CLOEXEC", 0),
+                        dir_fd=child_fd,
+                    )
+                    current = _mapping_application._posix_member_snapshot(
+                        os_api.fstat(current_fd)
+                    )
+                    if (
+                        before != current_preopen
+                        or before != current
+                    ):
+                        raise OSError(errno.EAGAIN, "frame member changed")
+                except BaseException as error:
+                    member_error = error
+                for descriptor in (current_fd, member_fd):
+                    if descriptor is None:
+                        continue
+                    try:
+                        os_api.close(descriptor)
+                    except BaseException as error:
+                        close_error = close_error or error
+                if member_error is not None:
+                    raise member_error
+                if close_error is not None:
+                    raise close_error
             if not os.path.samestat(child_before, os_api.fstat(child_fd)):
                 raise OSError(errno.EAGAIN, "frame directory changed")
+            current_child: int | None = None
+            child_error: BaseException | None = None
+            close_error = None
+            try:
+                current_preopen = os_api.stat(
+                    dirname, dir_fd=root_fd, follow_symlinks=False
+                )
+                if not stat.S_ISDIR(current_preopen.st_mode):
+                    raise OSError(errno.ENOTDIR, "frame directory changed")
+                current_child = os_api.open(
+                    dirname,
+                    os_api.O_RDONLY
+                    | directory_flag
+                    | nofollow_flag
+                    | getattr(os_api, "O_CLOEXEC", 0),
+                    dir_fd=root_fd,
+                )
+                if (
+                    not os.path.samestat(child_before, current_preopen)
+                    or not os.path.samestat(
+                        child_before, os_api.fstat(current_child)
+                    )
+                ):
+                    raise OSError(errno.EAGAIN, "frame directory changed")
+            except BaseException as error:
+                child_error = error
+            if current_child is not None:
+                try:
+                    os_api.close(current_child)
+                except BaseException as error:
+                    close_error = error
+            if child_error is not None:
+                raise child_error
+            if close_error is not None:
+                raise close_error
         if not os.path.samestat(root_before, os_api.fstat(root_fd)):
             raise OSError(errno.EAGAIN, "frame directory changed")
+        current_root: int | None = None
+        root_error: BaseException | None = None
+        close_error = None
+        try:
+            current_root = os_api.open(
+                final,
+                os_api.O_RDONLY
+                | directory_flag
+                | nofollow_flag
+                | getattr(os_api, "O_CLOEXEC", 0),
+            )
+            if not os.path.samestat(root_before, os_api.fstat(current_root)):
+                raise OSError(errno.EAGAIN, "frame directory changed")
+        except BaseException as error:
+            root_error = error
+        if current_root is not None:
+            try:
+                os_api.close(current_root)
+            except BaseException as error:
+                close_error = error
+        if root_error is not None:
+            raise root_error
+        if close_error is not None:
+            raise close_error
         return captured
     finally:
         close_error: BaseException | None = None
@@ -1145,9 +1240,11 @@ def _read_windows_frame_members(final: Path) -> dict[str, bytes]:
             if api.directory_entries(child) != names:
                 _fail("E1A4_SAMPLING_FRAME_PARTIAL")
             for name in sorted(names):
-                member = api.open_member(child, name)
+                member: object | None = None
                 current: object | None = None
+                member_error: BaseException | None = None
                 try:
+                    member = api.open_member(child, name)
                     before = api.member_snapshot(member)
                     content = api.read_member(member)
                     after = api.member_snapshot(member)
@@ -1155,14 +1252,41 @@ def _read_windows_frame_members(final: Path) -> dict[str, bytes]:
                     if before != after or before != api.member_snapshot(current):
                         raise OSError(errno.EAGAIN, "frame member changed")
                     captured[f"{dirname}/{name}"] = content
-                finally:
-                    if current is not None:
-                        api.close_handle(current)
-                    api.close_handle(member)
+                except BaseException as error:
+                    member_error = error
+                close_error = _mapping_application._attempt_resource_closes(
+                    (current, member), close=api.close_handle
+                )
+                if member_error is not None:
+                    raise member_error
+                if close_error is not None:
+                    raise close_error
             if child_before != api._validate_handle(child, directory=True):
                 raise OSError(errno.EAGAIN, "frame directory changed")
+            current_child: object | None = None
+            try:
+                current_child = _open_windows_child_directory(
+                    api, root, dirname
+                )
+                if child_before != api._validate_handle(
+                    current_child, directory=True
+                ):
+                    raise OSError(errno.EAGAIN, "frame directory changed")
+            finally:
+                if current_child is not None:
+                    api.close_handle(current_child)
         if root_before != api._validate_handle(root, directory=True):
             raise OSError(errno.EAGAIN, "frame directory changed")
+        current_root: object | None = None
+        try:
+            current_root = api.open_directory(final)
+            if root_before != api._validate_handle(
+                current_root, directory=True
+            ):
+                raise OSError(errno.EAGAIN, "frame directory changed")
+        finally:
+            if current_root is not None:
+                api.close_handle(current_root)
         return captured
     finally:
         close_error: BaseException | None = None

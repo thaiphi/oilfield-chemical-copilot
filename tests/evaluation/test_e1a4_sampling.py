@@ -914,6 +914,7 @@ class _FakeFrameWindowsReader:
         replaced_member: str | None = None,
         unsafe_root: bool = False,
         replaced_root: bool = False,
+        replaced_child: str | None = None,
         fail_close: object | None = None,
     ) -> None:
         self.members = members
@@ -921,43 +922,43 @@ class _FakeFrameWindowsReader:
         self.replaced_member = replaced_member
         self.unsafe_root = unsafe_root
         self.replaced_root = replaced_root
+        self.replaced_child = replaced_child
         self.fail_close = fail_close
-        self.root_validations = 0
         self.opens: dict[str, int] = {}
         self.closed: list[object] = []
 
-    def open_directory(self, _path: Path) -> str:
+    def open_directory(self, _path: Path) -> tuple[str, int]:
         if self.unsafe_root:
             raise OSError("frame directory is reparse")
-        return "root"
+        self.opens["root"] = self.opens.get("root", 0) + 1
+        return "root", self.opens["root"]
 
-    def open_child(self, _parent: object, name: str) -> str:
-        return name
+    def open_child(self, _parent: object, name: str) -> tuple[str, int]:
+        self.opens[name] = self.opens.get(name, 0) + 1
+        return name, self.opens[name]
 
     def _validate_handle(self, handle: object, *, directory: bool) -> tuple[object, ...]:
         if directory:
-            if handle == "root":
-                self.root_validations += 1
-                return (
-                    handle,
-                    "replacement"
-                    if self.replaced_root and self.root_validations > 1
-                    else "original",
-                )
-            return (handle, "directory")
+            name, generation = handle
+            replacement = (
+                (name == "root" and self.replaced_root)
+                or name == self.replaced_child
+            ) and generation > 1
+            return name, "replacement" if replacement else "original"
         raise AssertionError("member validation uses member_snapshot")
 
     def directory_entries(self, handle: object) -> set[str]:
-        if handle == "root":
+        name = handle[0]
+        if name == "root":
             return {"sealed", "manifests"}
         return {
-            key.removeprefix(f"{handle}/")
+            key.removeprefix(f"{name}/")
             for key in self.members
-            if key.startswith(f"{handle}/")
+            if key.startswith(f"{name}/")
         }
 
     def open_member(self, directory: object, name: str) -> tuple[str, int]:
-        key = f"{directory}/{name}"
+        key = f"{directory[0]}/{name}"
         self.opens[key] = self.opens.get(key, 0) + 1
         return key, self.opens[key]
 
@@ -1010,7 +1011,7 @@ def test_frame_windows_reader_rejects_reparse_member_via_native_seam(
         runner._read_windows_frame_members(final)
 
     assert f"sealed/{runner.SOURCE_REGISTER_NAME}" in api.opens
-    assert "root" in api.closed
+    assert ("root", 1) in api.closed
 
 
 def test_frame_windows_reader_rejects_reparse_final_directory_via_native_seam(
@@ -1084,6 +1085,29 @@ def test_frame_windows_reader_rejects_final_directory_replacement_via_native_sea
         runner._read_windows_frame_members(Path("frame"))
 
 
+def test_frame_windows_reader_rejects_child_name_replacement_via_native_seam(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import eval.seal_e1a4_sampling_frame as runner
+
+    api = _FakeFrameWindowsReader(
+        _frame_reader_members(runner), replaced_child="sealed"
+    )
+    monkeypatch.setattr(
+        runner._mapping_application, "_windows_seal_reader_api", lambda: api
+    )
+    monkeypatch.setattr(
+        runner,
+        "_open_windows_child_directory",
+        lambda _api, parent, name: api.open_child(parent, name),
+    )
+
+    with pytest.raises(OSError, match="frame directory changed"):
+        runner._read_windows_frame_members(Path("frame"))
+
+    assert api.opens["sealed"] == 2
+
+
 def test_frame_windows_reader_attempts_all_closes_after_close_failure(
     monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1095,7 +1119,7 @@ def test_frame_windows_reader_attempts_all_closes_after_close_failure(
         f"manifests/{runner._manifest_name(runner.SOURCE_REGISTER_NAME)}": b"digest\n",
         f"manifests/{runner._manifest_name(runner.ALLOCATION_NAME)}": b"digest\n",
     }
-    api = _FakeFrameWindowsReader(members, fail_close="manifests")
+    api = _FakeFrameWindowsReader(members, fail_close=("manifests", 1))
     monkeypatch.setattr(
         runner._mapping_application, "_windows_seal_reader_api", lambda: api
     )
@@ -1108,7 +1132,32 @@ def test_frame_windows_reader_attempts_all_closes_after_close_failure(
     with pytest.raises(OSError, match="synthetic close failure"):
         runner._read_windows_frame_members(Path("frame"))
 
-    assert api.closed[-1] == "root"
+    assert api.closed[-1] == ("root", 1)
+
+
+def test_frame_windows_reader_closes_original_member_after_current_close_failure(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import eval.seal_e1a4_sampling_frame as runner
+
+    member = f"sealed/{runner.ALLOCATION_NAME}"
+    api = _FakeFrameWindowsReader(
+        _frame_reader_members(runner), fail_close=(member, 2)
+    )
+    monkeypatch.setattr(
+        runner._mapping_application, "_windows_seal_reader_api", lambda: api
+    )
+    monkeypatch.setattr(
+        runner,
+        "_open_windows_child_directory",
+        lambda _api, parent, name: api.open_child(parent, name),
+    )
+
+    with pytest.raises(OSError, match="synthetic close failure"):
+        runner._read_windows_frame_members(Path("frame"))
+
+    assert (member, 1) in api.closed
+    assert api.closed[-1] == ("root", 1)
 
 
 class _FakeFramePosixOS:
@@ -1147,7 +1196,11 @@ class _FakeFramePosixOS:
     def fstat(self, fd: int) -> object:
         key = self.handles[fd]
         if key in {"root", "sealed", "manifests"}:
-            return SimpleNamespace(st_mode=stat.S_IFDIR | 0o700, st_dev=1, st_ino=fd)
+            return SimpleNamespace(
+                st_mode=stat.S_IFDIR | 0o700,
+                st_dev=1,
+                st_ino={"root": 1, "sealed": 2, "manifests": 3}[key],
+            )
         content = self.members[key]
         return SimpleNamespace(
             st_mode=(stat.S_IFIFO if key.endswith(self.fifo) else stat.S_IFREG) | 0o600,
@@ -1162,6 +1215,12 @@ class _FakeFramePosixOS:
     def stat(self, path: object, *, dir_fd: int, follow_symlinks: bool) -> object:
         key = f"{self.handles[dir_fd]}/{path}"
         self.events.append(("stat", key, follow_symlinks))
+        if key in {"root/sealed", "root/manifests"}:
+            return SimpleNamespace(
+                st_mode=stat.S_IFDIR | 0o700,
+                st_dev=1,
+                st_ino=2 if key.endswith("sealed") else 3,
+            )
         content = self.members[key]
         return SimpleNamespace(
             st_mode=(stat.S_IFIFO if key.endswith(self.fifo) else stat.S_IFREG) | 0o600,
@@ -1213,6 +1272,125 @@ def test_frame_posix_reader_rejects_fifo_before_opening_it() -> None:
     assert not any(
         event[:2] == ("open", fifo) for event in fake_os.events
     )
+
+
+def _frame_reader_members(runner: object) -> dict[str, bytes]:
+    return {
+        f"sealed/{runner.SOURCE_REGISTER_NAME}": b"source",
+        f"sealed/{runner.ALLOCATION_NAME}": b"allocation",
+        f"manifests/{runner._manifest_name(runner.SOURCE_REGISTER_NAME)}": b"digest\n",
+        f"manifests/{runner._manifest_name(runner.ALLOCATION_NAME)}": b"digest\n",
+    }
+
+
+def test_frame_posix_reader_rejects_member_name_replacement_after_read() -> None:
+    import eval.seal_e1a4_sampling_frame as runner
+
+    fake_os = _FakeFramePosixOS(
+        _frame_reader_members(runner), fifo="never-a-member"
+    )
+    original_open = fake_os.open
+    original_fstat = fake_os.fstat
+    target = runner.SOURCE_REGISTER_NAME
+    target_opens = 0
+    changed: set[int] = set()
+
+    def replace_member(path: object, flags: int, *, dir_fd: int | None = None) -> int:
+        nonlocal target_opens
+        descriptor = original_open(path, flags, dir_fd=dir_fd)
+        if str(path) == target:
+            target_opens += 1
+            if target_opens > 1:
+                changed.add(descriptor)
+        return descriptor
+
+    def replacement_fstat(descriptor: int) -> object:
+        observed = original_fstat(descriptor)
+        if descriptor in changed:
+            values = vars(observed).copy()
+            values["st_ino"] = 999
+            return SimpleNamespace(**values)
+        return observed
+
+    fake_os.open = replace_member  # type: ignore[method-assign]
+    fake_os.fstat = replacement_fstat  # type: ignore[method-assign]
+
+    with pytest.raises(OSError, match="frame member changed"):
+        runner._read_posix_frame_members(Path("frame"), os_api=fake_os)
+
+
+def test_frame_posix_reader_rejects_child_name_replacement_after_traversal() -> None:
+    import eval.seal_e1a4_sampling_frame as runner
+
+    fake_os = _FakeFramePosixOS(
+        _frame_reader_members(runner), fifo="never-a-member"
+    )
+    original_open = fake_os.open
+    original_fstat = fake_os.fstat
+    sealed_opens = 0
+    changed: set[int] = set()
+
+    def replace_child(path: object, flags: int, *, dir_fd: int | None = None) -> int:
+        nonlocal sealed_opens
+        descriptor = original_open(path, flags, dir_fd=dir_fd)
+        if str(path) == "sealed" and dir_fd is not None:
+            sealed_opens += 1
+            if sealed_opens > 1:
+                changed.add(descriptor)
+        return descriptor
+
+    def replacement_fstat(descriptor: int) -> object:
+        observed = original_fstat(descriptor)
+        if descriptor in changed:
+            values = vars(observed).copy()
+            values["st_ino"] = 999
+            return SimpleNamespace(**values)
+        return observed
+
+    fake_os.open = replace_child  # type: ignore[method-assign]
+    fake_os.fstat = replacement_fstat  # type: ignore[method-assign]
+
+    with pytest.raises(OSError, match="frame directory changed"):
+        runner._read_posix_frame_members(Path("frame"), os_api=fake_os)
+
+    assert sealed_opens == 2
+
+
+def test_frame_posix_reader_rejects_final_name_replacement_after_traversal() -> None:
+    import eval.seal_e1a4_sampling_frame as runner
+
+    fake_os = _FakeFramePosixOS(
+        _frame_reader_members(runner), fifo="never-a-member"
+    )
+    original_open = fake_os.open
+    original_fstat = fake_os.fstat
+    root_opens = 0
+    changed: set[int] = set()
+
+    def replace_final(path: object, flags: int, *, dir_fd: int | None = None) -> int:
+        nonlocal root_opens
+        descriptor = original_open(path, flags, dir_fd=dir_fd)
+        if dir_fd is None:
+            root_opens += 1
+            if root_opens > 1:
+                changed.add(descriptor)
+        return descriptor
+
+    def replacement_fstat(descriptor: int) -> object:
+        observed = original_fstat(descriptor)
+        if descriptor in changed:
+            values = vars(observed).copy()
+            values["st_ino"] = 999
+            return SimpleNamespace(**values)
+        return observed
+
+    fake_os.open = replace_final  # type: ignore[method-assign]
+    fake_os.fstat = replacement_fstat  # type: ignore[method-assign]
+
+    with pytest.raises(OSError, match="frame directory changed"):
+        runner._read_posix_frame_members(Path("frame"), os_api=fake_os)
+
+    assert root_opens == 2
 
 
 def test_frame_publisher_lock_fails_closed_then_releases(
