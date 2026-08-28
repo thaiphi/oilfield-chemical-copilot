@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import re
 from typing import Iterable, Literal
 
 from oilfield_chemical_copilot.evaluation.e1a3_sampling import (
@@ -18,6 +19,9 @@ Topic = Literal["iron_sulfide", "scale", "corrosion", "paraffin"]
 SourceRole = Literal["foundational", "supporting"]
 _TOPICS: frozenset[str] = frozenset(("iron_sulfide", "scale", "corrosion", "paraffin"))
 _SOURCE_ROLES: frozenset[str] = frozenset(("foundational", "supporting"))
+_PRIOR_ALLOCATION_FIELDS = frozenset(
+    ("schema_version", "source_register_sha256", "slot_count", "allocations")
+)
 _ALLOCATION_FIELDS = frozenset(
     (
         "slot_id",
@@ -164,7 +168,7 @@ def _load_payload(path: Path) -> dict[str, object]:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError):
         _fail("E1A4_PRIOR_ALLOCATION_INVALID")
-    if not isinstance(value, dict) or set(value) != {"schema_version", "allocations"}:
+    if not isinstance(value, dict) or set(value) != _PRIOR_ALLOCATION_FIELDS:
         _fail("E1A4_PRIOR_ALLOCATION_INVALID")
     schema_version = value["schema_version"]
     if (
@@ -172,6 +176,15 @@ def _load_payload(path: Path) -> dict[str, object]:
         or isinstance(schema_version, bool)
         or schema_version != 1
     ):
+        _fail("E1A4_PRIOR_ALLOCATION_INVALID")
+    source_register_sha256 = value["source_register_sha256"]
+    if (
+        not isinstance(source_register_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", source_register_sha256) is None
+    ):
+        _fail("E1A4_PRIOR_ALLOCATION_INVALID")
+    slot_count = value["slot_count"]
+    if not isinstance(slot_count, int) or isinstance(slot_count, bool) or slot_count != 96:
         _fail("E1A4_PRIOR_ALLOCATION_INVALID")
     if not isinstance(value["allocations"], list):
         _fail("E1A4_PRIOR_ALLOCATION_INVALID")

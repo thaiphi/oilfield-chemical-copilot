@@ -40,6 +40,8 @@ def _mapped(
 def _allocation_payload() -> dict[str, object]:
     return {
         "schema_version": 1,
+        "source_register_sha256": "0123456789abcdef" * 4,
+        "slot_count": 96,
         "allocations": [
             {
                 **slot.to_mapping(),
@@ -76,6 +78,7 @@ def test_prior_allocation_requires_manifest_and_exact_96_unique_keys(tmp_path: P
 
     assert result.slot_count == 96
     assert len(result.locator_keys) == 96
+    assert result.payload_sha256 == sha256(payload_path.read_bytes()).hexdigest()
 
 
 @pytest.mark.parametrize(
@@ -83,6 +86,21 @@ def test_prior_allocation_requires_manifest_and_exact_96_unique_keys(tmp_path: P
     [
         (lambda payload: payload.update({"extra": "field"}), "E1A4_PRIOR_ALLOCATION_INVALID"),
         (lambda payload: payload.update({"schema_version": True}), "E1A4_PRIOR_ALLOCATION_INVALID"),
+        (lambda payload: payload.update({"schema_version": 2}), "E1A4_PRIOR_ALLOCATION_INVALID"),
+        (
+            lambda payload: payload.update({"source_register_sha256": "A" * 64}),
+            "E1A4_PRIOR_ALLOCATION_INVALID",
+        ),
+        (
+            lambda payload: payload.update({"source_register_sha256": "g" * 64}),
+            "E1A4_PRIOR_ALLOCATION_INVALID",
+        ),
+        (
+            lambda payload: payload.update({"source_register_sha256": "a" * 63}),
+            "E1A4_PRIOR_ALLOCATION_INVALID",
+        ),
+        (lambda payload: payload.update({"slot_count": True}), "E1A4_PRIOR_ALLOCATION_INVALID"),
+        (lambda payload: payload.update({"slot_count": 95}), "E1A4_PRIOR_ALLOCATION_INVALID"),
         (
             lambda payload: payload["allocations"][0].pop("parser_type"),
             "E1A4_PRIOR_ALLOCATION_INVALID",
@@ -121,6 +139,29 @@ def test_prior_allocation_rejects_invalid_payload_contract(
     manifest_path.write_bytes((private_sampling_payload_digest(payload) + "\n").encode("ascii"))
 
     with pytest.raises(E1A4SamplingError, match=expected_code):
+        load_e1a3_prior_allocation(
+            payload_path=payload_path,
+            manifest_path=manifest_path,
+            private_root=private_root,
+        )
+
+
+@pytest.mark.parametrize(
+    "field",
+    ("schema_version", "source_register_sha256", "slot_count", "allocations"),
+)
+def test_prior_allocation_rejects_missing_top_level_field(
+    tmp_path: Path, field: str
+) -> None:
+    private_root, payload_path, manifest_path = _sealed_allocation(tmp_path)
+    payload = json.loads(payload_path.read_text())
+    payload.pop(field)
+    payload_path.write_bytes(
+        (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    )
+    manifest_path.write_bytes((private_sampling_payload_digest(payload) + "\n").encode("ascii"))
+
+    with pytest.raises(E1A4SamplingError, match="E1A4_PRIOR_ALLOCATION_INVALID"):
         load_e1a3_prior_allocation(
             payload_path=payload_path,
             manifest_path=manifest_path,
