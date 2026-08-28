@@ -149,7 +149,7 @@ git commit -m "feat: add e1a4 mapping sampling contracts"
 - Produces: `E1A4MappingApplicationError`, `E1A4MappingArtifact`, `E1A4MappingSeal`, `build_e1a4_role_mapping(...)`, `seal_e1a4_role_mapping(...)`, and `verify_e1a4_role_mapping(...)`.
 - Consumes: `ReconciliationStore`, `FoundationalAuditStore`, `IronSulfideSupplementAuditStore`, four expected binding digests, and frozen E1a-3 allocation paths.
 
-- [ ] **Step 1: Write failing mapping-application tests**
+- [x] **Step 1: Write failing mapping-application tests**
 
 Create a synthetic sealed reconciliation with terminal core and supplement proposals. Assert that:
 
@@ -165,7 +165,7 @@ def test_mapping_application_preserves_inventory_and_mixed_roles(tmp_path: Path)
 
 Add adversarial tests for a fake reconciliation digest, fake core/supplement binding, another SQLite database, mismatched reconciliation snapshots, altered E1a-3 allocation, inventory/allocation exclusion mismatch, overlapping proposal keys, promotion not in its frozen candidate inventory, wrong pre-application role/status, unresolved proposal, insufficient stratum, allocator failure, seal crash cleanup, extra files, altered manifests, SQLite state drift, and idempotent no-write verification.
 
-- [ ] **Step 2: Run Task 2 tests and verify RED**
+- [x] **Step 2: Run Task 2 tests and verify RED**
 
 ```powershell
 python -m pytest tests/evaluation/test_e1a4_mapping_application.py -q
@@ -173,7 +173,7 @@ python -m pytest tests/evaluation/test_e1a4_mapping_application.py -q
 
 Expected: collection fails because `e1a4_mapping_application` is absent.
 
-- [ ] **Step 3: Implement authenticated in-memory application**
+- [x] **Step 3: Implement authenticated in-memory application**
 
 Use this signature:
 
@@ -229,7 +229,7 @@ Baseline mapped rows require `e1a4_available=1`, `e1a3_used=0`, and `substantive
 
 Validate the grouped records through Task 1, require at least 12 locators in each of eight strata, call `allocate_sampling_slots(build_sampling_slots(), sources)` once, and require 96 unique source-locator allocation keys.
 
-- [ ] **Step 4: Implement atomic mapping seal and verification**
+- [x] **Step 4: Implement atomic mapping seal and verification**
 
 Use:
 
@@ -305,7 +305,7 @@ Implement the public seal functions with the same trust inputs as `build_e1a4_ro
 
 Publish canonical `role-mapping.v1.json`, its manifest, `mapping-binding.v1.json`, and its manifest inside one staged `e1a4-role-mapping/v1/sealed` directory. Rename the complete staged directory once. Verify exact filenames, both manifests, current regenerated payload bytes, current binding bytes, and supplied binding trust anchor. Never update reconciliation rows.
 
-- [ ] **Step 5: Run Task 2 tests and regression checks**
+- [x] **Step 5: Run Task 2 tests and regression checks**
 
 ```powershell
 python -m pytest tests/evaluation/test_e1a4_mapping_application.py tests/evaluation/test_iron_sulfide_supplement_audit.py tests/evaluation/test_foundational_locator_audit.py tests/evaluation/test_corpus_reconciliation.py -q
@@ -315,7 +315,7 @@ git diff --check
 
 Expected: all tests, Ruff, and diff checks pass.
 
-- [ ] **Step 6: Commit Task 2**
+- [x] **Step 6: Commit Task 2**
 
 ```powershell
 git add -- src/oilfield_chemical_copilot/evaluation/e1a4_mapping_application.py tests/evaluation/test_e1a4_mapping_application.py
