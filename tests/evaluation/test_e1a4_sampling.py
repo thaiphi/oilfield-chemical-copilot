@@ -4,6 +4,8 @@ from dataclasses import replace
 from hashlib import sha256
 import json
 from pathlib import Path
+import stat
+from threading import Event, Thread, current_thread
 from types import SimpleNamespace
 
 import pytest
@@ -777,6 +779,147 @@ def test_frame_publisher_lock_fails_closed_then_releases(
     assert runner.verify_current_sampling_frame(
         **_frame_kwargs(tmp_path)
     ) == sealed
+
+
+def test_frame_rejects_symlink_publisher_lock_without_touching_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import eval.seal_e1a4_sampling_frame as runner
+
+    _patch_frame_trust(runner, tmp_path, monkeypatch)
+    parent = tmp_path / "output" / "e1a4" / "sampling-frame"
+    parent.mkdir(parents=True)
+    external = tmp_path / "external-lock-target"
+    external.write_bytes(b"synthetic sentinel")
+    lock_path = parent / ".v1.publish.lock"
+    try:
+        lock_path.symlink_to(external)
+    except (NotImplementedError, OSError) as error:
+        pytest.skip(f"file symlinks unavailable: {type(error).__name__}")
+
+    with pytest.raises(
+        runner.E1A4SamplingFrameError,
+        match="^E1A4_SAMPLING_FRAME_WRITE_FAILED$",
+    ):
+        runner.seal_sampling_frame(**_frame_kwargs(tmp_path))
+
+    assert external.read_bytes() == b"synthetic sentinel"
+    assert not (parent / "v1").exists()
+
+
+def test_frame_rejects_non_regular_publisher_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import eval.seal_e1a4_sampling_frame as runner
+
+    _patch_frame_trust(runner, tmp_path, monkeypatch)
+    parent = tmp_path / "output" / "e1a4" / "sampling-frame"
+    lock_path = parent / ".v1.publish.lock"
+    lock_path.mkdir(parents=True)
+
+    with pytest.raises(
+        runner.E1A4SamplingFrameError,
+        match="^E1A4_SAMPLING_FRAME_WRITE_FAILED$",
+    ):
+        runner.seal_sampling_frame(**_frame_kwargs(tmp_path))
+
+    assert lock_path.is_dir()
+    assert not (parent / "v1").exists()
+
+
+def test_frame_rejects_injected_windows_reparse_lock_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import eval.seal_e1a4_sampling_frame as runner
+
+    _patch_frame_trust(runner, tmp_path, monkeypatch)
+    parent = tmp_path / "output" / "e1a4" / "sampling-frame"
+    parent.mkdir(parents=True)
+    lock_path = parent / ".v1.publish.lock"
+    lock_path.write_bytes(b"0")
+    real_lstat = runner.os.lstat
+
+    class ReparseStat:
+        def __init__(self, observed: object) -> None:
+            self._observed = observed
+            self.st_file_attributes = (
+                getattr(observed, "st_file_attributes", 0)
+                | stat.FILE_ATTRIBUTE_REPARSE_POINT
+            )
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._observed, name)
+
+    def lstat_with_reparse(path: object, *args: object, **kwargs: object) -> object:
+        observed = real_lstat(path, *args, **kwargs)
+        if Path(path) == lock_path:
+            return ReparseStat(observed)
+        return observed
+
+    monkeypatch.setattr(runner.os, "lstat", lstat_with_reparse)
+
+    with pytest.raises(
+        runner.E1A4SamplingFrameError,
+        match="^E1A4_SAMPLING_FRAME_WRITE_FAILED$",
+    ):
+        runner.seal_sampling_frame(**_frame_kwargs(tmp_path))
+
+    assert lock_path.read_bytes() == b"0"
+    assert not (parent / "v1").exists()
+
+
+def test_failed_publisher_cleans_owned_final_before_releasing_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import eval.seal_e1a4_sampling_frame as runner
+
+    _patch_frame_trust(runner, tmp_path, monkeypatch)
+    real_verify = runner.verify_sampling_frame
+    real_remove = runner._remove_owned_publication
+    cleanup_started = Event()
+    publisher_two_done = Event()
+    results: dict[str, object] = {}
+
+    def fail_first_verification(**kwargs: object) -> object:
+        if current_thread().name == "publisher-1":
+            raise runner.E1A4SamplingFrameError(
+                "E1A4_SAMPLING_FRAME_VERIFY_FAILED"
+            )
+        return real_verify(**kwargs)
+
+    def coordinated_remove(final: Path, identity: object) -> None:
+        if current_thread().name == "publisher-1":
+            cleanup_started.set()
+            assert publisher_two_done.wait(10)
+        real_remove(final, identity)
+
+    monkeypatch.setattr(runner, "verify_sampling_frame", fail_first_verification)
+    monkeypatch.setattr(runner, "_remove_owned_publication", coordinated_remove)
+
+    def publish(name: str) -> None:
+        try:
+            results[name] = runner.seal_sampling_frame(**_frame_kwargs(tmp_path))
+        except runner.E1A4SamplingFrameError as error:
+            results[name] = error
+        finally:
+            if name == "publisher-2":
+                publisher_two_done.set()
+
+    first = Thread(target=publish, args=("publisher-1",), name="publisher-1")
+    second = Thread(target=publish, args=("publisher-2",), name="publisher-2")
+    first.start()
+    assert cleanup_started.wait(10)
+    second.start()
+    first.join(10)
+    second.join(10)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert str(results["publisher-1"]) == "E1A4_SAMPLING_FRAME_VERIFY_FAILED"
+    assert str(results["publisher-2"]) == "E1A4_SAMPLING_FRAME_WRITE_FAILED"
+    parent = tmp_path / "output" / "e1a4" / "sampling-frame"
+    assert not (parent / "v1").exists()
+    assert not tuple(parent.glob(".v1.*.tmp"))
 
 
 def test_frame_publication_race_preserves_concurrent_destination(

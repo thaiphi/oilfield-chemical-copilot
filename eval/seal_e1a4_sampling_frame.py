@@ -14,7 +14,7 @@ import shutil
 import stat
 import sys
 from tempfile import mkdtemp
-from typing import BinaryIO, Iterator, Mapping, Sequence
+from typing import Iterator, Mapping, Sequence
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -602,41 +602,68 @@ def _rename_no_replace(staged: Path, final: Path) -> None:
 @contextmanager
 def _publisher_lock(parent: Path) -> Iterator[None]:
     """Hold an OS-released exclusive lock for the whole publication attempt."""
-    stream: BinaryIO | None = None
+    descriptor: int | None = None
     unlock = None
     try:
-        stream = (parent / _PUBLISH_LOCK_NAME).open("a+b")
-        stream.seek(0, os.SEEK_END)
-        if stream.tell() == 0:
-            stream.write(b"0")
-            stream.flush()
-            os.fsync(stream.fileno())
-        stream.seek(0)
+        lock_path = parent / _PUBLISH_LOCK_NAME
+        resolved_parent = parent.resolve(strict=True)
+        open_flags = (
+            os.O_RDWR
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOINHERIT", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        try:
+            initial = os.lstat(lock_path)
+        except FileNotFoundError:
+            descriptor = os.open(
+                lock_path,
+                open_flags | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+        else:
+            _validate_lock_stat(initial)
+            descriptor = os.open(lock_path, open_flags)
+            if not os.path.samestat(initial, os.fstat(descriptor)):
+                raise OSError(errno.EAGAIN, "publisher lock changed")
+        _validate_open_lock(
+            descriptor=descriptor,
+            lock_path=lock_path,
+            resolved_parent=resolved_parent,
+        )
         if os.name == "nt":
             import msvcrt
 
-            msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
 
             def unlock() -> None:
-                assert stream is not None
-                stream.seek(0)
-                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+                assert descriptor is not None
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
 
         elif os.name == "posix":
             import fcntl
 
-            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
             def unlock() -> None:
-                assert stream is not None
-                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+                assert descriptor is not None
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
 
         else:
             raise OSError(errno.ENOTSUP, "publisher lock unavailable")
+        _validate_open_lock(
+            descriptor=descriptor,
+            lock_path=lock_path,
+            resolved_parent=resolved_parent,
+        )
     except Exception as error:
-        if stream is not None:
+        if descriptor is not None:
             try:
-                stream.close()
+                os.close(descriptor)
             except Exception:
                 pass
         raise E1A4SamplingFrameError(
@@ -653,14 +680,43 @@ def _publisher_lock(parent: Path) -> Iterator[None]:
         except Exception as error:
             cleanup_error = error
         try:
-            assert stream is not None
-            stream.close()
+            assert descriptor is not None
+            os.close(descriptor)
         except Exception as error:
             cleanup_error = cleanup_error or error
         if cleanup_error is not None:
             raise E1A4SamplingFrameError(
                 "E1A4_SAMPLING_FRAME_WRITE_FAILED"
             ) from cleanup_error
+
+
+def _validate_lock_stat(observed: os.stat_result) -> None:
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    attributes = getattr(observed, "st_file_attributes", 0)
+    if (
+        not stat.S_ISREG(observed.st_mode)
+        or bool(attributes & reparse_flag)
+        or observed.st_nlink != 1
+    ):
+        raise OSError(errno.EPERM, "unsafe publisher lock")
+
+
+def _validate_open_lock(
+    *, descriptor: int, lock_path: Path, resolved_parent: Path
+) -> None:
+    opened = os.fstat(descriptor)
+    candidate = os.lstat(lock_path)
+    _validate_lock_stat(opened)
+    _validate_lock_stat(candidate)
+    if not os.path.samestat(opened, candidate):
+        raise OSError(errno.EAGAIN, "publisher lock changed")
+    resolved_lock = lock_path.resolve(strict=True)
+    if resolved_lock.parent != resolved_parent:
+        raise OSError(errno.EPERM, "publisher lock escaped parent")
+    final_candidate = os.lstat(lock_path)
+    _validate_lock_stat(final_candidate)
+    if not os.path.samestat(opened, final_candidate):
+        raise OSError(errno.EAGAIN, "publisher lock changed")
 
 
 def _is_staging_name(name: str) -> bool:
@@ -766,52 +822,65 @@ def _publish_sampling_frame(
     try:
         parent.mkdir(parents=True, exist_ok=True)
         with _publisher_lock(parent):
-            _remove_abandoned_staging(parent)
-            if final.exists():
-                return verify_sampling_frame(
-                    source_register=source_register,
-                    allocation=allocation,
-                    output_root=output_root,
-                )
-            staged = Path(mkdtemp(prefix=".v1.", suffix=".tmp", dir=parent))
-            (staged / "sealed").mkdir()
-            (staged / "manifests").mkdir()
-            for name, content in (
-                (SOURCE_REGISTER_NAME, _canonical(source_register)),
-                (ALLOCATION_NAME, _canonical(allocation)),
-            ):
-                payload_path = staged / "sealed" / name
-                manifest_path = staged / "manifests" / _manifest_name(name)
-                for path, value in (
-                    (payload_path, content),
-                    (
-                        manifest_path,
-                        (
-                            hashlib.sha256(content).hexdigest() + "\n"
-                        ).encode("ascii"),
-                    ),
-                ):
-                    with path.open("xb") as stream:
-                        stream.write(value)
-                        stream.flush()
-                        os.fsync(stream.fileno())
-            published_identity = staged.stat()
-            _rename_no_replace(staged, final)
-            staged = None
-            return verify_sampling_frame(
-                source_register=source_register,
-                allocation=allocation,
-                output_root=output_root,
-            )
+            try:
+                _remove_abandoned_staging(parent)
+                if final.exists():
+                    result = verify_sampling_frame(
+                        source_register=source_register,
+                        allocation=allocation,
+                        output_root=output_root,
+                    )
+                else:
+                    staged = Path(
+                        mkdtemp(prefix=".v1.", suffix=".tmp", dir=parent)
+                    )
+                    (staged / "sealed").mkdir()
+                    (staged / "manifests").mkdir()
+                    for name, content in (
+                        (SOURCE_REGISTER_NAME, _canonical(source_register)),
+                        (ALLOCATION_NAME, _canonical(allocation)),
+                    ):
+                        payload_path = staged / "sealed" / name
+                        manifest_path = staged / "manifests" / _manifest_name(
+                            name
+                        )
+                        for path, value in (
+                            (payload_path, content),
+                            (
+                                manifest_path,
+                                (
+                                    hashlib.sha256(content).hexdigest() + "\n"
+                                ).encode("ascii"),
+                            ),
+                        ):
+                            with path.open("xb") as stream:
+                                stream.write(value)
+                                stream.flush()
+                                os.fsync(stream.fileno())
+                    published_identity = staged.stat()
+                    _rename_no_replace(staged, final)
+                    staged = None
+                    result = verify_sampling_frame(
+                        source_register=source_register,
+                        allocation=allocation,
+                        output_root=output_root,
+                    )
+            except E1A4SamplingFrameError:
+                _remove_owned_publication(final, published_identity)
+                if staged is not None and staged.exists():
+                    shutil.rmtree(staged, ignore_errors=True)
+                raise
+            except Exception as error:
+                _remove_owned_publication(final, published_identity)
+                if staged is not None and staged.exists():
+                    shutil.rmtree(staged, ignore_errors=True)
+                raise E1A4SamplingFrameError(
+                    "E1A4_SAMPLING_FRAME_WRITE_FAILED"
+                ) from error
+        return result
     except E1A4SamplingFrameError:
-        _remove_owned_publication(final, published_identity)
-        if staged is not None and staged.exists():
-            shutil.rmtree(staged, ignore_errors=True)
         raise
     except Exception as error:
-        _remove_owned_publication(final, published_identity)
-        if staged is not None and staged.exists():
-            shutil.rmtree(staged, ignore_errors=True)
         raise E1A4SamplingFrameError(
             "E1A4_SAMPLING_FRAME_WRITE_FAILED"
         ) from error
