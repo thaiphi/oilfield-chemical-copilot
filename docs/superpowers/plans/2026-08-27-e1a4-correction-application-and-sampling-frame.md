@@ -438,7 +438,7 @@ Verify reconciliation `index_sources` and `index_locators` still equal the activ
 - Consumes: aggregate verified private results only.
 - Produces: synchronized public Task 2 status and a reviewed tracked commit.
 
-- [ ] **Step 1: Update public status with aggregates only**
+- [x] **Step 1: Update public status with aggregates only**
 
 Record mapping/frame verification, source-record count only when disclosure-safe, eight-stratum status, exact slot count, mutation-boundary result, and the next checkpoint: private question/canonical-claim authoring. Include no identifiers, locators, paths, decisions, or hashes.
 
