@@ -1390,3 +1390,183 @@ def test_public_mapping_operations_reject_post_verification_sqlite_drift(
             operation,
             mapping_binding=mapping_binding,
         )
+
+
+def _mapping_runner_args(
+    chain: _TrustChain, command: str, *, mapping_binding: str | None = None
+) -> list[str]:
+    arguments = [
+        command,
+        "--reconciliation-root",
+        str(chain.store.root),
+        "--run-id",
+        chain.store.run_id,
+        "--core-audit-id",
+        chain.core.audit_id,
+        "--supplement-audit-id",
+        chain.supplement.audit_id,
+        "--expected-reconciliation-binding-sha256",
+        chain.reconciliation_binding,
+        "--expected-core-binding-sha256",
+        chain.core_binding,
+        "--expected-supplement-binding-sha256",
+        chain.supplement_binding,
+        "--e1a3-allocation-path",
+        str(chain.allocation_path),
+        "--e1a3-allocation-manifest-path",
+        str(chain.allocation_manifest_path),
+        "--e1a3-private-root",
+        str(chain.private_root),
+        "--output-root",
+        str(chain.output_root),
+    ]
+    if mapping_binding is not None:
+        arguments.extend(
+            ["--expected-mapping-binding-sha256", mapping_binding]
+        )
+    return arguments
+
+
+def test_mapping_cli_apply_and_verify_emit_exact_aggregate_json(
+    trust_chain: _TrustChain, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import eval.apply_e1a4_role_corrections as runner
+
+    assert runner.cli(_mapping_runner_args(trust_chain, "apply")) == 0
+    applied = json.loads(capsys.readouterr().out)
+    binding_path = (
+        trust_chain.output_root
+        / "e1a4-role-mapping"
+        / "v1"
+        / "sealed"
+        / "mapping-binding.v1.json"
+    )
+    binding = hashlib.sha256(binding_path.read_bytes()).hexdigest()
+
+    assert applied == {
+        "status": "E1A4_ROLE_MAPPING_SEALED",
+        "source_record_count": 11,
+        "sufficient_strata_count": 8,
+        "allocator_slot_count": 96,
+    }
+    assert runner.cli(
+        _mapping_runner_args(
+            trust_chain, "verify", mapping_binding=binding
+        )
+    ) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        **applied,
+        "status": "E1A4_ROLE_MAPPING_VERIFIED",
+    }
+
+
+def test_mapping_cli_uses_one_sqlite_path_and_closes_every_opened_store(
+    trust_chain: _TrustChain,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import eval.apply_e1a4_role_corrections as runner
+
+    opened: list[object] = []
+    closed: list[object] = []
+    database_paths: list[Path] = []
+    real_store_open = runner.ReconciliationStore.open
+    real_core_open = runner.FoundationalAuditStore.open
+    real_supplement_open = runner.IronSulfideSupplementAuditStore.open
+    real_store_close = runner.ReconciliationStore.close
+    real_core_close = runner.FoundationalAuditStore.close
+    real_supplement_close = runner.IronSulfideSupplementAuditStore.close
+
+    def open_store(_cls: object, **kwargs: object) -> object:
+        result = real_store_open(**kwargs)  # type: ignore[arg-type]
+        opened.append(result)
+        database_paths.append((Path(kwargs["root"]) / "reconciliation.sqlite").resolve())
+        return result
+
+    def open_core(_cls: object, **kwargs: object) -> object:
+        result = real_core_open(**kwargs)  # type: ignore[arg-type]
+        opened.append(result)
+        database_paths.append(Path(kwargs["database_path"]).resolve())
+        return result
+
+    def open_supplement(_cls: object, **kwargs: object) -> object:
+        result = real_supplement_open(**kwargs)  # type: ignore[arg-type]
+        opened.append(result)
+        database_paths.append(Path(kwargs["database_path"]).resolve())
+        return result
+
+    def close_store(instance: object) -> None:
+        closed.append(instance)
+        real_store_close(instance)  # type: ignore[arg-type]
+
+    def close_core(instance: object) -> None:
+        closed.append(instance)
+        real_core_close(instance)  # type: ignore[arg-type]
+
+    def close_supplement(instance: object) -> None:
+        closed.append(instance)
+        real_supplement_close(instance)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        runner.ReconciliationStore, "open", classmethod(open_store)
+    )
+    monkeypatch.setattr(
+        runner.FoundationalAuditStore, "open", classmethod(open_core)
+    )
+    monkeypatch.setattr(
+        runner.IronSulfideSupplementAuditStore,
+        "open",
+        classmethod(open_supplement),
+    )
+    monkeypatch.setattr(runner.ReconciliationStore, "close", close_store)
+    monkeypatch.setattr(runner.FoundationalAuditStore, "close", close_core)
+    monkeypatch.setattr(
+        runner.IronSulfideSupplementAuditStore, "close", close_supplement
+    )
+
+    assert runner.cli(_mapping_runner_args(trust_chain, "apply")) == 0
+    assert len(opened) == 3
+    assert {id(item) for item in closed} == {id(item) for item in opened}
+    assert len(set(database_paths)) == 1
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize("mode", ["malformed", "unexpected"])
+def test_mapping_cli_sanitizes_failures_without_private_values(
+    trust_chain: _TrustChain,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    import eval.apply_e1a4_role_corrections as runner
+
+    private_values = (
+        str(trust_chain.store.root),
+        trust_chain.store.run_id,
+        trust_chain.reconciliation_binding,
+        "prior:01",
+    )
+    arguments = _mapping_runner_args(trust_chain, "apply")
+    if mode == "malformed":
+        arguments.append("--unexpected-private-option")
+    else:
+        monkeypatch.setattr(
+            runner,
+            "seal_e1a4_role_mapping",
+            lambda **_kwargs: (_ for _ in ()).throw(
+                RuntimeError(" ".join(private_values))
+            ),
+        )
+
+    assert runner.cli(arguments) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert json.loads(captured.err) == {
+        "status": "E1A4_ROLE_MAPPING_BLOCKED",
+        "error_code": (
+            "E1A4_ROLE_MAPPING_ARGUMENT_INVALID"
+            if mode == "malformed"
+            else "E1A4_ROLE_MAPPING_OPERATION_FAILED"
+        ),
+    }
+    assert not any(value in captured.out + captured.err for value in private_values)
