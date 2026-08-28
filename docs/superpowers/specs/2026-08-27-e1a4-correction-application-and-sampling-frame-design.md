@@ -59,16 +59,17 @@ e1a4-role-mapping/v1/sealed/
   mapping-binding.v1.json.sha256
 ```
 
-The sampling-frame sealer publishes exactly four files beneath the ignored E1a-4 evaluation boundary:
+The sampling-frame sealer publishes exactly four files beneath one versioned directory inside the ignored E1a-4 evaluation boundary:
 
 ```text
-e1a4/sealed/source-register.v1.json
-e1a4/manifests/source-register.v1.sha256
-e1a4/sealed/sampling-allocation.v1.json
-e1a4/manifests/sampling-allocation.v1.sha256
+e1a4/sampling-frame/v1/
+  sealed/source-register.v1.json
+  sealed/sampling-allocation.v1.json
+  manifests/source-register.v1.sha256
+  manifests/sampling-allocation.v1.sha256
 ```
 
-Both artifact sets use canonical JSON, SHA-256 manifests, single-directory atomic publication, exact-file-set verification, and no overwrite. An existing complete artifact is accepted only after exact no-write verification against current authenticated state.
+Both artifact sets use canonical JSON, SHA-256 manifests, atomic publication of the complete version directory by one rename, exact-file-set verification, and no overwrite. An existing complete artifact is accepted only after exact no-write verification against current authenticated state.
 
 ## Role-Mapping Payload
 
