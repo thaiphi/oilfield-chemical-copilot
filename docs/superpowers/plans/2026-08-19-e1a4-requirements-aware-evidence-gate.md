@@ -12,7 +12,7 @@
 
 ## Progress Ledger
 
-**Last reconciled:** 2026-08-27
+**Last reconciled:** 2026-08-28
 
 | Task | Status | Evidence and next gate |
 | --- | --- | --- |
@@ -25,9 +25,9 @@
 
 **Verification recorded at reconciliation:** the combined Task 1-2 focused suite passed 47 tests and Ruff passed for the Task 1-2 files. This verifies implementation files only; it is not evidence that the question and claim population is complete.
 
-**Private corpus reconciliation evidence:** the contract-bound reconciliation run completed every inventory, matching, and capacity stage; the no-write E1a-4 allocation stage blocked as designed; and all six private JSONL snapshots plus manifests verified. That checkpoint classified the blocker as foundational-locator freshness across all four topics, not general supporting-source capacity and not evidence that bulk ingestion was required. The resulting audits and current gate are recorded below.
+**Historical checkpoint — private corpus reconciliation evidence:** the contract-bound reconciliation run completed every inventory, matching, and capacity stage; the no-write E1a-4 allocation stage blocked as designed; and all six private JSONL snapshots plus manifests verified. That checkpoint classified the blocker as foundational-locator freshness across all four topics, not general supporting-source capacity and not evidence that bulk ingestion was required. The resulting audits and current gate are recorded below.
 
-**Foundational-locator audit evidence:** the approved audit reviewed all 133 bound candidates, proposed 92 promotions, retained 41 as ineligible, and closed with zero unresolved items. The stricter v2 correction seal and manifests passed separate no-write verification and have not been applied; the earlier v1 seal is preserved as superseded history. Independent review approved the v2 contract with no findings. At that checkpoint, the projection established sufficient foundational capacity for scale, corrosion, and paraffin but only 5 of 12 required fresh foundational Iron Sulfide locators, leading to the supplement follow-up below.
+**Historical checkpoint — foundational-locator audit evidence:** the approved audit reviewed all 133 bound candidates, proposed 92 promotions, retained 41 as ineligible, and closed with zero unresolved items. The stricter v2 correction seal and manifests passed separate no-write verification and have not been applied; the earlier v1 seal is preserved as superseded history. Independent review approved the v2 contract with no findings. At that checkpoint, the projection established sufficient foundational capacity for scale, corrosion, and paraffin but only 5 of 12 required fresh foundational Iron Sulfide locators, leading to the supplement follow-up below.
 
 **Sampling-frame closure:** the seven-artifact reconciliation snapshot set plus both correction proposals were reverified before application. The authenticated role mapping is sealed and independently no-write verified with 170 source records and all eight topic/role strata sufficient. The deterministic metadata-only frame is also sealed and independently verified: exactly 96 slots, 96 unique slot identities, 96 unique source-locator assignments, all four topics, both roles, and zero E1a-3 locator reuse. Mutation-boundary checks are clean: Qdrant and application services were not run, and no retrieval, ingestion, reindexing, model, question, or claim artifact was created. The next checkpoint is private question and canonical-claim authoring only.
 

@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-27
 
-**Status:** Approved design; implementation not yet started
+**Status:** Implemented and privately sealed/verified on 2026-08-28; public documentation contains aggregates only
 
 ## Objective
 
@@ -17,7 +17,7 @@ This stage stops before question authoring, canonical-claim authoring, retrieval
 - The Iron Sulfide supplement correction proposal has a verified v2 seal and passed independent review.
 - Their combined no-write projection satisfies all eight topic/role strata and the exact 96-slot allocator.
 - The frozen E1a-3 allocation remains the authoritative prior-locator exclusion set.
-- The earlier E1a-4 Task 2 implementation exists only as reviewed, untracked workspace files and must be recovered into the isolated branch before it can be executed or finalized.
+- Historical pre-implementation context: the earlier E1a-4 Task 2 implementation was once reviewed in a workspace-only state and required recovery into the isolated branch. The current tracked implementation has since been executed, privately sealed, and independently verified on 2026-08-28; no question, retrieval, ingestion, or reindexing work was authorized.
 
 ## Selected Approach
 
