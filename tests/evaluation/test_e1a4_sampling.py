@@ -3,7 +3,9 @@ from __future__ import annotations
 from dataclasses import replace
 from hashlib import sha256
 import json
+import os
 from pathlib import Path
+import stat
 from threading import Event, Thread, current_thread
 from types import SimpleNamespace
 
@@ -796,6 +798,427 @@ def test_frame_retry_removes_abandoned_staging_before_publication(
     assert runner.verify_current_sampling_frame(
         **_frame_kwargs(tmp_path)
     ) == sealed
+
+
+def test_frame_verifier_rejects_symlinked_final_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import eval.seal_e1a4_sampling_frame as runner
+
+    _patch_frame_trust(runner, tmp_path, monkeypatch)
+    runner.seal_sampling_frame(**_frame_kwargs(tmp_path))
+    final = tmp_path / "output" / "e1a4" / "sampling-frame" / "v1"
+    target = tmp_path / "external-frame"
+    final.rename(target)
+    try:
+        final.symlink_to(target, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"symlink creation unavailable: {error}")
+
+    with pytest.raises(
+        runner.E1A4SamplingFrameError,
+        match="E1A4_SAMPLING_FRAME_VERIFY_FAILED",
+    ):
+        runner.verify_current_sampling_frame(**_frame_kwargs(tmp_path))
+
+
+def test_frame_verifier_rejects_symlinked_sealed_member(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import eval.seal_e1a4_sampling_frame as runner
+
+    _patch_frame_trust(runner, tmp_path, monkeypatch)
+    runner.seal_sampling_frame(**_frame_kwargs(tmp_path))
+    final = tmp_path / "output" / "e1a4" / "sampling-frame" / "v1"
+    member = final / "sealed" / runner.SOURCE_REGISTER_NAME
+    replacement = tmp_path / "external-member"
+    replacement.write_bytes(member.read_bytes())
+    member.unlink()
+    try:
+        member.symlink_to(replacement)
+    except OSError as error:
+        pytest.skip(f"symlink creation unavailable: {error}")
+
+    with pytest.raises(
+        runner.E1A4SamplingFrameError,
+        match="E1A4_SAMPLING_FRAME_VERIFY_FAILED",
+    ):
+        runner.verify_current_sampling_frame(**_frame_kwargs(tmp_path))
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX FIFO")
+def test_frame_verifier_rejects_fifo_member_without_blocking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import multiprocessing
+
+    import eval.seal_e1a4_sampling_frame as runner
+
+    _patch_frame_trust(runner, tmp_path, monkeypatch)
+    runner.seal_sampling_frame(**_frame_kwargs(tmp_path))
+    final = tmp_path / "output" / "e1a4" / "sampling-frame" / "v1"
+    member = final / "sealed" / runner.SOURCE_REGISTER_NAME
+    member.unlink()
+    os.mkfifo(member)
+
+    def verify_in_child() -> None:
+        try:
+            runner.verify_current_sampling_frame(**_frame_kwargs(tmp_path))
+        except runner.E1A4SamplingFrameError:
+            return
+        raise AssertionError("FIFO member was accepted")
+
+    process = multiprocessing.Process(target=verify_in_child)
+    process.start()
+    process.join(1)
+    blocked = process.is_alive()
+    if blocked:
+        process.terminate()
+        process.join(5)
+    assert not blocked
+    assert process.exitcode == 0
+
+
+def test_abandoned_staging_cleanup_does_not_delete_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import eval.seal_e1a4_sampling_frame as runner
+
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    candidate = parent / ".v1.abandoned.tmp"
+    candidate.mkdir()
+    (candidate / "owned").write_text("owned")
+    parked = parent / ".v1.parked.tmp"
+    original_resolve = Path.resolve
+    replaced = False
+
+    def replace_after_identity(path: Path, *args: object, **kwargs: object) -> Path:
+        nonlocal replaced
+        if path == candidate and not replaced:
+            replaced = True
+            candidate.rename(parked)
+            candidate.mkdir()
+            (candidate / "replacement").write_text("must survive")
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", replace_after_identity)
+
+    with pytest.raises(OSError):
+        runner._remove_abandoned_staging(parent)
+
+    assert (candidate / "replacement").read_text() == "must survive"
+    assert (parked / "owned").read_text() == "owned"
+
+
+class _FakeFrameWindowsReader:
+    def __init__(
+        self,
+        members: dict[str, bytes],
+        *,
+        unsafe_member: str | None = None,
+        replaced_member: str | None = None,
+        unsafe_root: bool = False,
+        replaced_root: bool = False,
+        fail_close: object | None = None,
+    ) -> None:
+        self.members = members
+        self.unsafe_member = unsafe_member
+        self.replaced_member = replaced_member
+        self.unsafe_root = unsafe_root
+        self.replaced_root = replaced_root
+        self.fail_close = fail_close
+        self.root_validations = 0
+        self.opens: dict[str, int] = {}
+        self.closed: list[object] = []
+
+    def open_directory(self, _path: Path) -> str:
+        if self.unsafe_root:
+            raise OSError("frame directory is reparse")
+        return "root"
+
+    def open_child(self, _parent: object, name: str) -> str:
+        return name
+
+    def _validate_handle(self, handle: object, *, directory: bool) -> tuple[object, ...]:
+        if directory:
+            if handle == "root":
+                self.root_validations += 1
+                return (
+                    handle,
+                    "replacement"
+                    if self.replaced_root and self.root_validations > 1
+                    else "original",
+                )
+            return (handle, "directory")
+        raise AssertionError("member validation uses member_snapshot")
+
+    def directory_entries(self, handle: object) -> set[str]:
+        if handle == "root":
+            return {"sealed", "manifests"}
+        return {
+            key.removeprefix(f"{handle}/")
+            for key in self.members
+            if key.startswith(f"{handle}/")
+        }
+
+    def open_member(self, directory: object, name: str) -> tuple[str, int]:
+        key = f"{directory}/{name}"
+        self.opens[key] = self.opens.get(key, 0) + 1
+        return key, self.opens[key]
+
+    def member_snapshot(self, handle: tuple[str, int]) -> tuple[object, ...]:
+        key, generation = handle
+        if key == self.unsafe_member:
+            raise OSError("member is reparse")
+        identity = (
+            "replacement"
+            if key == self.replaced_member and generation > 1
+            else "original"
+        )
+        return key, identity, len(self.members[key])
+
+    def read_member(self, handle: tuple[str, int]) -> bytes:
+        return self.members[handle[0]]
+
+    def close_handle(self, handle: object) -> None:
+        self.closed.append(handle)
+        if handle == self.fail_close:
+            raise OSError("synthetic close failure")
+
+
+def test_frame_windows_reader_rejects_reparse_member_via_native_seam(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import eval.seal_e1a4_sampling_frame as runner
+
+    _patch_frame_trust(runner, tmp_path, monkeypatch)
+    runner.seal_sampling_frame(**_frame_kwargs(tmp_path))
+    final = tmp_path / "output" / "e1a4" / "sampling-frame" / "v1"
+    members = {
+        path.relative_to(final).as_posix(): path.read_bytes()
+        for path in final.rglob("*")
+        if path.is_file()
+    }
+    api = _FakeFrameWindowsReader(
+        members, unsafe_member=f"sealed/{runner.SOURCE_REGISTER_NAME}"
+    )
+    monkeypatch.setattr(
+        runner._mapping_application, "_windows_seal_reader_api", lambda: api
+    )
+    monkeypatch.setattr(
+        runner,
+        "_open_windows_child_directory",
+        lambda _api, parent, name: api.open_child(parent, name),
+    )
+
+    with pytest.raises(OSError, match="member is reparse"):
+        runner._read_windows_frame_members(final)
+
+    assert f"sealed/{runner.SOURCE_REGISTER_NAME}" in api.opens
+    assert "root" in api.closed
+
+
+def test_frame_windows_reader_rejects_reparse_final_directory_via_native_seam(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import eval.seal_e1a4_sampling_frame as runner
+
+    api = _FakeFrameWindowsReader({}, unsafe_root=True)
+    monkeypatch.setattr(
+        runner._mapping_application, "_windows_seal_reader_api", lambda: api
+    )
+
+    with pytest.raises(OSError, match="directory is reparse"):
+        runner._read_windows_frame_members(Path("frame"))
+
+    assert not api.closed
+
+
+def test_frame_windows_reader_rejects_member_replacement_via_native_seam(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import eval.seal_e1a4_sampling_frame as runner
+
+    _patch_frame_trust(runner, tmp_path, monkeypatch)
+    runner.seal_sampling_frame(**_frame_kwargs(tmp_path))
+    final = tmp_path / "output" / "e1a4" / "sampling-frame" / "v1"
+    members = {
+        path.relative_to(final).as_posix(): path.read_bytes()
+        for path in final.rglob("*")
+        if path.is_file()
+    }
+    replaced = f"sealed/{runner.SOURCE_REGISTER_NAME}"
+    api = _FakeFrameWindowsReader(members, replaced_member=replaced)
+    monkeypatch.setattr(
+        runner._mapping_application, "_windows_seal_reader_api", lambda: api
+    )
+    monkeypatch.setattr(
+        runner,
+        "_open_windows_child_directory",
+        lambda _api, parent, name: api.open_child(parent, name),
+    )
+
+    with pytest.raises(OSError, match="frame member changed"):
+        runner._read_windows_frame_members(final)
+
+    assert api.opens[replaced] == 2
+
+
+def test_frame_windows_reader_rejects_final_directory_replacement_via_native_seam(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import eval.seal_e1a4_sampling_frame as runner
+
+    members = {
+        f"sealed/{runner.SOURCE_REGISTER_NAME}": b"source",
+        f"sealed/{runner.ALLOCATION_NAME}": b"allocation",
+        f"manifests/{runner._manifest_name(runner.SOURCE_REGISTER_NAME)}": b"digest\n",
+        f"manifests/{runner._manifest_name(runner.ALLOCATION_NAME)}": b"digest\n",
+    }
+    api = _FakeFrameWindowsReader(members, replaced_root=True)
+    monkeypatch.setattr(
+        runner._mapping_application, "_windows_seal_reader_api", lambda: api
+    )
+    monkeypatch.setattr(
+        runner,
+        "_open_windows_child_directory",
+        lambda _api, parent, name: api.open_child(parent, name),
+    )
+
+    with pytest.raises(OSError, match="frame directory changed"):
+        runner._read_windows_frame_members(Path("frame"))
+
+
+def test_frame_windows_reader_attempts_all_closes_after_close_failure(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import eval.seal_e1a4_sampling_frame as runner
+
+    members = {
+        f"sealed/{runner.SOURCE_REGISTER_NAME}": b"source",
+        f"sealed/{runner.ALLOCATION_NAME}": b"allocation",
+        f"manifests/{runner._manifest_name(runner.SOURCE_REGISTER_NAME)}": b"digest\n",
+        f"manifests/{runner._manifest_name(runner.ALLOCATION_NAME)}": b"digest\n",
+    }
+    api = _FakeFrameWindowsReader(members, fail_close="manifests")
+    monkeypatch.setattr(
+        runner._mapping_application, "_windows_seal_reader_api", lambda: api
+    )
+    monkeypatch.setattr(
+        runner,
+        "_open_windows_child_directory",
+        lambda _api, parent, name: api.open_child(parent, name),
+    )
+
+    with pytest.raises(OSError, match="synthetic close failure"):
+        runner._read_windows_frame_members(Path("frame"))
+
+    assert api.closed[-1] == "root"
+
+
+class _FakeFramePosixOS:
+    O_RDONLY = 0x01
+    O_CLOEXEC = 0x02
+    O_DIRECTORY = 0x04
+    O_NOFOLLOW = 0x08
+    O_NONBLOCK = 0x10
+
+    def __init__(self, members: dict[str, bytes], *, fifo: str) -> None:
+        self.members = members
+        self.fifo = fifo
+        self.events: list[tuple[object, ...]] = []
+        self.next_fd = 10
+        self.handles: dict[int, str] = {}
+        self.read_done: set[int] = set()
+
+    def open(self, path: object, flags: int, *, dir_fd: int | None = None) -> int:
+        name = str(path)
+        self.events.append(("open", name, flags, dir_fd))
+        if dir_fd is not None and "/" in self.handles[dir_fd]:
+            if name == self.fifo:
+                raise AssertionError("blocking FIFO open attempted")
+            key = f"{self.handles[dir_fd]}/{name}"
+        elif dir_fd is not None and name in {"sealed", "manifests"}:
+            key = name
+        elif dir_fd is None:
+            key = "root"
+        else:
+            key = f"{self.handles[dir_fd]}/{name}"
+        fd = self.next_fd
+        self.next_fd += 1
+        self.handles[fd] = key
+        return fd
+
+    def fstat(self, fd: int) -> object:
+        key = self.handles[fd]
+        if key in {"root", "sealed", "manifests"}:
+            return SimpleNamespace(st_mode=stat.S_IFDIR | 0o700, st_dev=1, st_ino=fd)
+        content = self.members[key]
+        return SimpleNamespace(
+            st_mode=(stat.S_IFIFO if key.endswith(self.fifo) else stat.S_IFREG) | 0o600,
+            st_nlink=1,
+            st_dev=1,
+            st_ino=100 + sorted(self.members).index(key),
+            st_size=len(content),
+            st_mtime_ns=1,
+            st_ctime_ns=1,
+        )
+
+    def stat(self, path: object, *, dir_fd: int, follow_symlinks: bool) -> object:
+        key = f"{self.handles[dir_fd]}/{path}"
+        self.events.append(("stat", key, follow_symlinks))
+        content = self.members[key]
+        return SimpleNamespace(
+            st_mode=(stat.S_IFIFO if key.endswith(self.fifo) else stat.S_IFREG) | 0o600,
+            st_nlink=1,
+            st_dev=1,
+            st_ino=100 + sorted(self.members).index(key),
+            st_size=len(content),
+            st_mtime_ns=1,
+            st_ctime_ns=1,
+        )
+
+    def listdir(self, fd: int) -> list[str]:
+        key = self.handles[fd]
+        if key == "root":
+            return ["sealed", "manifests"]
+        return [
+            item.removeprefix(f"{key}/")
+            for item in self.members
+            if item.startswith(f"{key}/")
+        ]
+
+    def read(self, fd: int, _count: int) -> bytes:
+        key = self.handles[fd]
+        if fd in self.read_done:
+            return b""
+        self.read_done.add(fd)
+        return self.members[key]
+
+    def close(self, _fd: int) -> None:
+        return None
+
+
+def test_frame_posix_reader_rejects_fifo_before_opening_it() -> None:
+    import eval.seal_e1a4_sampling_frame as runner
+
+    fifo = runner.SOURCE_REGISTER_NAME
+    members = {
+        f"sealed/{runner.SOURCE_REGISTER_NAME}": b"source",
+        f"sealed/{runner.ALLOCATION_NAME}": b"allocation",
+        f"manifests/{runner._manifest_name(runner.SOURCE_REGISTER_NAME)}": b"digest\n",
+        f"manifests/{runner._manifest_name(runner.ALLOCATION_NAME)}": b"digest\n",
+    }
+    fake_os = _FakeFramePosixOS(members, fifo=fifo)
+
+    with pytest.raises(OSError, match="unsafe sealed member"):
+        runner._read_posix_frame_members(Path("frame"), os_api=fake_os)
+
+    assert ("stat", f"sealed/{fifo}", False) in fake_os.events
+    assert not any(
+        event[:2] == ("open", fifo) for event in fake_os.events
+    )
 
 
 def test_frame_publisher_lock_fails_closed_then_releases(

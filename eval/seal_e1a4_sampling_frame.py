@@ -34,6 +34,9 @@ from oilfield_chemical_copilot.evaluation.e1a4_mapping_application import (  # n
     E1A4MappingApplicationError,
     verify_e1a4_role_mapping,
 )
+from oilfield_chemical_copilot.evaluation import (  # noqa: E402
+    e1a4_mapping_application as _mapping_application,
+)
 from oilfield_chemical_copilot.evaluation.e1a4_sampling import (  # noqa: E402
     E1A4SamplingError,
     load_e1a3_prior_allocation,
@@ -1020,6 +1023,13 @@ def _remove_abandoned_staging(parent: Path) -> None:
         resolved = candidate.resolve(strict=True)
         if resolved.parent != resolved_parent:
             raise OSError(errno.EPERM, "unsafe staging directory")
+        current = candidate.lstat()
+        if (
+            stat.S_ISLNK(current.st_mode)
+            or not stat.S_ISDIR(current.st_mode)
+            or not os.path.samestat(candidate_stat, current)
+        ):
+            raise OSError(errno.EAGAIN, "staging directory changed")
         shutil.rmtree(resolved)
 
 
@@ -1034,6 +1044,218 @@ def _remove_owned_publication(final: Path, identity: os.stat_result | None) -> N
         shutil.rmtree(final, ignore_errors=True)
 
 
+def _read_posix_frame_members(
+    final: Path, *, os_api: object | None = None
+) -> dict[str, bytes]:
+    if os_api is None:
+        os_api = os
+    directory_flag = _mapping_application._required_posix_flag(
+        os_api, "O_DIRECTORY"
+    )
+    nofollow_flag = _mapping_application._required_posix_flag(
+        os_api, "O_NOFOLLOW"
+    )
+    nonblock_flag = _mapping_application._required_posix_flag(
+        os_api, "O_NONBLOCK"
+    )
+    root_fd: int | None = None
+    opened: list[int] = []
+    try:
+        root_fd = os_api.open(
+            final,
+            os_api.O_RDONLY
+            | directory_flag
+            | nofollow_flag
+            | getattr(os_api, "O_CLOEXEC", 0),
+        )
+        root_before = os_api.fstat(root_fd)
+        if not stat.S_ISDIR(root_before.st_mode):
+            raise OSError(errno.ENOTDIR, "unsafe frame directory")
+        if set(os_api.listdir(root_fd)) != {"sealed", "manifests"}:
+            _fail("E1A4_SAMPLING_FRAME_PARTIAL")
+        captured: dict[str, bytes] = {}
+        for dirname, names in (
+            ("sealed", {SOURCE_REGISTER_NAME, ALLOCATION_NAME}),
+            (
+                "manifests",
+                {
+                    _manifest_name(SOURCE_REGISTER_NAME),
+                    _manifest_name(ALLOCATION_NAME),
+                },
+            ),
+        ):
+            child_fd = os_api.open(
+                dirname,
+                os_api.O_RDONLY
+                | directory_flag
+                | nofollow_flag
+                | getattr(os_api, "O_CLOEXEC", 0),
+                dir_fd=root_fd,
+            )
+            opened.append(child_fd)
+            child_before = os_api.fstat(child_fd)
+            if not stat.S_ISDIR(child_before.st_mode) or set(
+                os_api.listdir(child_fd)
+            ) != names:
+                _fail("E1A4_SAMPLING_FRAME_PARTIAL")
+            for name in sorted(names):
+                before = _mapping_application._posix_member_snapshot(
+                    os_api.stat(name, dir_fd=child_fd, follow_symlinks=False)
+                )
+                member_fd = os_api.open(
+                    name,
+                    os_api.O_RDONLY
+                    | nofollow_flag
+                    | nonblock_flag
+                    | getattr(os_api, "O_CLOEXEC", 0),
+                    dir_fd=child_fd,
+                )
+                try:
+                    if before != _mapping_application._posix_member_snapshot(
+                        os_api.fstat(member_fd)
+                    ):
+                        raise OSError(errno.EAGAIN, "frame member changed")
+                    captured[f"{dirname}/{name}"] = (
+                        _mapping_application._read_posix_member(
+                            member_fd, os_api=os_api
+                        )
+                    )
+                    if before != _mapping_application._posix_member_snapshot(
+                        os_api.fstat(member_fd)
+                    ):
+                        raise OSError(errno.EAGAIN, "frame member changed")
+                finally:
+                    os_api.close(member_fd)
+            if not os.path.samestat(child_before, os_api.fstat(child_fd)):
+                raise OSError(errno.EAGAIN, "frame directory changed")
+        if not os.path.samestat(root_before, os_api.fstat(root_fd)):
+            raise OSError(errno.EAGAIN, "frame directory changed")
+        return captured
+    finally:
+        close_error: BaseException | None = None
+        for descriptor in reversed(opened):
+            try:
+                os_api.close(descriptor)
+            except BaseException as error:
+                close_error = close_error or error
+        if root_fd is not None:
+            try:
+                os_api.close(root_fd)
+            except BaseException as error:
+                close_error = close_error or error
+        if close_error is not None:
+            raise close_error
+
+
+def _read_windows_frame_members(final: Path) -> dict[str, bytes]:
+    api = _mapping_application._windows_seal_reader_api()
+    root: object | None = None
+    children: list[object] = []
+    try:
+        root = api.open_directory(final)
+        root_before = api._validate_handle(root, directory=True)
+        if api.directory_entries(root) != {"sealed", "manifests"}:
+            _fail("E1A4_SAMPLING_FRAME_PARTIAL")
+        captured: dict[str, bytes] = {}
+        for dirname, names in (
+            ("sealed", {SOURCE_REGISTER_NAME, ALLOCATION_NAME}),
+            (
+                "manifests",
+                {
+                    _manifest_name(SOURCE_REGISTER_NAME),
+                    _manifest_name(ALLOCATION_NAME),
+                },
+            ),
+        ):
+            child = _open_windows_child_directory(api, root, dirname)
+            children.append(child)
+            child_before = api._validate_handle(child, directory=True)
+            if api.directory_entries(child) != names:
+                _fail("E1A4_SAMPLING_FRAME_PARTIAL")
+            for name in sorted(names):
+                member = api.open_member(child, name)
+                current: object | None = None
+                try:
+                    before = api.member_snapshot(member)
+                    content = api.read_member(member)
+                    after = api.member_snapshot(member)
+                    current = api.open_member(child, name)
+                    if before != after or before != api.member_snapshot(current):
+                        raise OSError(errno.EAGAIN, "frame member changed")
+                    captured[f"{dirname}/{name}"] = content
+                finally:
+                    if current is not None:
+                        api.close_handle(current)
+                    api.close_handle(member)
+            if child_before != api._validate_handle(child, directory=True):
+                raise OSError(errno.EAGAIN, "frame directory changed")
+        if root_before != api._validate_handle(root, directory=True):
+            raise OSError(errno.EAGAIN, "frame directory changed")
+        return captured
+    finally:
+        close_error: BaseException | None = None
+        for child in reversed(children):
+            try:
+                api.close_handle(child)
+            except BaseException as error:
+                close_error = close_error or error
+        if root is not None:
+            try:
+                api.close_handle(root)
+            except BaseException as error:
+                close_error = close_error or error
+        if close_error is not None:
+            raise close_error
+
+
+def _open_windows_child_directory(
+    api: object, parent: object, name: str
+) -> int:
+    """Open a child directory relative to a verified Windows handle."""
+    name_buffer = api._ctypes.create_unicode_buffer(name)
+    name_length = len(name.encode("utf-16-le"))
+    unicode_name = api._UNICODE_STRING(
+        name_length,
+        name_length + 2,
+        api._ctypes.cast(name_buffer, api._wintypes.LPWSTR),
+    )
+    attributes = api._OBJECT_ATTRIBUTES(
+        api._ctypes.sizeof(api._OBJECT_ATTRIBUTES),
+        parent,
+        api._ctypes.pointer(unicode_name),
+        0x00000040,
+        None,
+        None,
+    )
+    status_block = api._IO_STATUS_BLOCK()
+    handle = api._wintypes.HANDLE()
+    status = api._ntdll.NtCreateFile(
+        api._ctypes.byref(handle),
+        0x00100081,
+        api._ctypes.byref(attributes),
+        api._ctypes.byref(status_block),
+        None,
+        0,
+        0x00000007,
+        1,
+        0x00200021,
+        None,
+        0,
+    )
+    if status < 0:
+        number = int(api._ntdll.RtlNtStatusToDosError(status))
+        raise OSError(number, "frame child directory open failed")
+    return int(handle.value)
+
+
+def _read_frame_members(final: Path) -> dict[str, bytes]:
+    if os.name == "posix":
+        return _read_posix_frame_members(final)
+    if os.name == "nt":
+        return _read_windows_frame_members(final)
+    raise OSError(errno.ENOTSUP, "safe frame reader unavailable")
+
+
 def verify_sampling_frame(
     *,
     source_register: Mapping[str, object],
@@ -1046,23 +1268,17 @@ def verify_sampling_frame(
     if not final.exists():
         _fail("E1A4_SAMPLING_FRAME_MISSING")
     try:
-        observed = {
-            path.relative_to(final).as_posix() for path in final.rglob("*")
-        }
-        if not final.is_dir() or observed != _EXPECTED_PATHS:
-            _fail("E1A4_SAMPLING_FRAME_PARTIAL")
+        members = _read_frame_members(final)
         prepared = (
             (SOURCE_REGISTER_NAME, _canonical(source_register)),
             (ALLOCATION_NAME, _canonical(allocation)),
         )
         digests: list[str] = []
         for name, expected in prepared:
-            payload_path = final / "sealed" / name
             digest = hashlib.sha256(expected).hexdigest()
-            manifest_path = final / "manifests" / _manifest_name(name)
             if (
-                payload_path.read_bytes() != expected
-                or manifest_path.read_bytes()
+                members[f"sealed/{name}"] != expected
+                or members[f"manifests/{_manifest_name(name)}"]
                 != f"{digest}\n".encode("ascii")
             ):
                 _fail("E1A4_SAMPLING_FRAME_BINDING_MISMATCH")
