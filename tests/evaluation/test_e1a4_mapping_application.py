@@ -127,7 +127,12 @@ def _allocation_payload() -> dict[str, object]:
                 "locator": f"prior:{counters[key]:02d}",
             }
         )
-    return {"schema_version": 1, "allocations": allocations}
+    return {
+        "schema_version": 1,
+        "source_register_sha256": "0123456789abcdef" * 4,
+        "slot_count": 96,
+        "allocations": allocations,
+    }
 
 
 def _write_allocation(
