@@ -4,7 +4,6 @@ from dataclasses import replace
 from hashlib import sha256
 import json
 from pathlib import Path
-import stat
 from threading import Event, Thread, current_thread
 from types import SimpleNamespace
 
@@ -766,13 +765,22 @@ def test_frame_publisher_lock_fails_closed_then_releases(
     _patch_frame_trust(runner, tmp_path, monkeypatch)
     parent = tmp_path / "output" / "e1a4" / "sampling-frame"
     parent.mkdir(parents=True)
+    result: list[object] = []
+
+    def contend() -> None:
+        try:
+            result.append(runner.seal_sampling_frame(**_frame_kwargs(tmp_path)))
+        except runner.E1A4SamplingFrameError as error:
+            result.append(error)
 
     with runner._publisher_lock(parent):
-        with pytest.raises(
-            runner.E1A4SamplingFrameError,
-            match="E1A4_SAMPLING_FRAME_WRITE_FAILED",
-        ):
-            runner.seal_sampling_frame(**_frame_kwargs(tmp_path))
+        contender = Thread(target=contend)
+        contender.start()
+        contender.join(10)
+        assert not contender.is_alive()
+        assert [str(item) for item in result] == [
+            "E1A4_SAMPLING_FRAME_WRITE_FAILED"
+        ]
         assert not (parent / "v1").exists()
 
     sealed = runner.seal_sampling_frame(**_frame_kwargs(tmp_path))
@@ -781,91 +789,305 @@ def test_frame_publisher_lock_fails_closed_then_releases(
     ) == sealed
 
 
-def test_frame_rejects_symlink_publisher_lock_without_touching_target(
+def _fake_windows_mutex(
+    wait_result: int, on_create: object | None = None
+) -> tuple[SimpleNamespace, list[tuple[object, ...]]]:
+    events: list[tuple[object, ...]] = []
+
+    def create_mutex(name: str) -> int:
+        events.append(("create", name))
+        if callable(on_create):
+            on_create()
+        return 91
+
+    def wait(handle: int, timeout_ms: int) -> int:
+        events.append(("wait", handle, timeout_ms))
+        return wait_result
+
+    def release_mutex(handle: int) -> None:
+        events.append(("release", handle))
+
+    def close_handle(handle: int) -> None:
+        events.append(("close", handle))
+
+    return (
+        SimpleNamespace(
+            create_mutex=create_mutex,
+            wait=wait,
+            release_mutex=release_mutex,
+            close_handle=close_handle,
+        ),
+        events,
+    )
+
+
+@pytest.mark.parametrize("wait_result", (0, 0x00000080))
+def test_windows_mutex_acquired_or_abandoned_never_opens_lock_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    wait_result: int,
+) -> None:
+    import eval.seal_e1a4_sampling_frame as runner
+
+    parent = tmp_path / "sampling-frame"
+    parent.mkdir()
+    trap = parent / ".v1.publish.lock"
+
+    def install_final_component_trap() -> None:
+        trap.mkdir()
+        (trap / "sentinel").write_text("preserve")
+
+    api, events = _fake_windows_mutex(wait_result, install_final_component_trap)
+    monkeypatch.setattr(runner, "_windows_mutex_api", lambda: api, raising=False)
+    real_open = runner.os.open
+
+    def forbid_filesystem_lock(path: object, *args: object, **kwargs: object) -> int:
+        if Path(path).name == ".v1.publish.lock":
+            raise AssertionError("filesystem lock opened")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(runner.os, "open", forbid_filesystem_lock)
+
+    with runner._publisher_lock(parent):
+        pass
+
+    mutex_name = str(events[0][1])
+    assert mutex_name.startswith("Local\\E1A4SamplingFrame-")
+    assert len(mutex_name.removeprefix("Local\\E1A4SamplingFrame-")) == 64
+    assert str(parent) not in mutex_name
+    assert events[1:] == [
+        ("wait", 91, 0),
+        ("release", 91),
+        ("close", 91),
+    ]
+    assert (trap / "sentinel").read_text() == "preserve"
+
+
+def test_windows_mutex_contention_closes_without_release(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import eval.seal_e1a4_sampling_frame as runner
 
-    _patch_frame_trust(runner, tmp_path, monkeypatch)
-    parent = tmp_path / "output" / "e1a4" / "sampling-frame"
-    parent.mkdir(parents=True)
-    external = tmp_path / "external-lock-target"
-    external.write_bytes(b"synthetic sentinel")
-    lock_path = parent / ".v1.publish.lock"
-    try:
-        lock_path.symlink_to(external)
-    except (NotImplementedError, OSError) as error:
-        pytest.skip(f"file symlinks unavailable: {type(error).__name__}")
+    parent = tmp_path / "sampling-frame"
+    parent.mkdir()
+    api, events = _fake_windows_mutex(0x00000102)
+    monkeypatch.setattr(runner, "_windows_mutex_api", lambda: api, raising=False)
 
     with pytest.raises(
         runner.E1A4SamplingFrameError,
         match="^E1A4_SAMPLING_FRAME_WRITE_FAILED$",
     ):
-        runner.seal_sampling_frame(**_frame_kwargs(tmp_path))
+        with runner._publisher_lock(parent):
+            pass
 
-    assert external.read_bytes() == b"synthetic sentinel"
-    assert not (parent / "v1").exists()
+    assert [event[0] for event in events] == ["create", "wait", "close"]
+    assert not (parent / ".v1.publish.lock").exists()
 
 
-def test_frame_rejects_non_regular_publisher_lock(
+def test_windows_mutex_parent_swap_never_mutates_replacement(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import eval.seal_e1a4_sampling_frame as runner
 
-    _patch_frame_trust(runner, tmp_path, monkeypatch)
-    parent = tmp_path / "output" / "e1a4" / "sampling-frame"
-    lock_path = parent / ".v1.publish.lock"
-    lock_path.mkdir(parents=True)
+    parent = tmp_path / "sampling-frame"
+    displaced = tmp_path / "displaced-frame"
+    parent.mkdir()
+
+    def swap_parent() -> None:
+        parent.rename(displaced)
+        parent.mkdir()
+        trap = parent / ".v1.publish.lock"
+        trap.mkdir()
+        (trap / "sentinel").write_text("replacement")
+
+    api, events = _fake_windows_mutex(0, swap_parent)
+    monkeypatch.setattr(runner, "_windows_mutex_api", lambda: api, raising=False)
+
+    with runner._publisher_lock(parent):
+        pass
+
+    assert [event[0] for event in events] == [
+        "create",
+        "wait",
+        "release",
+        "close",
+    ]
+    assert not (displaced / ".v1.publish.lock").exists()
+    assert (parent / ".v1.publish.lock" / "sentinel").read_text() == "replacement"
+
+
+class _FakePosixOS:
+    O_RDONLY = 0x01
+    O_RDWR = 0x02
+    O_CREAT = 0x04
+    O_EXCL = 0x08
+    O_CLOEXEC = 0x10
+    O_DIRECTORY = 0x20
+    O_NOFOLLOW = 0x40
+    O_NONBLOCK = 0x80
+
+    def __init__(
+        self,
+        *,
+        parent_stat: object,
+        lock_stat: object,
+        parent_open_stat: object | None = None,
+        initial_lock_stat: object | None = None,
+        lock_open_stat: object | None = None,
+    ) -> None:
+        self.parent_stat = parent_stat
+        self.parent_open_stat = parent_open_stat or parent_stat
+        self.lock_stat = lock_stat
+        self.initial_lock_stat = initial_lock_stat
+        self.lock_open_stat = lock_open_stat or lock_stat
+        self.lock_created = initial_lock_stat is not None
+        self.calls: list[tuple[object, ...]] = []
+
+    def lstat(self, path: object) -> object:
+        self.calls.append(("lstat-parent", path))
+        return self.parent_stat
+
+    def open(
+        self,
+        path: object,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        self.calls.append(("open", path, flags, mode, dir_fd))
+        if dir_fd is None:
+            return 41
+        self.lock_created = True
+        return 42
+
+    def fstat(self, descriptor: int) -> object:
+        self.calls.append(("fstat", descriptor))
+        if descriptor == 41:
+            return self.parent_open_stat
+        return self.lock_open_stat
+
+    def stat(
+        self, path: object, *, dir_fd: int, follow_symlinks: bool
+    ) -> object:
+        self.calls.append(("stat-lock", path, dir_fd, follow_symlinks))
+        if not self.lock_created:
+            raise FileNotFoundError
+        return self.initial_lock_stat or self.lock_stat
+
+    def close(self, descriptor: int) -> None:
+        self.calls.append(("close", descriptor))
+
+
+class _FakeFlock:
+    LOCK_EX = 0x01
+    LOCK_NB = 0x02
+    LOCK_UN = 0x04
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[int, int]] = []
+
+    def flock(self, descriptor: int, operation: int) -> None:
+        self.calls.append((descriptor, operation))
+
+
+def test_posix_lock_creates_only_by_relative_validated_parent_fd(
+    tmp_path: Path,
+) -> None:
+    import eval.seal_e1a4_sampling_frame as runner
+
+    parent = tmp_path / "sampling-frame"
+    parent.mkdir()
+    reference = tmp_path / "reference-lock"
+    reference.touch()
+    fake_os = _FakePosixOS(
+        parent_stat=parent.stat(),
+        lock_stat=reference.stat(),
+    )
+    fake_flock = _FakeFlock()
+    posix_lock = getattr(runner, "_posix_publisher_lock", None)
+    assert posix_lock is not None
+
+    with posix_lock(parent, os_api=fake_os, flock_api=fake_flock):
+        pass
+
+    parent_open = next(call for call in fake_os.calls if call[:2] == ("open", parent.resolve()))
+    relative_open = next(
+        call for call in fake_os.calls if call[0:2] == ("open", ".v1.publish.lock")
+    )
+    assert parent_open[2] & fake_os.O_DIRECTORY
+    assert parent_open[2] & fake_os.O_NOFOLLOW
+    assert relative_open[4] == 41
+    assert relative_open[2] & fake_os.O_CREAT
+    assert relative_open[2] & fake_os.O_EXCL
+    assert relative_open[2] & fake_os.O_NOFOLLOW
+    assert relative_open[2] & fake_os.O_NONBLOCK
+    assert fake_flock.calls == [(42, 0x03), (42, 0x04)]
+    assert fake_os.calls[-2:] == [("close", 42), ("close", 41)]
+
+
+def test_posix_parent_swap_fails_before_relative_lock_open(
+    tmp_path: Path,
+) -> None:
+    import eval.seal_e1a4_sampling_frame as runner
+
+    parent = tmp_path / "sampling-frame"
+    replacement = tmp_path / "replacement-frame"
+    reference = tmp_path / "reference-lock"
+    parent.mkdir()
+    replacement.mkdir()
+    reference.touch()
+    fake_os = _FakePosixOS(
+        parent_stat=parent.stat(),
+        parent_open_stat=replacement.stat(),
+        lock_stat=reference.stat(),
+    )
+    fake_flock = _FakeFlock()
+    posix_lock = getattr(runner, "_posix_publisher_lock", None)
+    assert posix_lock is not None
 
     with pytest.raises(
         runner.E1A4SamplingFrameError,
         match="^E1A4_SAMPLING_FRAME_WRITE_FAILED$",
     ):
-        runner.seal_sampling_frame(**_frame_kwargs(tmp_path))
+        with posix_lock(parent, os_api=fake_os, flock_api=fake_flock):
+            pass
 
-    assert lock_path.is_dir()
-    assert not (parent / "v1").exists()
+    assert not any(call[-1] == 41 for call in fake_os.calls if call[0] == "open")
+    assert not (replacement / ".v1.publish.lock").exists()
+    assert not fake_flock.calls
 
 
-def test_frame_rejects_injected_windows_reparse_lock_metadata(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_posix_final_component_swap_fails_before_flock(
+    tmp_path: Path,
 ) -> None:
     import eval.seal_e1a4_sampling_frame as runner
 
-    _patch_frame_trust(runner, tmp_path, monkeypatch)
-    parent = tmp_path / "output" / "e1a4" / "sampling-frame"
-    parent.mkdir(parents=True)
-    lock_path = parent / ".v1.publish.lock"
-    lock_path.write_bytes(b"0")
-    real_lstat = runner.os.lstat
-
-    class ReparseStat:
-        def __init__(self, observed: object) -> None:
-            self._observed = observed
-            self.st_file_attributes = (
-                getattr(observed, "st_file_attributes", 0)
-                | stat.FILE_ATTRIBUTE_REPARSE_POINT
-            )
-
-        def __getattr__(self, name: str) -> object:
-            return getattr(self._observed, name)
-
-    def lstat_with_reparse(path: object, *args: object, **kwargs: object) -> object:
-        observed = real_lstat(path, *args, **kwargs)
-        if Path(path) == lock_path:
-            return ReparseStat(observed)
-        return observed
-
-    monkeypatch.setattr(runner.os, "lstat", lstat_with_reparse)
+    parent = tmp_path / "sampling-frame"
+    initial = tmp_path / "initial-lock"
+    replacement = tmp_path / "replacement-lock"
+    parent.mkdir()
+    initial.touch()
+    replacement.write_text("preserve")
+    fake_os = _FakePosixOS(
+        parent_stat=parent.stat(),
+        lock_stat=initial.stat(),
+        initial_lock_stat=initial.stat(),
+        lock_open_stat=replacement.stat(),
+    )
+    fake_flock = _FakeFlock()
+    posix_lock = getattr(runner, "_posix_publisher_lock", None)
+    assert posix_lock is not None
 
     with pytest.raises(
         runner.E1A4SamplingFrameError,
         match="^E1A4_SAMPLING_FRAME_WRITE_FAILED$",
     ):
-        runner.seal_sampling_frame(**_frame_kwargs(tmp_path))
+        with posix_lock(parent, os_api=fake_os, flock_api=fake_flock):
+            pass
 
-    assert lock_path.read_bytes() == b"0"
-    assert not (parent / "v1").exists()
+    assert replacement.read_text() == "preserve"
+    assert not fake_flock.calls
 
 
 def test_failed_publisher_cleans_owned_final_before_releasing_lock(

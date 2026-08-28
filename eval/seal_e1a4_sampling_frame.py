@@ -599,71 +599,77 @@ def _rename_no_replace(staged: Path, final: Path) -> None:
         raise OSError(error_number, os.strerror(error_number), final)
 
 
+_WAIT_OBJECT_0 = 0x00000000
+_WAIT_ABANDONED = 0x00000080
+_WAIT_TIMEOUT = 0x00000102
+
+
+class _NativeWindowsMutex:
+    def __init__(self) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.argtypes = (
+            wintypes.LPVOID,
+            wintypes.BOOL,
+            wintypes.LPCWSTR,
+        )
+        kernel32.CreateMutexW.restype = wintypes.HANDLE
+        kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        kernel32.ReleaseMutex.argtypes = (wintypes.HANDLE,)
+        kernel32.ReleaseMutex.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        self._ctypes = ctypes
+        self._kernel32 = kernel32
+
+    def create_mutex(self, name: str) -> int:
+        handle = self._kernel32.CreateMutexW(None, False, name)
+        if not handle:
+            raise OSError(self._ctypes.get_last_error(), "mutex creation failed")
+        return int(handle)
+
+    def wait(self, handle: int, timeout_ms: int) -> int:
+        return int(self._kernel32.WaitForSingleObject(handle, timeout_ms))
+
+    def release_mutex(self, handle: int) -> None:
+        if not self._kernel32.ReleaseMutex(handle):
+            raise OSError(self._ctypes.get_last_error(), "mutex release failed")
+
+    def close_handle(self, handle: int) -> None:
+        if not self._kernel32.CloseHandle(handle):
+            raise OSError(self._ctypes.get_last_error(), "mutex close failed")
+
+
+def _windows_mutex_api() -> _NativeWindowsMutex:
+    return _NativeWindowsMutex()
+
+
+def _windows_mutex_name(parent: Path) -> str:
+    resolved = parent.resolve(strict=True)
+    canonical = os.path.normcase(os.path.normpath(str(resolved)))
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return f"Local\\E1A4SamplingFrame-{digest}"
+
+
 @contextmanager
-def _publisher_lock(parent: Path) -> Iterator[None]:
-    """Hold an OS-released exclusive lock for the whole publication attempt."""
-    descriptor: int | None = None
-    unlock = None
+def _windows_publisher_lock(parent: Path) -> Iterator[None]:
+    api = _windows_mutex_api()
+    handle: int | None = None
+    acquired = False
     try:
-        lock_path = parent / _PUBLISH_LOCK_NAME
-        resolved_parent = parent.resolve(strict=True)
-        open_flags = (
-            os.O_RDWR
-            | getattr(os, "O_BINARY", 0)
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOINHERIT", 0)
-            | getattr(os, "O_NONBLOCK", 0)
-            | getattr(os, "O_NOFOLLOW", 0)
-        )
-        try:
-            initial = os.lstat(lock_path)
-        except FileNotFoundError:
-            descriptor = os.open(
-                lock_path,
-                open_flags | os.O_CREAT | os.O_EXCL,
-                0o600,
-            )
-        else:
-            _validate_lock_stat(initial)
-            descriptor = os.open(lock_path, open_flags)
-            if not os.path.samestat(initial, os.fstat(descriptor)):
-                raise OSError(errno.EAGAIN, "publisher lock changed")
-        _validate_open_lock(
-            descriptor=descriptor,
-            lock_path=lock_path,
-            resolved_parent=resolved_parent,
-        )
-        if os.name == "nt":
-            import msvcrt
-
-            os.lseek(descriptor, 0, os.SEEK_SET)
-            msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
-
-            def unlock() -> None:
-                assert descriptor is not None
-                os.lseek(descriptor, 0, os.SEEK_SET)
-                msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
-
-        elif os.name == "posix":
-            import fcntl
-
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-
-            def unlock() -> None:
-                assert descriptor is not None
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
-
-        else:
-            raise OSError(errno.ENOTSUP, "publisher lock unavailable")
-        _validate_open_lock(
-            descriptor=descriptor,
-            lock_path=lock_path,
-            resolved_parent=resolved_parent,
-        )
+        handle = api.create_mutex(_windows_mutex_name(parent))
+        outcome = api.wait(handle, 0)
+        if outcome not in {_WAIT_OBJECT_0, _WAIT_ABANDONED}:
+            error_number = errno.EBUSY if outcome == _WAIT_TIMEOUT else errno.EIO
+            raise OSError(error_number, "publisher mutex unavailable")
+        acquired = True
     except Exception as error:
-        if descriptor is not None:
+        if handle is not None:
             try:
-                os.close(descriptor)
+                api.close_handle(handle)
             except Exception:
                 pass
         raise E1A4SamplingFrameError(
@@ -674,14 +680,15 @@ def _publisher_lock(parent: Path) -> Iterator[None]:
         yield
     finally:
         cleanup_error: Exception | None = None
+        if acquired:
+            try:
+                assert handle is not None
+                api.release_mutex(handle)
+            except Exception as error:
+                cleanup_error = error
         try:
-            assert unlock is not None
-            unlock()
-        except Exception as error:
-            cleanup_error = error
-        try:
-            assert descriptor is not None
-            os.close(descriptor)
+            assert handle is not None
+            api.close_handle(handle)
         except Exception as error:
             cleanup_error = cleanup_error or error
         if cleanup_error is not None:
@@ -690,33 +697,150 @@ def _publisher_lock(parent: Path) -> Iterator[None]:
             ) from cleanup_error
 
 
-def _validate_lock_stat(observed: os.stat_result) -> None:
-    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
-    attributes = getattr(observed, "st_file_attributes", 0)
-    if (
-        not stat.S_ISREG(observed.st_mode)
-        or bool(attributes & reparse_flag)
-        or observed.st_nlink != 1
-    ):
+def _validate_posix_lock_stat(observed: os.stat_result) -> None:
+    if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
         raise OSError(errno.EPERM, "unsafe publisher lock")
 
 
-def _validate_open_lock(
-    *, descriptor: int, lock_path: Path, resolved_parent: Path
-) -> None:
-    opened = os.fstat(descriptor)
-    candidate = os.lstat(lock_path)
-    _validate_lock_stat(opened)
-    _validate_lock_stat(candidate)
-    if not os.path.samestat(opened, candidate):
-        raise OSError(errno.EAGAIN, "publisher lock changed")
-    resolved_lock = lock_path.resolve(strict=True)
-    if resolved_lock.parent != resolved_parent:
-        raise OSError(errno.EPERM, "publisher lock escaped parent")
-    final_candidate = os.lstat(lock_path)
-    _validate_lock_stat(final_candidate)
-    if not os.path.samestat(opened, final_candidate):
-        raise OSError(errno.EAGAIN, "publisher lock changed")
+def _required_posix_flag(os_api: object, name: str) -> int:
+    value = getattr(os_api, name, None)
+    if type(value) is not int or value == 0:
+        raise OSError(errno.ENOTSUP, "publisher lock primitive unavailable")
+    return value
+
+
+@contextmanager
+def _posix_publisher_lock(
+    parent: Path, *, os_api: object | None = None, flock_api: object | None = None
+) -> Iterator[None]:
+    if os_api is None:
+        os_api = os
+    if flock_api is None:
+        import fcntl
+
+        flock_api = fcntl
+    parent_descriptor: int | None = None
+    lock_descriptor: int | None = None
+    acquired = False
+    try:
+        directory_flag = _required_posix_flag(os_api, "O_DIRECTORY")
+        nofollow_flag = _required_posix_flag(os_api, "O_NOFOLLOW")
+        nonblock_flag = _required_posix_flag(os_api, "O_NONBLOCK")
+        resolved_parent = parent.resolve(strict=True)
+        initial_parent = os_api.lstat(resolved_parent)
+        if not stat.S_ISDIR(initial_parent.st_mode):
+            raise OSError(errno.ENOTDIR, "unsafe publisher parent")
+        parent_flags = (
+            os_api.O_RDONLY
+            | directory_flag
+            | nofollow_flag
+            | getattr(os_api, "O_CLOEXEC", 0)
+        )
+        parent_descriptor = os_api.open(resolved_parent, parent_flags)
+        opened_parent = os_api.fstat(parent_descriptor)
+        if not stat.S_ISDIR(opened_parent.st_mode) or not os.path.samestat(
+            initial_parent, opened_parent
+        ):
+            raise OSError(errno.EAGAIN, "publisher parent changed")
+
+        lock_flags = (
+            os_api.O_RDWR
+            | nofollow_flag
+            | nonblock_flag
+            | getattr(os_api, "O_CLOEXEC", 0)
+        )
+        try:
+            initial_lock = os_api.stat(
+                _PUBLISH_LOCK_NAME,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            lock_descriptor = os_api.open(
+                _PUBLISH_LOCK_NAME,
+                lock_flags | os_api.O_CREAT | os_api.O_EXCL,
+                0o600,
+                dir_fd=parent_descriptor,
+            )
+        else:
+            _validate_posix_lock_stat(initial_lock)
+            lock_descriptor = os_api.open(
+                _PUBLISH_LOCK_NAME,
+                lock_flags,
+                dir_fd=parent_descriptor,
+            )
+            if not os.path.samestat(
+                initial_lock, os_api.fstat(lock_descriptor)
+            ):
+                raise OSError(errno.EAGAIN, "publisher lock changed")
+
+        opened_lock = os_api.fstat(lock_descriptor)
+        _validate_posix_lock_stat(opened_lock)
+        candidate = os_api.stat(
+            _PUBLISH_LOCK_NAME,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        _validate_posix_lock_stat(candidate)
+        if not os.path.samestat(opened_lock, candidate):
+            raise OSError(errno.EAGAIN, "publisher lock changed")
+        flock_api.flock(
+            lock_descriptor,
+            flock_api.LOCK_EX | flock_api.LOCK_NB,
+        )
+        acquired = True
+        final_candidate = os_api.stat(
+            _PUBLISH_LOCK_NAME,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        _validate_posix_lock_stat(final_candidate)
+        if not os.path.samestat(opened_lock, final_candidate):
+            raise OSError(errno.EAGAIN, "publisher lock changed")
+    except Exception as error:
+        for descriptor in (lock_descriptor, parent_descriptor):
+            if descriptor is not None:
+                try:
+                    os_api.close(descriptor)
+                except Exception:
+                    pass
+        raise E1A4SamplingFrameError(
+            "E1A4_SAMPLING_FRAME_WRITE_FAILED"
+        ) from error
+
+    try:
+        yield
+    finally:
+        cleanup_error: Exception | None = None
+        if acquired:
+            try:
+                assert lock_descriptor is not None
+                flock_api.flock(lock_descriptor, flock_api.LOCK_UN)
+            except Exception as error:
+                cleanup_error = error
+        for descriptor in (lock_descriptor, parent_descriptor):
+            if descriptor is not None:
+                try:
+                    os_api.close(descriptor)
+                except Exception as error:
+                    cleanup_error = cleanup_error or error
+        if cleanup_error is not None:
+            raise E1A4SamplingFrameError(
+                "E1A4_SAMPLING_FRAME_WRITE_FAILED"
+            ) from cleanup_error
+
+
+@contextmanager
+def _publisher_lock(parent: Path) -> Iterator[None]:
+    """Hold an OS-released exclusive lock for the whole publication attempt."""
+    if os.name == "nt":
+        lock = _windows_publisher_lock(parent)
+    elif os.name == "posix":
+        lock = _posix_publisher_lock(parent)
+    else:
+        raise E1A4SamplingFrameError("E1A4_SAMPLING_FRAME_WRITE_FAILED")
+    with lock:
+        yield
 
 
 def _is_staging_name(name: str) -> bool:
