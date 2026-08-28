@@ -35,7 +35,7 @@
 - Produces: `E1A4SamplingError`, `E1A4MappedSource`, `E1A4PriorAllocation`, `load_e1a3_prior_allocation(...)`, `validate_mapping_sources(...)`, and `mapping_sources_as_sampling_metadata(...)`.
 - Consumes: canonical E1a-3 sampling payloads and `E1A3SourceMetadata`.
 
-- [ ] **Step 1: Write failing tests for strict mapped-source and prior-allocation contracts**
+- [x] **Step 1: Write failing tests for strict mapped-source and prior-allocation contracts**
 
 Add tests that construct an exact 96-row E1a-3 allocation and assert:
 
@@ -62,7 +62,7 @@ def test_mapping_sources_preserve_mixed_roles_for_one_source() -> None:
 
 Also reject unknown fields, booleans as counts, invalid topics/roles, empty or unsorted locator lists, duplicate locator keys across records, a manifest mismatch, noncanonical payload digest, non-96 slot sets, duplicate slot identities, duplicate locator keys, and paths outside the supplied private root.
 
-- [ ] **Step 2: Run Task 1 tests and verify RED**
+- [x] **Step 2: Run Task 1 tests and verify RED**
 
 Run:
 
@@ -72,7 +72,7 @@ python -m pytest tests/evaluation/test_e1a4_sampling.py -q
 
 Expected: collection fails because `e1a4_sampling` is absent in the isolated branch.
 
-- [ ] **Step 3: Implement the minimal strict contracts**
+- [x] **Step 3: Implement the minimal strict contracts**
 
 Use these public shapes:
 
@@ -123,7 +123,7 @@ class E1A4PriorAllocation:
 
 `validate_mapping_sources` must sort records deterministically and reject any repeated `source_id:locator` across all records. `mapping_sources_as_sampling_metadata` converts each record to `E1A3SourceMetadata(..., eligibility_status="eligible")` without merging mixed roles.
 
-- [ ] **Step 4: Run Task 1 tests and Ruff**
+- [x] **Step 4: Run Task 1 tests and Ruff**
 
 ```powershell
 python -m pytest tests/evaluation/test_e1a4_sampling.py -q
@@ -132,7 +132,7 @@ python -m ruff check src/oilfield_chemical_copilot/evaluation/e1a4_sampling.py t
 
 Expected: all tests and Ruff pass.
 
-- [ ] **Step 5: Commit Task 1**
+- [x] **Step 5: Commit Task 1**
 
 ```powershell
 git add -- src/oilfield_chemical_copilot/evaluation/e1a4_sampling.py tests/evaluation/test_e1a4_sampling.py docs/superpowers/plans/2026-08-27-e1a4-correction-application-and-sampling-frame.md docs/superpowers/specs/2026-08-27-e1a4-correction-application-and-sampling-frame-design.md
