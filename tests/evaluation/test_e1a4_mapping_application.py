@@ -1593,10 +1593,14 @@ def test_mapping_publisher_fsyncs_all_files_and_directory_state(
 
     parent = module._mapping_directory(mapping_root).parent
     assert len(file_syncs) == 4
-    assert len(directory_syncs) >= 2
+    assert len(directory_syncs) >= 4
+    assert mapping_root in directory_syncs
+    assert mapping_root / "e1a4-role-mapping" in directory_syncs
     assert directory_syncs[-1] == parent
-    assert directory_syncs[0].parent == parent
-    assert directory_syncs[0].name.startswith(".sealed.")
+    assert any(
+        path.parent == parent and path.name.startswith(".sealed.")
+        for path in directory_syncs
+    )
 
 
 def _fake_mapping_windows_mutex(
@@ -1830,6 +1834,185 @@ def test_mapping_posix_lock_missing_nofollow_fails_closed(
 
     assert not fake_os.calls
     assert not fake_flock.calls
+
+
+@pytest.mark.parametrize(
+    "member_name",
+    ["role-mapping.v1.json", "role-mapping.v1.json.sha256"],
+)
+def test_mapping_verifier_rejects_member_symlink(
+    mapping_root: Path, member_name: str
+) -> None:
+    import oilfield_chemical_copilot.evaluation.e1a4_mapping_application as module
+
+    mapping, binding = _payloads()
+    seal = module._publish_mapping_directory(mapping, binding, mapping_root)
+    sealed = module._mapping_directory(mapping_root)
+    member = sealed / member_name
+    target = mapping_root / f"{member_name}.target"
+    target.write_bytes(member.read_bytes())
+    member.unlink()
+    try:
+        member.symlink_to(target)
+    except OSError as error:
+        pytest.skip(f"file symlink unavailable: {error.__class__.__name__}")
+
+    with pytest.raises(
+        E1A4MappingApplicationError,
+        match="^E1A4_MAPPING_SEAL_(PARTIAL|VERIFY_FAILED)$",
+    ):
+        module._verify_mapping_directory(
+            mapping, binding, mapping_root, seal.binding_sha256
+        )
+
+
+class _FakeMappingWindowsSealReader:
+    def __init__(
+        self,
+        members: dict[str, bytes],
+        *,
+        replaced_name: str | None = None,
+        unsafe_name: str | None = None,
+    ) -> None:
+        self.members = members
+        self.replaced_name = replaced_name
+        self.unsafe_name = unsafe_name
+        self.opens: dict[str, int] = {}
+        self.reads: dict[str, int] = {}
+        self.closed: list[object] = []
+
+    def open_directory(self, _path: Path) -> str:
+        return "directory"
+
+    def directory_entries(self, _handle: object) -> set[str]:
+        return set(self.members)
+
+    def open_member(self, _directory: object, name: str) -> tuple[str, int]:
+        self.opens[name] = self.opens.get(name, 0) + 1
+        return name, self.opens[name]
+
+    def member_snapshot(self, handle: tuple[str, int]) -> tuple[object, ...]:
+        name, generation = handle
+        if name == self.unsafe_name:
+            raise OSError("member is a reparse point")
+        identity = (
+            "replacement"
+            if name == self.replaced_name and generation > 1
+            else "original"
+        )
+        return name, identity, len(self.members[name])
+
+    def read_member(self, handle: tuple[str, int]) -> bytes:
+        name = handle[0]
+        self.reads[name] = self.reads.get(name, 0) + 1
+        return self.members[name]
+
+    def close_handle(self, handle: object) -> None:
+        self.closed.append(handle)
+
+
+def test_mapping_verifier_rejects_member_replacement_race(
+    mapping_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import oilfield_chemical_copilot.evaluation.e1a4_mapping_application as module
+
+    mapping, binding = _payloads()
+    seal = module._publish_mapping_directory(mapping, binding, mapping_root)
+    sealed = module._mapping_directory(mapping_root)
+    members = {name: (sealed / name).read_bytes() for name in module._NAMES}
+    api = _FakeMappingWindowsSealReader(
+        members, replaced_name="role-mapping.v1.json"
+    )
+    monkeypatch.setattr(
+        module, "_windows_seal_reader_api", lambda: api, raising=False
+    )
+    monkeypatch.setattr(module.os, "name", "nt")
+
+    with pytest.raises(
+        E1A4MappingApplicationError,
+        match="^E1A4_MAPPING_SEAL_VERIFY_FAILED$",
+    ):
+        module._verify_mapping_directory(
+            mapping, binding, mapping_root, seal.binding_sha256
+        )
+
+    assert api.opens["role-mapping.v1.json"] == 2
+    assert api.reads["role-mapping.v1.json"] == 1
+    assert "directory" in api.closed
+
+
+@pytest.mark.parametrize(
+    "member_name",
+    ["role-mapping.v1.json", "role-mapping.v1.json.sha256"],
+)
+def test_mapping_windows_verifier_rejects_member_symlink_reparse_point(
+    mapping_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    member_name: str,
+) -> None:
+    import oilfield_chemical_copilot.evaluation.e1a4_mapping_application as module
+
+    mapping, binding = _payloads()
+    seal = module._publish_mapping_directory(mapping, binding, mapping_root)
+    sealed = module._mapping_directory(mapping_root)
+    members = {name: (sealed / name).read_bytes() for name in module._NAMES}
+    api = _FakeMappingWindowsSealReader(members, unsafe_name=member_name)
+    monkeypatch.setattr(
+        module, "_windows_seal_reader_api", lambda: api, raising=False
+    )
+    monkeypatch.setattr(module.os, "name", "nt")
+
+    with pytest.raises(
+        E1A4MappingApplicationError,
+        match="^E1A4_MAPPING_SEAL_VERIFY_FAILED$",
+    ):
+        module._verify_mapping_directory(
+            mapping, binding, mapping_root, seal.binding_sha256
+        )
+
+
+def test_first_mapping_publication_syncs_each_new_ancestor_entry(
+    mapping_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import oilfield_chemical_copilot.evaluation.e1a4_mapping_application as module
+
+    mapping, binding = _payloads()
+    synced: list[Path] = []
+    monkeypatch.setattr(module, "_fsync_directory", synced.append)
+
+    module._publish_mapping_directory(mapping, binding, mapping_root)
+
+    role_root = mapping_root / "e1a4-role-mapping"
+    version_root = role_root / "v1"
+    assert synced[:2] == [mapping_root, role_root]
+    assert synced[-1] == version_root
+    assert any(
+        path.parent == version_root and path.name.startswith(".sealed.")
+        for path in synced
+    )
+
+
+def test_mapping_verifier_missing_native_safe_open_fails_closed(
+    mapping_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import oilfield_chemical_copilot.evaluation.e1a4_mapping_application as module
+
+    mapping, binding = _payloads()
+    seal = module._publish_mapping_directory(mapping, binding, mapping_root)
+
+    def missing_api() -> object:
+        raise AttributeError("private primitive detail")
+
+    monkeypatch.setattr(module, "_windows_seal_reader_api", missing_api)
+    monkeypatch.setattr(module.os, "name", "nt")
+
+    with pytest.raises(
+        E1A4MappingApplicationError,
+        match="^E1A4_MAPPING_SEAL_VERIFY_FAILED$",
+    ):
+        module._verify_mapping_directory(
+            mapping, binding, mapping_root, seal.binding_sha256
+        )
 
 
 def _mapping_runner_args(

@@ -381,6 +381,41 @@ def _mapping_directory(output_root: Path) -> Path:
     return output_root / "e1a4-role-mapping" / "v1" / "sealed"
 
 
+def _is_reparse_point(observed: os.stat_result) -> bool:
+    attributes = getattr(observed, "st_file_attributes", 0)
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x00000400)
+    return bool(attributes & reparse_flag)
+
+
+def _validate_directory_path(directory: Path) -> None:
+    observed = directory.lstat()
+    if (
+        stat.S_ISLNK(observed.st_mode)
+        or _is_reparse_point(observed)
+        or not stat.S_ISDIR(observed.st_mode)
+    ):
+        raise OSError(errno.ENOTDIR, "unsafe publication directory")
+
+
+def _ensure_directory(directory: Path) -> None:
+    try:
+        _validate_directory_path(directory)
+        return
+    except FileNotFoundError:
+        pass
+    parent = directory.parent
+    if parent == directory:
+        raise OSError(errno.ENOENT, "publication root unavailable")
+    _ensure_directory(parent)
+    try:
+        directory.mkdir()
+    except FileExistsError:
+        _validate_directory_path(directory)
+    else:
+        _fsync_directory(parent)
+        _validate_directory_path(directory)
+
+
 def _rename_no_replace(staged: Path, final: Path) -> None:
     """Atomically rename one directory and fail if the destination exists."""
     if os.name == "nt":
@@ -978,6 +1013,429 @@ def _remove_owned_publication(
     _remove_owned_directory(final, identity)
 
 
+def _posix_member_snapshot(observed: os.stat_result) -> tuple[object, ...]:
+    if (
+        not stat.S_ISREG(observed.st_mode)
+        or stat.S_ISLNK(observed.st_mode)
+        or observed.st_nlink != 1
+    ):
+        raise OSError(errno.EPERM, "unsafe sealed member")
+    return (
+        observed.st_dev,
+        observed.st_ino,
+        observed.st_size,
+        observed.st_mtime_ns,
+        observed.st_ctime_ns,
+    )
+
+
+def _read_posix_member(descriptor: int, *, os_api: object) -> bytes:
+    chunks: list[bytes] = []
+    while True:
+        chunk = os_api.read(descriptor, 65536)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+
+
+def _read_posix_sealed_members(
+    sealed: Path, *, os_api: object | None = None
+) -> dict[str, bytes]:
+    if os_api is None:
+        os_api = os
+    directory_flag = _required_posix_flag(os_api, "O_DIRECTORY")
+    nofollow_flag = _required_posix_flag(os_api, "O_NOFOLLOW")
+    directory_descriptor: int | None = None
+    try:
+        directory_descriptor = os_api.open(
+            sealed,
+            os_api.O_RDONLY
+            | directory_flag
+            | nofollow_flag
+            | getattr(os_api, "O_CLOEXEC", 0),
+        )
+        directory_stat = os_api.fstat(directory_descriptor)
+        if not stat.S_ISDIR(directory_stat.st_mode):
+            raise OSError(errno.ENOTDIR, "unsafe sealed directory")
+        entries = set(os_api.listdir(directory_descriptor))
+        if entries != _NAMES:
+            _fail("E1A4_MAPPING_SEAL_PARTIAL")
+        captured: dict[str, bytes] = {}
+        for name in sorted(_NAMES):
+            descriptor: int | None = None
+            current_descriptor: int | None = None
+            try:
+                descriptor = os_api.open(
+                    name,
+                    os_api.O_RDONLY
+                    | nofollow_flag
+                    | getattr(os_api, "O_CLOEXEC", 0),
+                    dir_fd=directory_descriptor,
+                )
+                before = _posix_member_snapshot(os_api.fstat(descriptor))
+                content = _read_posix_member(descriptor, os_api=os_api)
+                after = _posix_member_snapshot(os_api.fstat(descriptor))
+                current_descriptor = os_api.open(
+                    name,
+                    os_api.O_RDONLY
+                    | nofollow_flag
+                    | getattr(os_api, "O_CLOEXEC", 0),
+                    dir_fd=directory_descriptor,
+                )
+                current = _posix_member_snapshot(
+                    os_api.fstat(current_descriptor)
+                )
+                if before != after or before != current:
+                    raise OSError(errno.EAGAIN, "sealed member changed")
+                captured[name] = content
+            finally:
+                for opened in (current_descriptor, descriptor):
+                    if opened is not None:
+                        os_api.close(opened)
+        final_directory = os_api.fstat(directory_descriptor)
+        if not os.path.samestat(directory_stat, final_directory):
+            raise OSError(errno.EAGAIN, "sealed directory changed")
+        return captured
+    finally:
+        if directory_descriptor is not None:
+            os_api.close(directory_descriptor)
+
+
+class _NativeWindowsSealReader:
+    def __init__(self) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        class UNICODE_STRING(ctypes.Structure):
+            _fields_ = (
+                ("Length", wintypes.USHORT),
+                ("MaximumLength", wintypes.USHORT),
+                ("Buffer", wintypes.LPWSTR),
+            )
+
+        class OBJECT_ATTRIBUTES(ctypes.Structure):
+            _fields_ = (
+                ("Length", wintypes.ULONG),
+                ("RootDirectory", wintypes.HANDLE),
+                ("ObjectName", ctypes.POINTER(UNICODE_STRING)),
+                ("Attributes", wintypes.ULONG),
+                ("SecurityDescriptor", wintypes.LPVOID),
+                ("SecurityQualityOfService", wintypes.LPVOID),
+            )
+
+        class IO_STATUS_BLOCK(ctypes.Structure):
+            _fields_ = (
+                ("Status", ctypes.c_ssize_t),
+                ("Information", ctypes.c_size_t),
+            )
+
+        class FILE_STANDARD_INFO(ctypes.Structure):
+            _fields_ = (
+                ("AllocationSize", ctypes.c_longlong),
+                ("EndOfFile", ctypes.c_longlong),
+                ("NumberOfLinks", wintypes.DWORD),
+                ("DeletePending", wintypes.BOOLEAN),
+                ("Directory", wintypes.BOOLEAN),
+            )
+
+        class FILE_BASIC_INFO(ctypes.Structure):
+            _fields_ = (
+                ("CreationTime", ctypes.c_longlong),
+                ("LastAccessTime", ctypes.c_longlong),
+                ("LastWriteTime", ctypes.c_longlong),
+                ("ChangeTime", ctypes.c_longlong),
+                ("FileAttributes", wintypes.DWORD),
+            )
+
+        class FILE_ATTRIBUTE_TAG_INFO(ctypes.Structure):
+            _fields_ = (
+                ("FileAttributes", wintypes.DWORD),
+                ("ReparseTag", wintypes.DWORD),
+            )
+
+        class FILE_ID_INFO(ctypes.Structure):
+            _fields_ = (
+                ("VolumeSerialNumber", ctypes.c_ulonglong),
+                ("FileId", ctypes.c_ubyte * 16),
+            )
+
+        class FILE_ID_BOTH_DIR_INFO(ctypes.Structure):
+            _fields_ = (
+                ("NextEntryOffset", wintypes.DWORD),
+                ("FileIndex", wintypes.DWORD),
+                ("CreationTime", ctypes.c_longlong),
+                ("LastAccessTime", ctypes.c_longlong),
+                ("LastWriteTime", ctypes.c_longlong),
+                ("ChangeTime", ctypes.c_longlong),
+                ("EndOfFile", ctypes.c_longlong),
+                ("AllocationSize", ctypes.c_longlong),
+                ("FileAttributes", wintypes.DWORD),
+                ("FileNameLength", wintypes.DWORD),
+                ("EaSize", wintypes.DWORD),
+                ("ShortNameLength", ctypes.c_ubyte),
+                ("ShortName", wintypes.WCHAR * 12),
+                ("FileId", ctypes.c_longlong),
+                ("FileName", wintypes.WCHAR * 1),
+            )
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+        kernel32.CreateFileW.argtypes = (
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        )
+        kernel32.CreateFileW.restype = wintypes.HANDLE
+        kernel32.GetFileType.argtypes = (wintypes.HANDLE,)
+        kernel32.GetFileType.restype = wintypes.DWORD
+        kernel32.GetFileInformationByHandleEx.argtypes = (
+            wintypes.HANDLE,
+            ctypes.c_int,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+        )
+        kernel32.GetFileInformationByHandleEx.restype = wintypes.BOOL
+        kernel32.ReadFile.argtypes = (
+            wintypes.HANDLE,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.LPDWORD,
+            wintypes.LPVOID,
+        )
+        kernel32.ReadFile.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        ntdll.NtCreateFile.argtypes = (
+            ctypes.POINTER(wintypes.HANDLE),
+            wintypes.DWORD,
+            ctypes.POINTER(OBJECT_ATTRIBUTES),
+            ctypes.POINTER(IO_STATUS_BLOCK),
+            ctypes.POINTER(ctypes.c_longlong),
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+        )
+        ntdll.NtCreateFile.restype = ctypes.c_long
+        ntdll.RtlNtStatusToDosError.argtypes = (ctypes.c_long,)
+        ntdll.RtlNtStatusToDosError.restype = wintypes.ULONG
+        self._ctypes = ctypes
+        self._wintypes = wintypes
+        self._kernel32 = kernel32
+        self._ntdll = ntdll
+        self._UNICODE_STRING = UNICODE_STRING
+        self._OBJECT_ATTRIBUTES = OBJECT_ATTRIBUTES
+        self._IO_STATUS_BLOCK = IO_STATUS_BLOCK
+        self._FILE_STANDARD_INFO = FILE_STANDARD_INFO
+        self._FILE_BASIC_INFO = FILE_BASIC_INFO
+        self._FILE_ATTRIBUTE_TAG_INFO = FILE_ATTRIBUTE_TAG_INFO
+        self._FILE_ID_INFO = FILE_ID_INFO
+        self._directory_info = FILE_ID_BOTH_DIR_INFO
+        self._directory_name_offset = FILE_ID_BOTH_DIR_INFO.FileName.offset
+
+    def _query(self, handle: object, info_class: int, result: object) -> None:
+        if not self._kernel32.GetFileInformationByHandleEx(
+            handle,
+            info_class,
+            self._ctypes.byref(result),
+            self._ctypes.sizeof(result),
+        ):
+            raise OSError(
+                self._ctypes.get_last_error(), "file information unavailable"
+            )
+
+    def _validate_handle(
+        self, handle: object, *, directory: bool
+    ) -> tuple[object, ...]:
+        if self._kernel32.GetFileType(handle) != 1:
+            raise OSError(errno.EPERM, "sealed member is not a disk file")
+        attributes = self._FILE_ATTRIBUTE_TAG_INFO()
+        standard = self._FILE_STANDARD_INFO()
+        basic = self._FILE_BASIC_INFO()
+        identity = self._FILE_ID_INFO()
+        self._query(handle, 9, attributes)
+        self._query(handle, 1, standard)
+        self._query(handle, 0, basic)
+        self._query(handle, 18, identity)
+        if (
+            bool(attributes.FileAttributes & 0x00000400)
+            or bool(standard.Directory) != directory
+            or (directory and not attributes.FileAttributes & 0x00000010)
+            or (not directory and standard.NumberOfLinks != 1)
+        ):
+            raise OSError(errno.EPERM, "unsafe sealed object")
+        return (
+            int(identity.VolumeSerialNumber),
+            bytes(identity.FileId),
+            int(standard.EndOfFile),
+            int(basic.LastWriteTime),
+            int(basic.ChangeTime),
+        )
+
+    def open_directory(self, path: Path) -> int:
+        handle = self._kernel32.CreateFileW(
+            str(path),
+            0x00100081,
+            0x00000007,
+            None,
+            3,
+            0x02200000,
+            None,
+        )
+        if handle == self._ctypes.c_void_p(-1).value:
+            raise OSError(
+                self._ctypes.get_last_error(), "sealed directory unavailable"
+            )
+        try:
+            self._validate_handle(handle, directory=True)
+        except Exception:
+            self.close_handle(handle)
+            raise
+        return int(handle)
+
+    def directory_entries(self, handle: object) -> set[str]:
+        names: set[str] = set()
+        while True:
+            buffer = self._ctypes.create_string_buffer(65536)
+            if not self._kernel32.GetFileInformationByHandleEx(
+                handle, 10, buffer, len(buffer)
+            ):
+                error_number = self._ctypes.get_last_error()
+                if error_number == 18:
+                    return names
+                raise OSError(error_number, "directory enumeration failed")
+            offset = 0
+            while True:
+                entry = self._directory_info.from_buffer(buffer, offset)
+                name = self._ctypes.wstring_at(
+                    self._ctypes.addressof(buffer)
+                    + offset
+                    + self._directory_name_offset,
+                    entry.FileNameLength // 2,
+                )
+                if name not in {".", ".."}:
+                    names.add(name)
+                if entry.NextEntryOffset == 0:
+                    break
+                offset += entry.NextEntryOffset
+
+    def open_member(self, directory: object, name: str) -> int:
+        name_buffer = self._ctypes.create_unicode_buffer(name)
+        name_length = len(name.encode("utf-16-le"))
+        unicode_name = self._UNICODE_STRING(
+            name_length,
+            name_length + 2,
+            self._ctypes.cast(name_buffer, self._wintypes.LPWSTR),
+        )
+        attributes = self._OBJECT_ATTRIBUTES(
+            self._ctypes.sizeof(self._OBJECT_ATTRIBUTES),
+            directory,
+            self._ctypes.pointer(unicode_name),
+            0x00000040,
+            None,
+            None,
+        )
+        status_block = self._IO_STATUS_BLOCK()
+        handle = self._wintypes.HANDLE()
+        status = self._ntdll.NtCreateFile(
+            self._ctypes.byref(handle),
+            0x00100081,
+            self._ctypes.byref(attributes),
+            self._ctypes.byref(status_block),
+            None,
+            0,
+            0x00000007,
+            1,
+            0x00200060,
+            None,
+            0,
+        )
+        if status < 0:
+            number = int(self._ntdll.RtlNtStatusToDosError(status))
+            raise OSError(number, "sealed member open failed")
+        return int(handle.value)
+
+    def member_snapshot(self, handle: object) -> tuple[object, ...]:
+        return self._validate_handle(handle, directory=False)
+
+    def read_member(self, handle: object) -> bytes:
+        chunks: list[bytes] = []
+        while True:
+            buffer = self._ctypes.create_string_buffer(65536)
+            read = self._wintypes.DWORD()
+            if not self._kernel32.ReadFile(
+                handle,
+                buffer,
+                len(buffer),
+                self._ctypes.byref(read),
+                None,
+            ):
+                raise OSError(
+                    self._ctypes.get_last_error(), "sealed member read failed"
+                )
+            if read.value == 0:
+                return b"".join(chunks)
+            chunks.append(buffer.raw[: read.value])
+
+    def close_handle(self, handle: object) -> None:
+        if not self._kernel32.CloseHandle(handle):
+            raise OSError(
+                self._ctypes.get_last_error(), "sealed handle close failed"
+            )
+
+
+def _windows_seal_reader_api() -> _NativeWindowsSealReader:
+    return _NativeWindowsSealReader()
+
+
+def _read_windows_sealed_members(
+    sealed: Path, *, api: object | None = None
+) -> dict[str, bytes]:
+    if api is None:
+        api = _windows_seal_reader_api()
+    directory: object | None = None
+    try:
+        directory = api.open_directory(sealed)
+        if api.directory_entries(directory) != set(_NAMES):
+            _fail("E1A4_MAPPING_SEAL_PARTIAL")
+        captured: dict[str, bytes] = {}
+        for name in sorted(_NAMES):
+            member: object | None = None
+            current: object | None = None
+            try:
+                member = api.open_member(directory, name)
+                before = api.member_snapshot(member)
+                content = api.read_member(member)
+                after = api.member_snapshot(member)
+                current = api.open_member(directory, name)
+                current_snapshot = api.member_snapshot(current)
+                if before != after or before != current_snapshot:
+                    raise OSError(errno.EAGAIN, "sealed member changed")
+                captured[name] = content
+            finally:
+                for handle in (current, member):
+                    if handle is not None:
+                        api.close_handle(handle)
+        return captured
+    finally:
+        if directory is not None:
+            api.close_handle(directory)
+
+
+def _read_sealed_members(sealed: Path) -> dict[str, bytes]:
+    if os.name == "nt":
+        return _read_windows_sealed_members(sealed)
+    if os.name == "posix":
+        return _read_posix_sealed_members(sealed)
+    raise OSError(errno.ENOTSUP, "safe sealed-member open unavailable")
+
+
 def _artifact(
     name: str, path: Path, digest: str, count: int
 ) -> E1A4MappingArtifact:
@@ -994,19 +1452,7 @@ def _verify_mapping_directory(mapping: Mapping[str, object], binding: Mapping[st
     trusted = _digest(expected_mapping_binding_sha256, "E1A4_MAPPING_BINDING_MISMATCH")
     sealed = _mapping_directory(output_root)
     try:
-        observed_seal = sealed.lstat()
-    except FileNotFoundError:
-        _fail("E1A4_MAPPING_SEAL_MISSING")
-    except OSError:
-        _fail("E1A4_MAPPING_SEAL_VERIFY_FAILED")
-    if (
-        stat.S_ISLNK(observed_seal.st_mode)
-        or not stat.S_ISDIR(observed_seal.st_mode)
-    ):
-        _fail("E1A4_MAPPING_SEAL_PARTIAL")
-    try:
-        if {item.name for item in sealed.iterdir()} != _NAMES:
-            _fail("E1A4_MAPPING_SEAL_PARTIAL")
+        members = _read_sealed_members(sealed)
         prepared = (
             (MAPPING_NAME, _canonical(mapping)),
             (BINDING_NAME, _canonical(binding)),
@@ -1015,17 +1461,27 @@ def _verify_mapping_directory(mapping: Mapping[str, object], binding: Mapping[st
         digests: list[str] = []
         for name, expected in prepared:
             path = sealed / name
-            manifest = path.with_name(f"{path.name}.sha256")
             digest = hashlib.sha256(expected).hexdigest()
             if (
-                path.read_bytes() != expected
-                or manifest.read_bytes()
+                members[name] != expected
+                or members[f"{name}.sha256"]
                 != f"{digest}\n".encode("ascii")
             ):
                 _fail("E1A4_MAPPING_BINDING_MISMATCH")
             paths.append(path)
             digests.append(digest)
-    except (OSError, UnicodeError):
+    except E1A4MappingApplicationError:
+        raise
+    except FileNotFoundError:
+        _fail("E1A4_MAPPING_SEAL_MISSING")
+    except (OSError, AttributeError, TypeError, ValueError) as error:
+        if getattr(error, "errno", None) in {errno.ENOENT, 3} or getattr(
+            error, "winerror", None
+        ) in {
+            2,
+            3,
+        }:
+            _fail("E1A4_MAPPING_SEAL_MISSING")
         _fail("E1A4_MAPPING_SEAL_VERIFY_FAILED")
     if digests[1] != trusted:
         _fail("E1A4_MAPPING_BINDING_MISMATCH")
@@ -1051,18 +1507,17 @@ def _publish_mapping_directory(mapping: Mapping[str, object], binding: Mapping[s
     staged_identity: os.stat_result | None = None
     published_identity: os.stat_result | None = None
     try:
-        root.mkdir(parents=True, exist_ok=True)
+        _ensure_directory(root)
         with _publisher_lock(root):
             try:
                 _remove_abandoned_staging(root)
                 try:
-                    sealed.lstat()
-                except FileNotFoundError:
-                    pass
-                else:
                     return _verify_mapping_directory(
                         mapping, binding, output_root, digest
                     )
+                except E1A4MappingApplicationError as error:
+                    if str(error) != "E1A4_MAPPING_SEAL_MISSING":
+                        raise
 
                 staged = Path(
                     mkdtemp(prefix=".sealed.", suffix=".tmp", dir=root)
