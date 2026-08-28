@@ -442,7 +442,7 @@ Verify reconciliation `index_sources` and `index_locators` still equal the activ
 
 Record mapping/frame verification, source-record count only when disclosure-safe, eight-stratum status, exact slot count, mutation-boundary result, and the next checkpoint: private question/canonical-claim authoring. Include no identifiers, locators, paths, decisions, or hashes.
 
-- [ ] **Step 2: Run focused and full verification**
+- [x] **Step 2: Run focused and full verification**
 
 ```powershell
 python -m pytest tests/evaluation/test_e1a4_sampling.py tests/evaluation/test_e1a4_mapping_application.py tests/evaluation/test_iron_sulfide_supplement_audit.py tests/evaluation/test_foundational_locator_audit.py tests/evaluation/test_corpus_reconciliation.py -q
@@ -453,15 +453,15 @@ git ls-files .private
 git status --short
 ```
 
-- [ ] **Step 3: Request independent public-only review**
+- [x] **Step 3: Request independent public-only review**
 
 Review the new controller, runners, tests, spec, implementation plan, aggregate public changes, and supplied private verification aggregates only. The reviewer must not inspect `.private`, mounted Drive files, raw artifacts, IDs, locators, hashes, or decisions.
 
-- [ ] **Step 4: Address all Critical and Important findings and reverify**
+- [x] **Step 4: Address all Critical and Important findings and reverify**
 
 Use test-first fixes, rerun focused tests and Ruff, and obtain scoped re-review approval. Record Minor findings or fix them before finalization.
 
-- [ ] **Step 5: Commit the tracked implementation and aggregate closure**
+- [x] **Step 5: Commit the tracked implementation and aggregate closure**
 
 ```powershell
 git add -- src/oilfield_chemical_copilot/evaluation/e1a4_sampling.py src/oilfield_chemical_copilot/evaluation/e1a4_mapping_application.py eval/apply_e1a4_role_corrections.py eval/seal_e1a4_sampling_frame.py tests/evaluation/test_e1a4_sampling.py tests/evaluation/test_e1a4_mapping_application.py docs/superpowers/specs/2026-08-27-e1a4-correction-application-and-sampling-frame-design.md docs/superpowers/plans/2026-08-27-e1a4-correction-application-and-sampling-frame.md docs/superpowers/plans/2026-08-19-e1a4-requirements-aware-evidence-gate.md docs/CURRICULUM_REMEDIATION_BACKLOG.md
