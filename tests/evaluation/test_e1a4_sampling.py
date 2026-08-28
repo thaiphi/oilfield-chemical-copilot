@@ -802,6 +802,55 @@ def test_frame_blocks_and_preserves_abandoned_staging_before_publication(
     assert not (parent / "v1").exists()
 
 
+def test_standalone_frame_verify_blocks_and_preserves_staging_residue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import eval.seal_e1a4_sampling_frame as runner
+
+    _patch_frame_trust(runner, tmp_path, monkeypatch)
+    sealed = runner.seal_sampling_frame(**_frame_kwargs(tmp_path))
+    parent = tmp_path / "output" / "e1a4" / "sampling-frame"
+    residue = parent / ".v1.abandoned.tmp"
+    residue.mkdir()
+    (residue / "sentinel").write_text("preserve")
+
+    with pytest.raises(
+        runner.E1A4SamplingFrameError,
+        match="E1A4_SAMPLING_FRAME_WRITE_FAILED",
+    ):
+        runner.verify_current_sampling_frame(**_frame_kwargs(tmp_path))
+
+    assert (residue / "sentinel").read_text() == "preserve"
+    assert sealed.slot_count == 96
+
+
+def test_standalone_frame_verify_fails_closed_on_publisher_lock_contention(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import eval.seal_e1a4_sampling_frame as runner
+
+    _patch_frame_trust(runner, tmp_path, monkeypatch)
+    runner.seal_sampling_frame(**_frame_kwargs(tmp_path))
+    parent = tmp_path / "output" / "e1a4" / "sampling-frame"
+    result: list[object] = []
+
+    def verify() -> None:
+        try:
+            result.append(runner.verify_current_sampling_frame(**_frame_kwargs(tmp_path)))
+        except runner.E1A4SamplingFrameError as error:
+            result.append(error)
+
+    with runner._publisher_lock(parent):
+        contender = Thread(target=verify)
+        contender.start()
+        contender.join(10)
+        assert not contender.is_alive()
+
+    assert [str(item) for item in result] == [
+        "E1A4_SAMPLING_FRAME_WRITE_FAILED"
+    ]
+
+
 def test_frame_verifier_rejects_symlinked_final_directory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -1485,16 +1485,31 @@ def seal_sampling_frame(**values: object) -> E1A4SamplingFrameSeal:
 
 def verify_current_sampling_frame(**values: object) -> E1A4SamplingFrameSeal:
     _presence_preflight_values(values)
-    source_register, allocation = _expected_frame(**values)
-    return verify_sampling_frame(
-        source_register=source_register,
-        allocation=allocation,
-        output_root=Path(values["output_root"]),
-        expected_source_register_sha256=values.get(
-            "expected_source_register_sha256"
-        ),
-        expected_allocation_sha256=values.get("expected_allocation_sha256"),
-    )
+    output_root = Path(values["output_root"])
+    final = _frame_directory(output_root)
+    if not final.exists():
+        _fail("E1A4_SAMPLING_FRAME_MISSING")
+    try:
+        with _publisher_lock(final.parent):
+            _remove_abandoned_staging(final.parent)
+            source_register, allocation = _expected_frame(**values)
+            return verify_sampling_frame(
+                source_register=source_register,
+                allocation=allocation,
+                output_root=output_root,
+                expected_source_register_sha256=values.get(
+                    "expected_source_register_sha256"
+                ),
+                expected_allocation_sha256=values.get(
+                    "expected_allocation_sha256"
+                ),
+            )
+    except E1A4SamplingFrameError:
+        raise
+    except Exception as error:
+        raise E1A4SamplingFrameError(
+            "E1A4_SAMPLING_FRAME_WRITE_FAILED"
+        ) from error
 
 
 def _values(args: argparse.Namespace) -> dict[str, object]:
