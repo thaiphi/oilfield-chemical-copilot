@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import replace
 from hashlib import sha256
 import json
@@ -911,10 +912,10 @@ def test_frame_publication_failure_preserves_owned_staging_for_manual_review(
     import eval.seal_e1a4_sampling_frame as runner
 
     _patch_frame_trust(runner, tmp_path, monkeypatch)
-    rename_no_replace = runner._rename_no_replace
+    publish_bound_staging = runner._publish_bound_staging
     monkeypatch.setattr(
         runner,
-        "_rename_no_replace",
+        "_publish_bound_staging",
         lambda *_args: (_ for _ in ()).throw(OSError("private path")),
     )
 
@@ -927,7 +928,9 @@ def test_frame_publication_failure_preserves_owned_staging_for_manual_review(
     assert not (parent / "v1").exists()
     assert len(tuple(parent.glob(".v1.*.tmp"))) == 1
 
-    monkeypatch.setattr(runner, "_rename_no_replace", rename_no_replace)
+    monkeypatch.setattr(
+        runner, "_publish_bound_staging", publish_bound_staging
+    )
     with pytest.raises(
         runner.E1A4SamplingFrameError,
         match="E1A4_SAMPLING_FRAME_WRITE_FAILED",
@@ -2042,15 +2045,14 @@ def test_frame_publication_race_preserves_concurrent_destination(
     parent = tmp_path / "output" / "e1a4" / "sampling-frame"
     final = parent / "v1"
 
-    def concurrent_publish(_staged: Path, destination: Path) -> None:
-        assert destination == final
-        destination.mkdir()
-        (destination / "concurrent-owner").write_text("preserve me")
+    def concurrent_publish(_publication: object, _staged: object) -> None:
+        final.mkdir()
+        (final / "concurrent-owner").write_text("preserve me")
         raise FileExistsError("private concurrent detail")
 
     monkeypatch.setattr(
         runner,
-        "_rename_no_replace",
+        "_publish_bound_staging",
         concurrent_publish,
         raising=False,
     )
@@ -2094,6 +2096,80 @@ def test_frame_publisher_rejects_symlinked_output_ancestor_without_mutation(
     assert not (actual / "e1a4").exists()
 
 
+def test_frame_publisher_never_writes_through_concurrently_retargeted_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import eval.seal_e1a4_sampling_frame as runner
+
+    _patch_frame_trust(runner, tmp_path, monkeypatch)
+    parent = tmp_path / "output" / "e1a4" / "sampling-frame"
+    displaced = tmp_path / "authenticated-parent"
+    adversary = tmp_path / "retargeted-parent"
+    attack_happened = False
+
+    class StablePublication:
+        def ensure_no_staging(self) -> None:
+            nonlocal attack_happened
+            attack_happened = True
+            parent.rename(displaced)
+            parent.mkdir()
+
+        def final_exists(self) -> bool:
+            return False
+
+        def create_staging(self) -> object:
+            staging = displaced / ".v1.bound.tmp"
+            sealed = staging / "sealed"
+            manifests = staging / "manifests"
+            sealed.mkdir(parents=True)
+            manifests.mkdir()
+            return runner._BoundStagingDirectory(
+                name=staging.name,
+                path=staging,
+                root=staging,
+                sealed=sealed,
+                manifests=manifests,
+            )
+
+        def write_file(
+            self, directory: Path, name: str, content: bytes
+        ) -> None:
+            (directory / name).write_bytes(content)
+
+        def sync_staging(self, _staging: object) -> None:
+            pass
+
+        def publish(self, staging: object) -> None:
+            parent.rename(adversary)
+            displaced.rename(parent)
+            (parent / staging.name).rename(parent / "v1")
+
+        def sync_parent(self) -> None:
+            pass
+
+        def close_staging(self, _staging: object) -> None:
+            pass
+
+    @contextmanager
+    def retargeting_lock(_parent: Path) -> object:
+        yield StablePublication()
+
+    monkeypatch.setattr(runner, "_publisher_lock", retargeting_lock)
+
+    sealed = runner.seal_sampling_frame(**_frame_kwargs(tmp_path))
+
+    leaked = tuple(
+        path.relative_to(adversary).as_posix()
+        for path in adversary.rglob("*")
+        if path.is_file()
+    ) if adversary.exists() else ()
+    assert not leaked
+    assert attack_happened
+    assert sealed.slot_count == 96
+    assert (parent / "v1").is_dir()
+
+
 def test_frame_publisher_syncs_directory_hierarchy_before_and_after_rename(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2102,17 +2178,17 @@ def test_frame_publisher_syncs_directory_hierarchy_before_and_after_rename(
 
     _patch_frame_trust(runner, tmp_path, monkeypatch)
     events: list[tuple[str, str]] = []
-    real_rename = runner._rename_no_replace
+    real_publish = runner._publish_bound_staging
 
-    def record_sync(directory: Path) -> None:
+    def record_sync(directory: Path, **_kwargs: object) -> None:
         events.append(("sync", directory.name))
 
-    def record_rename(staged: Path, final: Path) -> None:
-        events.append(("rename", final.name))
-        real_rename(staged, final)
+    def record_publish(publication: object, staged: object) -> None:
+        events.append(("rename", "v1"))
+        real_publish(publication, staged)
 
     monkeypatch.setattr(runner, "_sync_directory", record_sync, raising=False)
-    monkeypatch.setattr(runner, "_rename_no_replace", record_rename)
+    monkeypatch.setattr(runner, "_publish_bound_staging", record_publish)
 
     sealed = runner.seal_sampling_frame(**_frame_kwargs(tmp_path))
 
@@ -2142,7 +2218,7 @@ def test_frame_publisher_fails_closed_when_directory_sync_fails(
     _patch_frame_trust(runner, tmp_path, monkeypatch)
     calls: list[str] = []
 
-    def fail_selected(directory: Path) -> None:
+    def fail_selected(directory: Path, **_kwargs: object) -> None:
         label = (
             "staging"
             if directory.name.startswith(".v1.")

@@ -10,9 +10,9 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import secrets
 import stat
 import sys
-from tempfile import mkdtemp
 from typing import Iterator, Mapping, Sequence
 
 
@@ -253,22 +253,19 @@ def _reject_unsafe_directory_ancestors(path: Path) -> None:
         _require_safe_directory_component(component)
 
 
-def _directory_identity(path: Path) -> os.stat_result:
-    _reject_unsafe_directory_ancestors(path)
-    observed = path.lstat()
-    _require_safe_directory_component(path)
-    return observed
-
-
-def _require_directory_identity(path: Path, identity: os.stat_result) -> None:
-    _reject_unsafe_directory_ancestors(path)
-    current = path.lstat()
-    if not os.path.samestat(identity, current):
-        raise OSError(errno.EAGAIN, "publication directory changed")
-
-
-def _sync_directory(path: Path) -> None:
-    _mapping_application._fsync_directory(path)
+def _sync_directory(
+    path: Path,
+    *,
+    descriptor: object | None = None,
+    os_api: object | None = None,
+    windows_api: object | None = None,
+) -> None:
+    if descriptor is None:
+        _mapping_application._fsync_directory(path)
+    elif windows_api is not None:
+        windows_api.flush_handle(descriptor)
+    else:
+        (os_api or os).fsync(descriptor)
 
 
 def _presence_paths(args: argparse.Namespace) -> tuple[Path, ...]:
@@ -645,48 +642,193 @@ def _manifest_name(payload_name: str) -> str:
     return f"{payload_name.removesuffix('.json')}.sha256"
 
 
-def _rename_no_replace(staged: Path, final: Path) -> None:
-    """Atomically publish one directory and fail if the destination exists."""
-    if os.name == "nt":
-        os.rename(staged, final)
-        return
-
+def _rename_no_replace_at(
+    directory_descriptor: int, staged_name: str, final_name: str
+) -> None:
+    """Atomically rename within one authenticated POSIX directory handle."""
     import ctypes
 
     library = ctypes.CDLL(None, use_errno=True)
-    source = os.fsencode(staged)
-    destination = os.fsencode(final)
+    source = os.fsencode(staged_name)
+    destination = os.fsencode(final_name)
     if sys.platform.startswith("linux"):
-        renameat2 = getattr(library, "renameat2", None)
-        if renameat2 is None:
-            raise OSError(errno.ENOTSUP, "exclusive rename unavailable")
-        renameat2.argtypes = (
+        rename = getattr(library, "renameat2", None)
+        if rename is None:
+            raise OSError(errno.ENOTSUP, "exclusive relative rename unavailable")
+        rename.argtypes = (
             ctypes.c_int,
             ctypes.c_char_p,
             ctypes.c_int,
             ctypes.c_char_p,
             ctypes.c_uint,
         )
-        renameat2.restype = ctypes.c_int
-        result = renameat2(-100, source, -100, destination, 1)
+        rename.restype = ctypes.c_int
+        result = rename(
+            directory_descriptor,
+            source,
+            directory_descriptor,
+            destination,
+            1,
+        )
     elif sys.platform == "darwin":
-        renamex_np = getattr(library, "renamex_np", None)
-        if renamex_np is None:
-            raise OSError(errno.ENOTSUP, "exclusive rename unavailable")
-        renamex_np.argtypes = (
+        rename = getattr(library, "renameatx_np", None)
+        if rename is None:
+            raise OSError(errno.ENOTSUP, "exclusive relative rename unavailable")
+        rename.argtypes = (
+            ctypes.c_int,
             ctypes.c_char_p,
+            ctypes.c_int,
             ctypes.c_char_p,
             ctypes.c_uint,
         )
-        renamex_np.restype = ctypes.c_int
-        result = renamex_np(source, destination, 0x00000004)
+        rename.restype = ctypes.c_int
+        result = rename(
+            directory_descriptor,
+            source,
+            directory_descriptor,
+            destination,
+            0x00000004,
+        )
     else:
-        raise OSError(errno.ENOTSUP, "exclusive rename unavailable")
+        raise OSError(errno.ENOTSUP, "exclusive relative rename unavailable")
     if result != 0:
         error_number = ctypes.get_errno()
         if error_number == errno.EEXIST:
-            raise FileExistsError(error_number, os.strerror(error_number), final)
-        raise OSError(error_number, os.strerror(error_number), final)
+            raise FileExistsError(error_number, os.strerror(error_number), final_name)
+        raise OSError(error_number, os.strerror(error_number), final_name)
+
+
+@dataclass
+class _BoundStagingDirectory:
+    name: str
+    path: Path
+    root: object
+    sealed: object | None
+    manifests: object | None
+
+
+class _PosixPublicationDirectory:
+    def __init__(
+        self,
+        parent: Path,
+        descriptor: int,
+        *,
+        os_api: object,
+    ) -> None:
+        self.parent = parent
+        self.descriptor = descriptor
+        self.os_api = os_api
+        self._directory_flag = _required_posix_flag(os_api, "O_DIRECTORY")
+        self._nofollow_flag = _required_posix_flag(os_api, "O_NOFOLLOW")
+
+    def _open_directory(self, name: str, *, parent: int) -> int:
+        descriptor = self.os_api.open(
+            name,
+            self.os_api.O_RDONLY
+            | self._directory_flag
+            | self._nofollow_flag
+            | getattr(self.os_api, "O_CLOEXEC", 0),
+            dir_fd=parent,
+        )
+        observed = self.os_api.fstat(descriptor)
+        if not stat.S_ISDIR(observed.st_mode):
+            self.os_api.close(descriptor)
+            raise OSError(errno.ENOTDIR, "unsafe publication directory")
+        return descriptor
+
+    def ensure_no_staging(self) -> None:
+        for name in self.os_api.listdir(self.descriptor):
+            if _is_staging_name(name):
+                raise OSError(errno.EBUSY, "abandoned staging requires manual review")
+
+    def final_exists(self) -> bool:
+        try:
+            observed = self.os_api.stat(
+                "v1", dir_fd=self.descriptor, follow_symlinks=False
+            )
+        except FileNotFoundError:
+            return False
+        if not stat.S_ISDIR(observed.st_mode) or stat.S_ISLNK(observed.st_mode):
+            raise OSError(errno.EPERM, "unsafe final publication")
+        return True
+
+    def create_staging(self) -> _BoundStagingDirectory:
+        name = f".v1.{secrets.token_hex(16)}.tmp"
+        self.os_api.mkdir(name, 0o700, dir_fd=self.descriptor)
+        root: int | None = None
+        sealed: int | None = None
+        manifests: int | None = None
+        try:
+            root = self._open_directory(name, parent=self.descriptor)
+            self.os_api.mkdir("sealed", 0o700, dir_fd=root)
+            sealed = self._open_directory("sealed", parent=root)
+            self.os_api.mkdir("manifests", 0o700, dir_fd=root)
+            manifests = self._open_directory("manifests", parent=root)
+            return _BoundStagingDirectory(
+                name=name,
+                path=self.parent / name,
+                root=root,
+                sealed=sealed,
+                manifests=manifests,
+            )
+        except BaseException:
+            for descriptor in (manifests, sealed, root):
+                if descriptor is not None:
+                    try:
+                        self.os_api.close(descriptor)
+                    except Exception:
+                        pass
+            raise
+
+    def write_file(self, directory: object, name: str, content: bytes) -> None:
+        descriptor = self.os_api.open(
+            name,
+            self.os_api.O_WRONLY
+            | self.os_api.O_CREAT
+            | self.os_api.O_EXCL
+            | self._nofollow_flag
+            | getattr(self.os_api, "O_CLOEXEC", 0),
+            0o600,
+            dir_fd=directory,
+        )
+        try:
+            offset = 0
+            while offset < len(content):
+                written = self.os_api.write(descriptor, content[offset:])
+                if type(written) is not int or written < 1:
+                    raise OSError(errno.EIO, "publication member write failed")
+                offset += written
+            self.os_api.fsync(descriptor)
+        finally:
+            self.os_api.close(descriptor)
+
+    def sync_staging(self, staging: _BoundStagingDirectory) -> None:
+        for path, descriptor in (
+            (staging.path / "sealed", staging.sealed),
+            (staging.path / "manifests", staging.manifests),
+            (staging.path, staging.root),
+        ):
+            _sync_directory(path, descriptor=descriptor, os_api=self.os_api)
+
+    def publish(self, staging: _BoundStagingDirectory) -> None:
+        _rename_no_replace_at(self.descriptor, staging.name, "v1")
+
+    def sync_parent(self) -> None:
+        _sync_directory(
+            self.parent, descriptor=self.descriptor, os_api=self.os_api
+        )
+
+    def close_staging(self, staging: _BoundStagingDirectory) -> None:
+        error: BaseException | None = None
+        for descriptor in (staging.manifests, staging.sealed, staging.root):
+            if descriptor is None:
+                continue
+            try:
+                self.os_api.close(descriptor)
+            except BaseException as close_error:
+                error = error or close_error
+        if error is not None:
+            raise error
 
 
 _WAIT_OBJECT_0 = 0x00000000
@@ -895,12 +1037,289 @@ def _windows_mutex_policy(owner_sid: str) -> str:
     )
 
 
+class _WindowsPublicationDirectory:
+    def __init__(self, parent: Path) -> None:
+        self.parent = parent
+        self.api = _mapping_application._windows_seal_reader_api()
+        self._configure_kernel_calls()
+        handle = self.api._kernel32.CreateFileW(
+            str(parent),
+            0x001F01FF,
+            0x00000007,
+            None,
+            3,
+            0x02200000,
+            None,
+        )
+        if handle == self.api._ctypes.c_void_p(-1).value:
+            raise OSError(
+                self.api._ctypes.get_last_error(),
+                "publication directory unavailable",
+            )
+        self.descriptor = int(handle)
+        try:
+            self.api._validate_handle(self.descriptor, directory=True)
+        except Exception:
+            self.api.close_handle(self.descriptor)
+            raise
+
+    def _configure_kernel_calls(self) -> None:
+        kernel32 = self.api._kernel32
+        wintypes = self.api._wintypes
+        ctypes = self.api._ctypes
+        kernel32.WriteFile.argtypes = (
+            wintypes.HANDLE,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.LPDWORD,
+            wintypes.LPVOID,
+        )
+        kernel32.WriteFile.restype = wintypes.BOOL
+        kernel32.FlushFileBuffers.argtypes = (wintypes.HANDLE,)
+        kernel32.FlushFileBuffers.restype = wintypes.BOOL
+        kernel32.SetFileInformationByHandle.argtypes = (
+            wintypes.HANDLE,
+            ctypes.c_int,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+        )
+        kernel32.SetFileInformationByHandle.restype = wintypes.BOOL
+        self.api._ntdll.NtSetInformationFile.argtypes = (
+            wintypes.HANDLE,
+            ctypes.POINTER(self.api._IO_STATUS_BLOCK),
+            wintypes.LPVOID,
+            wintypes.ULONG,
+            ctypes.c_int,
+        )
+        self.api._ntdll.NtSetInformationFile.restype = ctypes.c_long
+
+    def _relative_attributes(self, parent: object, name: str) -> tuple[object, ...]:
+        name_buffer = self.api._ctypes.create_unicode_buffer(name)
+        name_length = len(name.encode("utf-16-le"))
+        unicode_name = self.api._UNICODE_STRING(
+            name_length,
+            name_length + 2,
+            self.api._ctypes.cast(name_buffer, self.api._wintypes.LPWSTR),
+        )
+        attributes = self.api._OBJECT_ATTRIBUTES(
+            self.api._ctypes.sizeof(self.api._OBJECT_ATTRIBUTES),
+            parent,
+            self.api._ctypes.pointer(unicode_name),
+            0x00000040,
+            None,
+            None,
+        )
+        return name_buffer, unicode_name, attributes
+
+    def _open_relative(
+        self,
+        parent: object,
+        name: str,
+        *,
+        directory: bool,
+        create: bool,
+    ) -> int:
+        buffers = self._relative_attributes(parent, name)
+        attributes = buffers[2]
+        status_block = self.api._IO_STATUS_BLOCK()
+        handle = self.api._wintypes.HANDLE()
+        status = self.api._ntdll.NtCreateFile(
+            self.api._ctypes.byref(handle),
+            0x001F01FF if directory else 0x0012019F,
+            self.api._ctypes.byref(attributes),
+            self.api._ctypes.byref(status_block),
+            None,
+            0x00000010 if directory else 0x00000080,
+            0x00000007,
+            2 if create else 1,
+            0x00200021 if directory else 0x00200060,
+            None,
+            0,
+        )
+        if status < 0:
+            number = int(self.api._ntdll.RtlNtStatusToDosError(status))
+            raise OSError(number, "relative publication open failed")
+        descriptor = int(handle.value)
+        try:
+            self.api._validate_handle(descriptor, directory=directory)
+        except Exception:
+            self.api.close_handle(descriptor)
+            raise
+        return descriptor
+
+    def ensure_no_staging(self) -> None:
+        for name in self.api.directory_entries(self.descriptor):
+            if _is_staging_name(name):
+                raise OSError(errno.EBUSY, "abandoned staging requires manual review")
+
+    def final_exists(self) -> bool:
+        descriptor: int | None = None
+        try:
+            descriptor = self._open_relative(
+                self.descriptor, "v1", directory=True, create=False
+            )
+        except OSError as error:
+            if getattr(error, "errno", None) in {2, 3}:
+                return False
+            raise
+        finally:
+            if descriptor is not None:
+                self.api.close_handle(descriptor)
+        return True
+
+    def create_staging(self) -> _BoundStagingDirectory:
+        name = f".v1.{secrets.token_hex(16)}.tmp"
+        root: int | None = None
+        sealed: int | None = None
+        manifests: int | None = None
+        try:
+            root = self._open_relative(
+                self.descriptor, name, directory=True, create=True
+            )
+            sealed = self._open_relative(
+                root, "sealed", directory=True, create=True
+            )
+            manifests = self._open_relative(
+                root, "manifests", directory=True, create=True
+            )
+            return _BoundStagingDirectory(
+                name=name,
+                path=self.parent / name,
+                root=root,
+                sealed=sealed,
+                manifests=manifests,
+            )
+        except BaseException:
+            for descriptor in (manifests, sealed, root):
+                if descriptor is not None:
+                    try:
+                        self.api.close_handle(descriptor)
+                    except Exception:
+                        pass
+            raise
+
+    def write_file(self, directory: object, name: str, content: bytes) -> None:
+        descriptor = self._open_relative(
+            directory, name, directory=False, create=True
+        )
+        try:
+            offset = 0
+            while offset < len(content):
+                chunk = content[offset : offset + 65536]
+                buffer = self.api._ctypes.create_string_buffer(chunk)
+                written = self.api._wintypes.DWORD()
+                if not self.api._kernel32.WriteFile(
+                    descriptor,
+                    buffer,
+                    len(chunk),
+                    self.api._ctypes.byref(written),
+                    None,
+                ):
+                    raise OSError(
+                        self.api._ctypes.get_last_error(),
+                        "publication member write failed",
+                    )
+                if written.value < 1:
+                    raise OSError(errno.EIO, "publication member write failed")
+                offset += written.value
+            self.flush_handle(descriptor)
+        finally:
+            self.api.close_handle(descriptor)
+
+    def flush_handle(self, descriptor: object) -> None:
+        if not self.api._kernel32.FlushFileBuffers(descriptor):
+            raise OSError(
+                self.api._ctypes.get_last_error(), "publication sync failed"
+            )
+
+    def sync_staging(self, staging: _BoundStagingDirectory) -> None:
+        for path, descriptor in (
+            (staging.path / "sealed", staging.sealed),
+            (staging.path / "manifests", staging.manifests),
+            (staging.path, staging.root),
+        ):
+            _sync_directory(
+                path,
+                descriptor=descriptor,
+                windows_api=self,
+            )
+
+    def publish(self, staging: _BoundStagingDirectory) -> None:
+        for attribute in ("manifests", "sealed"):
+            descriptor = getattr(staging, attribute)
+            if descriptor is not None:
+                self.api.close_handle(descriptor)
+                setattr(staging, attribute, None)
+
+        class FILE_RENAME_INFORMATION(self.api._ctypes.Structure):
+            _fields_ = (
+                ("ReplaceIfExists", self.api._wintypes.BOOLEAN),
+                ("RootDirectory", self.api._wintypes.HANDLE),
+                ("FileNameLength", self.api._wintypes.DWORD),
+                ("FileName", self.api._wintypes.WCHAR * 1),
+            )
+
+        encoded = "v1".encode("utf-16-le")
+        offset = FILE_RENAME_INFORMATION.FileName.offset
+        buffer = self.api._ctypes.create_string_buffer(offset + len(encoded))
+        information = self.api._ctypes.cast(
+            buffer, self.api._ctypes.POINTER(FILE_RENAME_INFORMATION)
+        ).contents
+        information.ReplaceIfExists = False
+        information.RootDirectory = self.descriptor
+        information.FileNameLength = len(encoded)
+        self.api._ctypes.memmove(
+            self.api._ctypes.addressof(buffer) + offset, encoded, len(encoded)
+        )
+        status_block = self.api._IO_STATUS_BLOCK()
+        status = self.api._ntdll.NtSetInformationFile(
+            staging.root,
+            self.api._ctypes.byref(status_block),
+            buffer,
+            len(buffer),
+            10,
+        )
+        if status < 0:
+            number = int(self.api._ntdll.RtlNtStatusToDosError(status))
+            raise OSError(number, "publication rename failed")
+
+    def sync_parent(self) -> None:
+        _sync_directory(
+            self.parent,
+            descriptor=self.descriptor,
+            windows_api=self,
+        )
+
+    def close_staging(self, staging: _BoundStagingDirectory) -> None:
+        error: BaseException | None = None
+        for descriptor in (staging.manifests, staging.sealed, staging.root):
+            if descriptor is None:
+                continue
+            try:
+                self.api.close_handle(descriptor)
+            except BaseException as close_error:
+                error = error or close_error
+        if error is not None:
+            raise error
+
+    def close(self) -> None:
+        self.api.close_handle(self.descriptor)
+
+
+def _publish_bound_staging(
+    publication: object, staging: _BoundStagingDirectory
+) -> None:
+    publication.publish(staging)
+
+
 @contextmanager
-def _windows_publisher_lock(parent: Path) -> Iterator[None]:
+def _windows_publisher_lock(parent: Path) -> Iterator[_WindowsPublicationDirectory]:
     api = _windows_mutex_api()
+    publication: _WindowsPublicationDirectory | None = None
     handle: int | None = None
     acquired = False
     try:
+        publication = _WindowsPublicationDirectory(parent)
         policy = _windows_mutex_policy(api.owner_sid())
         security = api.build_security_attributes(policy)
         try:
@@ -916,6 +1335,11 @@ def _windows_publisher_lock(parent: Path) -> Iterator[None]:
             raise OSError(error_number, "publisher mutex unavailable")
         acquired = True
     except Exception as error:
+        if publication is not None:
+            try:
+                publication.close()
+            except Exception:
+                pass
         if handle is not None:
             try:
                 api.close_handle(handle)
@@ -926,9 +1350,15 @@ def _windows_publisher_lock(parent: Path) -> Iterator[None]:
         ) from error
 
     try:
-        yield
+        assert publication is not None
+        yield publication
     finally:
         cleanup_error: Exception | None = None
+        try:
+            assert publication is not None
+            publication.close()
+        except Exception as error:
+            cleanup_error = error
         if acquired:
             try:
                 assert handle is not None
@@ -961,7 +1391,7 @@ def _required_posix_flag(os_api: object, name: str) -> int:
 @contextmanager
 def _posix_publisher_lock(
     parent: Path, *, os_api: object | None = None, flock_api: object | None = None
-) -> Iterator[None]:
+) -> Iterator[_PosixPublicationDirectory]:
     if os_api is None:
         os_api = os
     if flock_api is None:
@@ -1058,7 +1488,12 @@ def _posix_publisher_lock(
         ) from error
 
     try:
-        yield
+        assert parent_descriptor is not None
+        yield _PosixPublicationDirectory(
+            parent,
+            parent_descriptor,
+            os_api=os_api,
+        )
     finally:
         cleanup_error: Exception | None = None
         if acquired:
@@ -1080,7 +1515,7 @@ def _posix_publisher_lock(
 
 
 @contextmanager
-def _publisher_lock(parent: Path) -> Iterator[None]:
+def _publisher_lock(parent: Path) -> Iterator[object]:
     """Hold an OS-released exclusive lock for the whole publication attempt."""
     if os.name == "nt":
         lock = _windows_publisher_lock(parent)
@@ -1088,8 +1523,8 @@ def _publisher_lock(parent: Path) -> Iterator[None]:
         lock = _posix_publisher_lock(parent)
     else:
         raise E1A4SamplingFrameError("E1A4_SAMPLING_FRAME_WRITE_FAILED")
-    with lock:
-        yield
+    with lock as publication:
+        yield publication
 
 
 def _is_staging_name(name: str) -> bool:
@@ -1500,59 +1935,39 @@ def _publish_sampling_frame(
 ) -> E1A4SamplingFrameSeal:
     final = _frame_directory(output_root)
     parent = final.parent
-    staged: Path | None = None
+    staged: _BoundStagingDirectory | None = None
     try:
         _reject_unsafe_directory_ancestors(output_root)
         parent.mkdir(parents=True, exist_ok=True)
-        parent_identity = _directory_identity(parent)
-        with _publisher_lock(parent):
+        with _publisher_lock(parent) as publication:
             try:
-                _require_directory_identity(parent, parent_identity)
-                _remove_abandoned_staging(parent)
-                _require_directory_identity(parent, parent_identity)
-                if final.exists():
+                publication.ensure_no_staging()
+                if publication.final_exists():
                     result = verify_sampling_frame(
                         source_register=source_register,
                         allocation=allocation,
                         output_root=output_root,
                     )
                 else:
-                    _require_directory_identity(parent, parent_identity)
-                    staged = Path(
-                        mkdtemp(prefix=".v1.", suffix=".tmp", dir=parent)
-                    )
-                    _require_directory_identity(parent, parent_identity)
-                    (staged / "sealed").mkdir()
-                    (staged / "manifests").mkdir()
-                    for name, content in (
-                        (SOURCE_REGISTER_NAME, _canonical(source_register)),
-                        (ALLOCATION_NAME, _canonical(allocation)),
-                    ):
-                        payload_path = staged / "sealed" / name
-                        manifest_path = staged / "manifests" / _manifest_name(
-                            name
-                        )
-                        for path, value in (
-                            (payload_path, content),
-                            (
-                                manifest_path,
-                                (
-                                    hashlib.sha256(content).hexdigest() + "\n"
-                                ).encode("ascii"),
-                            ),
+                    staged = publication.create_staging()
+                    try:
+                        for name, content in (
+                            (SOURCE_REGISTER_NAME, _canonical(source_register)),
+                            (ALLOCATION_NAME, _canonical(allocation)),
                         ):
-                            with path.open("xb") as stream:
-                                stream.write(value)
-                                stream.flush()
-                                os.fsync(stream.fileno())
-                    _sync_directory(staged / "sealed")
-                    _sync_directory(staged / "manifests")
-                    _sync_directory(staged)
-                    _require_directory_identity(parent, parent_identity)
-                    _rename_no_replace(staged, final)
-                    staged = None
-                    _require_directory_identity(parent, parent_identity)
-                    _sync_directory(parent)
+                            publication.write_file(staged.sealed, name, content)
+                            publication.write_file(
+                                staged.manifests,
+                                _manifest_name(name),
+                                (hashlib.sha256(content).hexdigest() + "\n").encode(
+                                    "ascii"
+                                ),
+                            )
+                        publication.sync_staging(staged)
+                        _publish_bound_staging(publication, staged)
+                        publication.sync_parent()
+                    finally:
+                        publication.close_staging(staged)
                     result = verify_sampling_frame(
                         source_register=source_register,
                         allocation=allocation,
