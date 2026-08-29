@@ -1104,6 +1104,7 @@ def _complete_snapshot_store(
     *,
     include_dry_run: bool = True,
     include_ambiguous_review: bool = False,
+    source_topic_override: str | None = None,
 ):
     from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
         ReviewDecisionRecord,
@@ -1142,6 +1143,20 @@ def _complete_snapshot_store(
         next_page_token=None,
     )
     sources, locators = _capacity_inventory()
+    if source_topic_override is not None:
+        sources = tuple(
+            source.__class__.from_mapping(
+                {
+                    **source.to_mapping(),
+                    "topic": (
+                        source_topic_override
+                        if source.source_id == "source-scale-supporting"
+                        else source.topic
+                    ),
+                }
+            )
+            for source in sources
+        )
     import_index_inventory(
         store=store,
         sources=sources,
@@ -1186,6 +1201,76 @@ def test_snapshot_seal_requires_completed_e1a4_dry_run(tmp_path: Path) -> None:
     ):
         seal_reconciliation_snapshots(store=store, root=store.root)
 
+    store.close()
+
+
+def test_snapshot_seal_accepts_closed_allocation_unavailable_outcome(
+    tmp_path: Path,
+) -> None:
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        seal_reconciliation_snapshots,
+        verify_reconciliation_snapshots,
+    )
+
+    store = _complete_snapshot_store(tmp_path)
+    store.set_checkpoint(
+        stage="e1a4_dry_run",
+        status="BLOCKED",
+        committed_records=0,
+        error_code="CORPUS_RECONCILIATION_E1A4_ALLOCATION_UNAVAILABLE",
+    )
+
+    sealed = seal_reconciliation_snapshots(store=store, root=store.root)
+
+    assert len(sealed.artifacts) == 7
+    assert verify_reconciliation_snapshots(root=store.root, store=store) == sealed
+    store.close()
+
+
+def test_snapshot_seal_rejects_unrecognized_blocked_dry_run(
+    tmp_path: Path,
+) -> None:
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        CorpusReconciliationError,
+        seal_reconciliation_snapshots,
+    )
+
+    store = _complete_snapshot_store(tmp_path)
+    store.set_checkpoint(
+        stage="e1a4_dry_run",
+        status="BLOCKED",
+        committed_records=0,
+        error_code="CORPUS_RECONCILIATION_UNKNOWN_FAILURE",
+    )
+
+    with pytest.raises(
+        CorpusReconciliationError,
+        match="CORPUS_RECONCILIATION_SNAPSHOT_INPUT_INCOMPLETE",
+    ):
+        seal_reconciliation_snapshots(store=store, root=store.root)
+
+    store.close()
+
+
+@pytest.mark.parametrize("parent_topic", ["unassigned", "corrosion"])
+def test_snapshot_seal_allows_locator_level_topic_assignment(
+    tmp_path: Path,
+    parent_topic: str,
+) -> None:
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        seal_reconciliation_snapshots,
+        verify_reconciliation_snapshots,
+    )
+
+    store = _complete_snapshot_store(
+        tmp_path,
+        source_topic_override=parent_topic,
+    )
+
+    sealed = seal_reconciliation_snapshots(store=store, root=store.root)
+
+    assert len(sealed.artifacts) == 7
+    assert verify_reconciliation_snapshots(root=store.root, store=store) == sealed
     store.close()
 
 

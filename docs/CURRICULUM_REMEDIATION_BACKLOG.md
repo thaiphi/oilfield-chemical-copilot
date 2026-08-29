@@ -4,12 +4,12 @@
 
 **Rule:** Items below are a backlog, not approved implementation work.
 
-## Active Experiment Status - 2026-08-23
+## Active Experiment Status - 2026-08-28
 
 - E1a-4 Task 1 contracts are complete.
-- E1a-4 Task 2 contract and sealer code is implemented, but the private sampling frame is blocked after a completed, sealed metadata reconciliation. The approved index contains 4,797 chunks from 198 sources; all four supporting strata have sufficient fresh locator capacity, while all four foundational strata are insufficient after mandatory E1a-3 locator exclusion. No sampling-frame artifact was written.
-- E1a-4 Tasks 3-6 have not started. Do not weaken locator freshness, the exact grid, or the one-shot gates to bypass Task 2.
-- The reconciliation checkpoint contains 385 topic-scoped Drive candidates, 232 local files, 198 index sources, and 1,874 locator records. It left 117 filename-and-size candidates for human review and made no automatic ambiguous match. This does not validate ingestion of hundreds of PDFs, but it does show that E1a-4's immediate blocker is foundational-locator freshness rather than general supporting-corpus capacity.
+- E1a-4 Task 2 mapping and metadata-only sampling frame are sealed and independently no-write verified. The verified mapping has 170 source records and all eight topic/role strata sufficient. The frame has exactly 96 slots, 96 unique slot identities, and 96 unique source-locator assignments across all four topics and both roles, with zero E1a-3 locator reuse.
+- The reconciliation seven-artifact snapshot set and both correction proposals were reverified before application, and mutation-boundary checks are clean. Qdrant and application services were not run; retrieval, ingestion, reindexing, model execution, question authoring, and claim authoring did not occur.
+- E1a-4 Tasks 3-6 have not started. The next checkpoint is private question and canonical-claim authoring. Do not weaken locator freshness, the exact grid, or the one-shot gates; do not retrieve, ingest, or reindex to bypass this checkpoint.
 
 ## P0 - Preserve Submission Integrity
 
@@ -122,7 +122,7 @@
 
 ## Recommended Next Approval
 
-For E1a-4, approve only a narrow private foundational-locator evidence audit of the already approved corpus: review whether existing foundational documents contain additional substantive, topic-bound locators that were not used by E1a-3; version and independently review any mapping correction; then rerun the same capacity calculation and no-write allocator. Do not retrieve, generate questions, tune models, ingest/reindex documents, or relax freshness during that audit. If the exact foundational quotas still fail, require a separate approval for new foundational-source acquisition or close E1a-4 as infeasible under the current grid.
+For E1a-4, the authenticated mapping and metadata-only 96-slot frame are sealed and independently no-write verified. The next approval is limited to private question and canonical-claim authoring. Do not retrieve, tune models, ingest, or reindex documents as part of that checkpoint. New-source acquisition is not justified by the current capacity evidence.
 
 Approve **P0.1 plus P0.2** when ready to publish: push the two verified local
 commits, then validate an independent public clone at the resulting fixed hash.

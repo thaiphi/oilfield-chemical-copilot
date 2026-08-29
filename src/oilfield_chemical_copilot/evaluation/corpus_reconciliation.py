@@ -2087,13 +2087,31 @@ def _snapshot_payloads(store: ReconciliationStore) -> dict[str, bytes]:
         "index_inventory",
         "document_matching",
         "locator_capacity",
-        "e1a4_dry_run",
     ):
         _require_complete_checkpoint(
             store,
             stage,
             error_code="CORPUS_RECONCILIATION_SNAPSHOT_INPUT_INCOMPLETE",
         )
+    try:
+        dry_run = store.checkpoint("e1a4_dry_run")
+    except CorpusReconciliationError:
+        _fail("CORPUS_RECONCILIATION_SNAPSHOT_INPUT_INCOMPLETE")
+    complete_dry_run = (
+        dry_run.status == "COMPLETE"
+        and dry_run.committed_records == 96
+        and dry_run.page_token is None
+        and dry_run.error_code is None
+    )
+    closed_unavailable_dry_run = (
+        dry_run.status == "BLOCKED"
+        and dry_run.committed_records == 0
+        and dry_run.page_token is None
+        and dry_run.error_code
+        == "CORPUS_RECONCILIATION_E1A4_ALLOCATION_UNAVAILABLE"
+    )
+    if not (complete_dry_run or closed_unavailable_dry_run):
+        _fail("CORPUS_RECONCILIATION_SNAPSHOT_INPUT_INCOMPLETE")
     if _unresolved_ambiguous_matches(store):
         _fail("CORPUS_RECONCILIATION_SNAPSHOT_INPUT_INCOMPLETE")
 
@@ -2401,7 +2419,6 @@ def _validate_snapshot_relationships(
         source = sources.get(source_id)
         if (
             source is None
-            or source["topic"] != record["topic"]
             or locator_key in locator_keys
             or (
                 record["e1a4_available"] is True

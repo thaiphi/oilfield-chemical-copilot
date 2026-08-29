@@ -1,0 +1,901 @@
+"""Seal or verify the authenticated metadata-only E1a-4 sampling frame."""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+import hashlib
+import json
+import os
+from pathlib import Path
+import stat
+import sys
+from typing import Mapping, Sequence
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SRC_DIR = PROJECT_ROOT / "src"
+sys.path[:0] = [str(PROJECT_ROOT), str(SRC_DIR)]
+
+from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (  # noqa: E402
+    CorpusReconciliationError,
+    ReconciliationStore,
+)
+from oilfield_chemical_copilot.evaluation.e1a3_sampling import (  # noqa: E402
+    E1A3SamplingError,
+    allocate_sampling_slots,
+    build_sampling_slots,
+)
+from oilfield_chemical_copilot.evaluation.e1a4_mapping_application import (  # noqa: E402
+    E1A4MappingApplicationError,
+    verify_e1a4_role_mapping,
+)
+from oilfield_chemical_copilot.evaluation.e1a4_sampling import (  # noqa: E402
+    E1A4SamplingError,
+    load_e1a3_prior_allocation,
+    mapping_sources_as_sampling_metadata,
+    validate_mapping_sources,
+)
+from oilfield_chemical_copilot.evaluation.foundational_locator_audit import (  # noqa: E402
+    FoundationalAuditStore,
+    FoundationalLocatorAuditError,
+)
+from oilfield_chemical_copilot.evaluation.index_preflight import (  # noqa: E402
+    E1IndexPreflightError,
+    IndexFingerprint,
+    verify_e1_index_contract,
+)
+from oilfield_chemical_copilot.evaluation.iron_sulfide_supplement_audit import (  # noqa: E402
+    IronSulfideSupplementAuditError,
+    IronSulfideSupplementAuditStore,
+)
+from oilfield_chemical_copilot.evaluation.private_artifact_publication import (  # noqa: E402
+    authenticated_publication_directory,
+)
+
+
+SOURCE_REGISTER_NAME = "source-register.v1.json"
+ALLOCATION_NAME = "sampling-allocation.v1.json"
+_PUBLISH_LOCK_NAME = ".v1.publish.lock"
+_MAPPING_BINDING_FIELDS = frozenset(
+    {
+        "schema_version",
+        "reconciliation_run_id",
+        "reconciliation_binding_sha256",
+        "core_binding_sha256",
+        "supplement_binding_sha256",
+        "e1a3_allocation_sha256",
+        "mapping_payload_sha256",
+        "source_record_count",
+        "unique_locator_count",
+        "stratum_locator_counts",
+        "allocator_available",
+        "allocator_slot_count",
+        "e1a3_excluded_before_allocation",
+    }
+)
+_SAFE_CODES = frozenset(
+    {
+        "E1A4_SAMPLING_FRAME_ARGUMENT_INVALID",
+        "E1A4_SAMPLING_FRAME_PRIVATE_ROOT_INVALID",
+        "E1A4_SAMPLING_FRAME_PREFLIGHT_FAILED",
+        "E1A4_SAMPLING_FRAME_MAPPING_UNTRUSTED",
+        "E1A4_SAMPLING_FRAME_MAPPING_INVALID",
+        "E1A4_SAMPLING_FRAME_CLOSE_FAILED",
+        "E1A4_SAMPLING_FRAME_INDEX_UNTRUSTED",
+        "E1A4_SAMPLING_FRAME_E1A3_UNTRUSTED",
+        "E1A4_SAMPLING_FRAME_E1A3_REUSE",
+        "E1A4_SAMPLING_FRAME_STRATUM_INSUFFICIENT",
+        "E1A4_SAMPLING_FRAME_ALLOCATION_INVALID",
+        "E1A4_SAMPLING_FRAME_MISSING",
+        "E1A4_SAMPLING_FRAME_PARTIAL",
+        "E1A4_SAMPLING_FRAME_BINDING_MISMATCH",
+        "E1A4_SAMPLING_FRAME_VERIFY_FAILED",
+        "E1A4_SAMPLING_FRAME_WRITE_FAILED",
+    }
+)
+
+
+class E1A4SamplingFrameError(RuntimeError):
+    """Raised with a fixed public-safe sampling-frame error code."""
+
+
+def _fail(code: str) -> None:
+    raise E1A4SamplingFrameError(code)
+
+
+def _digest(value: object, code: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        _fail(code)
+    return value
+
+
+def _canonical(value: Mapping[str, object]) -> bytes:
+    return (
+        json.dumps(
+            dict(value),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+@dataclass(frozen=True)
+class E1A4SamplingFrameSeal:
+    source_record_count: int
+    sufficient_strata_count: int
+    slot_count: int
+    source_register_sha256: str
+    allocation_sha256: str
+
+
+class SafeArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        del message
+        _fail("E1A4_SAMPLING_FRAME_ARGUMENT_INVALID")
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = SafeArgumentParser(
+        description="Seal the authenticated E1a-4 metadata sampling frame."
+    )
+    parser.add_argument("command", nargs="?", choices=("seal", "verify"))
+    parser.add_argument("--preflight", action="store_true")
+    parser.add_argument("--reconciliation-root", type=Path, required=True)
+    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--core-audit-id", required=True)
+    parser.add_argument("--supplement-audit-id", required=True)
+    parser.add_argument(
+        "--expected-reconciliation-binding-sha256", required=True
+    )
+    parser.add_argument("--expected-core-binding-sha256", required=True)
+    parser.add_argument("--expected-supplement-binding-sha256", required=True)
+    parser.add_argument("--mapping-root", type=Path, required=True)
+    parser.add_argument("--expected-mapping-binding-sha256", required=True)
+    parser.add_argument("--e1a3-allocation-path", type=Path, required=True)
+    parser.add_argument(
+        "--e1a3-allocation-manifest-path", type=Path, required=True
+    )
+    parser.add_argument("--e1a3-private-root", type=Path, required=True)
+    parser.add_argument("--approved-private-root", type=Path, required=True)
+    parser.add_argument("--database-url", required=True)
+    parser.add_argument("--index-contract", dest="index_contract_path", type=Path, required=True)
+    parser.add_argument("--output-root", type=Path, required=True)
+    parser.add_argument("--expected-source-register-sha256")
+    parser.add_argument("--expected-allocation-sha256")
+    return parser
+
+
+def _is_reparse_point(observed: os.stat_result) -> bool:
+    attributes = getattr(observed, "st_file_attributes", 0)
+    return bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+
+
+def _require_safe_directory_component(path: Path) -> None:
+    observed = path.lstat()
+    if (
+        not stat.S_ISDIR(observed.st_mode)
+        or stat.S_ISLNK(observed.st_mode)
+        or _is_reparse_point(observed)
+    ):
+        raise OSError("unsafe private directory component")
+
+
+def _existing_directory_chain(path: Path) -> tuple[Path, ...]:
+    absolute = path.absolute()
+    lineage = tuple(reversed((absolute, *absolute.parents)))
+    existing: list[Path] = []
+    for component in lineage:
+        try:
+            component.lstat()
+        except FileNotFoundError:
+            break
+        existing.append(component)
+    return tuple(existing)
+
+
+def _repository_root(path: Path) -> Path | None:
+    for candidate in (path, *path.parents):
+        try:
+            (candidate / ".git").lstat()
+        except FileNotFoundError:
+            continue
+        return candidate
+    return None
+
+
+def _validate_private_paths(
+    approved_private_root: Path, paths: Sequence[Path]
+) -> None:
+    try:
+        raw_root = approved_private_root.absolute()
+        for component in _existing_directory_chain(raw_root):
+            _require_safe_directory_component(component)
+        root = raw_root.resolve(strict=True)
+        repository = _repository_root(root)
+        if repository is not None:
+            relative = root.relative_to(repository)
+            if not relative.parts or relative.parts[0] != ".private":
+                raise OSError("public worktree cannot be a private root")
+        for path in paths:
+            raw_path = path.absolute()
+            raw_path.relative_to(raw_root)
+            raw_path.resolve(strict=False).relative_to(root)
+            for component in _existing_directory_chain(raw_path):
+                _require_safe_directory_component(component)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise E1A4SamplingFrameError(
+            "E1A4_SAMPLING_FRAME_PRIVATE_ROOT_INVALID"
+        ) from error
+
+
+def _presence_paths(args: argparse.Namespace) -> tuple[Path, ...]:
+    return _presence_paths_from_values(vars(args))
+
+
+def _presence_paths_from_values(values: Mapping[str, object]) -> tuple[Path, ...]:
+    mapping = (
+        Path(values["mapping_root"])
+        / "e1a4-role-mapping"
+        / "v1"
+        / "sealed"
+    )
+    return (
+        Path(values["reconciliation_root"]) / "reconciliation.sqlite",
+        mapping / "role-mapping.v1.json",
+        mapping / "role-mapping.v1.json.sha256",
+        mapping / "mapping-binding.v1.json",
+        mapping / "mapping-binding.v1.json.sha256",
+        Path(values["e1a3_allocation_path"]),
+        Path(values["e1a3_allocation_manifest_path"]),
+        Path(values["index_contract_path"]),
+    )
+
+
+def _presence_preflight(args: argparse.Namespace) -> None:
+    _check_presence(_presence_paths(args))
+
+
+def _presence_preflight_values(values: Mapping[str, object]) -> None:
+    _check_presence(_presence_paths_from_values(values))
+
+
+def _check_presence(paths: Sequence[Path]) -> None:
+    try:
+        if not all(path.is_file() for path in paths):
+            _fail("E1A4_SAMPLING_FRAME_PREFLIGHT_FAILED")
+    except E1A4SamplingFrameError:
+        raise
+    except Exception:
+        _fail("E1A4_SAMPLING_FRAME_PREFLIGHT_FAILED")
+
+
+def _mapping_kwargs(values: Mapping[str, object]) -> dict[str, object]:
+    return {
+        "expected_reconciliation_binding_sha256": values[
+            "expected_reconciliation_binding_sha256"
+        ],
+        "expected_core_binding_sha256": values[
+            "expected_core_binding_sha256"
+        ],
+        "expected_supplement_binding_sha256": values[
+            "expected_supplement_binding_sha256"
+        ],
+        "e1a3_allocation_path": values["e1a3_allocation_path"],
+        "e1a3_allocation_manifest_path": values[
+            "e1a3_allocation_manifest_path"
+        ],
+        "e1a3_private_root": values["e1a3_private_root"],
+        "output_root": values["mapping_root"],
+        "expected_mapping_binding_sha256": values[
+            "expected_mapping_binding_sha256"
+        ],
+    }
+
+
+def _close_mapping_stores(*connections: object | None) -> None:
+    close_failed = False
+    for connection in connections:
+        if connection is None:
+            continue
+        try:
+            connection.close()  # type: ignore[attr-defined]
+        except Exception:
+            close_failed = True
+    if close_failed:
+        _fail("E1A4_SAMPLING_FRAME_CLOSE_FAILED")
+
+
+def _verify_mapping_trust(**values: object) -> object:
+    root = Path(values["reconciliation_root"]).resolve()
+    database_path = (root / "reconciliation.sqlite").resolve()
+    store: ReconciliationStore | None = None
+    core: FoundationalAuditStore | None = None
+    supplement: IronSulfideSupplementAuditStore | None = None
+    try:
+        store = ReconciliationStore.open(
+            root=root,
+            expected_root=root,
+            run_id=str(values["run_id"]),
+        )
+        core = FoundationalAuditStore.open(
+            database_path=database_path,
+            run_id=str(values["run_id"]),
+            audit_id=str(values["core_audit_id"]),
+        )
+        supplement = IronSulfideSupplementAuditStore.open(
+            database_path=database_path,
+            run_id=str(values["run_id"]),
+            audit_id=str(values["supplement_audit_id"]),
+        )
+        return verify_e1a4_role_mapping(
+            store=store,
+            core_audit=core,
+            supplement_audit=supplement,
+            **_mapping_kwargs(values),
+        )
+    except (
+        CorpusReconciliationError,
+        E1A4MappingApplicationError,
+        FoundationalLocatorAuditError,
+        IronSulfideSupplementAuditError,
+        OSError,
+        TypeError,
+        ValueError,
+    ):
+        _fail("E1A4_SAMPLING_FRAME_MAPPING_UNTRUSTED")
+    finally:
+        _close_mapping_stores(supplement, core, store)
+
+
+def _mapping_payload(
+    seal: object, *, expected_mapping_binding_sha256: str
+) -> tuple[object, ...]:
+    try:
+        artifacts = getattr(seal, "artifacts")
+        mapping_artifact = next(
+            item
+            for item in artifacts
+            if item.name == "role-mapping.v1.json"
+        )
+        binding_artifact = next(
+            item
+            for item in artifacts
+            if item.name == "mapping-binding.v1.json"
+        )
+        mapping_content = mapping_artifact.path.read_bytes()
+        binding_content = binding_artifact.path.read_bytes()
+        binding_digest = hashlib.sha256(binding_content).hexdigest()
+        if binding_digest != _digest(
+            expected_mapping_binding_sha256,
+            "E1A4_SAMPLING_FRAME_MAPPING_INVALID",
+        ) or binding_digest != _digest(
+            binding_artifact.sha256,
+            "E1A4_SAMPLING_FRAME_MAPPING_INVALID",
+        ):
+            _fail("E1A4_SAMPLING_FRAME_MAPPING_INVALID")
+        binding = json.loads(binding_content)
+        if (
+            not isinstance(binding, dict)
+            or set(binding) != _MAPPING_BINDING_FIELDS
+            or type(binding["schema_version"]) is not int
+            or binding["schema_version"] != 1
+            or _canonical(binding) != binding_content
+            or _digest(
+                binding["mapping_payload_sha256"],
+                "E1A4_SAMPLING_FRAME_MAPPING_INVALID",
+            )
+            != hashlib.sha256(mapping_content).hexdigest()
+        ):
+            _fail("E1A4_SAMPLING_FRAME_MAPPING_INVALID")
+        payload = json.loads(mapping_content)
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != {"schema_version", "sources"}
+            or type(payload["schema_version"]) is not int
+            or payload["schema_version"] != 1
+            or not isinstance(payload["sources"], list)
+            or _canonical(payload) != mapping_content
+        ):
+            _fail("E1A4_SAMPLING_FRAME_MAPPING_INVALID")
+        sources = validate_mapping_sources(payload["sources"])
+        if (
+            type(binding["source_record_count"]) is not int
+            or len(sources) != binding["source_record_count"]
+            or type(mapping_artifact.record_count) is not int
+            or len(sources) != mapping_artifact.record_count
+        ):
+            _fail("E1A4_SAMPLING_FRAME_MAPPING_INVALID")
+        return sources
+    except E1A4SamplingFrameError:
+        raise
+    except (E1A4SamplingError, AttributeError, OSError, StopIteration, TypeError, ValueError, json.JSONDecodeError):
+        _fail("E1A4_SAMPLING_FRAME_MAPPING_INVALID")
+
+
+def _frame_directory(output_root: Path) -> Path:
+    return output_root / "e1a4" / "sampling-frame" / "v1"
+
+
+def _index_fingerprint_from_bytes(content: bytes) -> IndexFingerprint:
+    try:
+        payload = json.loads(content.decode("utf-8"))
+        if not isinstance(payload, dict) or set(payload) != {
+            "chunk_count",
+            "distinct_source_count",
+            "embedding_models",
+            "embedding_dimensions",
+            "inventory_sha256",
+        }:
+            _fail("E1A4_SAMPLING_FRAME_INDEX_UNTRUSTED")
+        chunk_count = payload["chunk_count"]
+        source_count = payload["distinct_source_count"]
+        models = payload["embedding_models"]
+        dimensions = payload["embedding_dimensions"]
+        inventory_digest = payload["inventory_sha256"]
+        if (
+            type(chunk_count) is not int
+            or chunk_count < 1
+            or type(source_count) is not int
+            or source_count < 1
+            or not isinstance(models, list)
+            or not models
+            or any(not isinstance(model, str) or not model for model in models)
+            or not isinstance(dimensions, list)
+            or not dimensions
+            or any(
+                type(dimension) is not int or dimension < 1
+                for dimension in dimensions
+            )
+            or not isinstance(inventory_digest, str)
+            or len(inventory_digest) != 64
+        ):
+            _fail("E1A4_SAMPLING_FRAME_INDEX_UNTRUSTED")
+        return IndexFingerprint(
+            chunk_count=chunk_count,
+            distinct_source_count=source_count,
+            embedding_models=tuple(models),
+            embedding_dimensions=tuple(dimensions),
+            inventory_sha256=inventory_digest,
+        )
+    except E1A4SamplingFrameError:
+        raise
+    except (KeyError, TypeError, UnicodeError, json.JSONDecodeError):
+        _fail("E1A4_SAMPLING_FRAME_INDEX_UNTRUSTED")
+
+
+def _expected_frame(**values: object) -> tuple[dict[str, object], dict[str, object]]:
+    mapping_seal = _verify_mapping_trust(**values)
+    expected_mapping_binding = _digest(
+        values.get("expected_mapping_binding_sha256"),
+        "E1A4_SAMPLING_FRAME_MAPPING_UNTRUSTED",
+    )
+    mapping_binding = _digest(
+        getattr(mapping_seal, "binding_sha256", None),
+        "E1A4_SAMPLING_FRAME_MAPPING_UNTRUSTED",
+    )
+    if mapping_binding != expected_mapping_binding:
+        _fail("E1A4_SAMPLING_FRAME_MAPPING_UNTRUSTED")
+
+    contract_path = Path(values["index_contract_path"])
+    try:
+        contract_before = contract_path.read_bytes()
+        verified_fingerprint = verify_e1_index_contract(
+            database_url=str(values["database_url"]),
+            contract_path=contract_path,
+        )
+        contract_after = contract_path.read_bytes()
+    except (E1IndexPreflightError, OSError, TypeError, ValueError):
+        _fail("E1A4_SAMPLING_FRAME_INDEX_UNTRUSTED")
+    if (
+        contract_before != contract_after
+        or _index_fingerprint_from_bytes(contract_after)
+        != verified_fingerprint
+    ):
+        _fail("E1A4_SAMPLING_FRAME_INDEX_UNTRUSTED")
+    index_contract_digest = hashlib.sha256(contract_after).hexdigest()
+
+    sources = _mapping_payload(
+        mapping_seal,
+        expected_mapping_binding_sha256=expected_mapping_binding,
+    )
+    try:
+        prior = load_e1a3_prior_allocation(
+            payload_path=Path(values["e1a3_allocation_path"]),
+            manifest_path=Path(values["e1a3_allocation_manifest_path"]),
+            private_root=Path(values["e1a3_private_root"]),
+        )
+    except (E1A4SamplingError, OSError, TypeError, ValueError):
+        _fail("E1A4_SAMPLING_FRAME_E1A3_UNTRUSTED")
+    if prior.slot_count != 96:
+        _fail("E1A4_SAMPLING_FRAME_E1A3_UNTRUSTED")
+    prior_digest = _digest(
+        prior.payload_sha256, "E1A4_SAMPLING_FRAME_E1A3_UNTRUSTED"
+    )
+    mapped_keys = {
+        f"{source.source_id}:{locator}"
+        for source in sources
+        for locator in source.locators
+    }
+    if mapped_keys & prior.locator_keys:
+        _fail("E1A4_SAMPLING_FRAME_E1A3_REUSE")
+
+    metadata = mapping_sources_as_sampling_metadata(sources)
+    stratum_counts = {
+        (topic, role): sum(
+            len(source.locators)
+            for source in metadata
+            if source.topic == topic and source.source_role == role
+        )
+        for topic in ("iron_sulfide", "scale", "corrosion", "paraffin")
+        for role in ("foundational", "supporting")
+    }
+    if any(count < 12 for count in stratum_counts.values()):
+        _fail("E1A4_SAMPLING_FRAME_STRATUM_INSUFFICIENT")
+
+    slots = build_sampling_slots()
+    try:
+        allocations = allocate_sampling_slots(slots=slots, sources=metadata)
+    except (E1A3SamplingError, TypeError, ValueError):
+        _fail("E1A4_SAMPLING_FRAME_ALLOCATION_INVALID")
+    expected_identities = {
+        (
+            slot.slot_id,
+            slot.topic,
+            slot.source_role,
+            slot.question_form,
+            slot.evidence_depth,
+            slot.replicate,
+        )
+        for slot in slots
+    }
+    try:
+        identities = {
+            (
+                item.slot_id,
+                item.topic,
+                item.source_role,
+                item.question_form,
+                item.evidence_depth,
+                item.replicate,
+            )
+            for item in allocations
+        }
+        allocated_keys = {
+            (item.source_id, item.locator) for item in allocations
+        }
+        allocation_rows = [item.to_mapping() for item in allocations]
+    except (AttributeError, TypeError, ValueError):
+        _fail("E1A4_SAMPLING_FRAME_ALLOCATION_INVALID")
+    if (
+        len(allocations) != 96
+        or identities != expected_identities
+        or len(allocated_keys) != 96
+        or {item.topic for item in allocations}
+        != {"iron_sulfide", "scale", "corrosion", "paraffin"}
+        or {item.source_role for item in allocations}
+        != {"foundational", "supporting"}
+    ):
+        _fail("E1A4_SAMPLING_FRAME_ALLOCATION_INVALID")
+
+    source_register = {
+        "schema_version": 1,
+        "mapping_binding_sha256": mapping_binding,
+        "index_contract_sha256": index_contract_digest,
+        "e1a3_allocation_sha256": prior_digest,
+        "source_record_count": len(metadata),
+        "sources": [source.to_mapping() for source in metadata],
+    }
+    source_register_digest = hashlib.sha256(
+        _canonical(source_register)
+    ).hexdigest()
+    allocation = {
+        "schema_version": 1,
+        "source_register_sha256": source_register_digest,
+        "e1a3_allocation_sha256": prior_digest,
+        "slot_count": 96,
+        "allocations": allocation_rows,
+    }
+    return source_register, allocation
+
+
+def _manifest_name(payload_name: str) -> str:
+    return f"{payload_name.removesuffix('.json')}.sha256"
+
+
+def _sampling_frame_layout() -> dict[str, frozenset[str]]:
+    return {
+        "sealed": frozenset({SOURCE_REGISTER_NAME, ALLOCATION_NAME}),
+        "manifests": frozenset(
+            {
+                _manifest_name(SOURCE_REGISTER_NAME),
+                _manifest_name(ALLOCATION_NAME),
+            }
+        ),
+    }
+
+
+def _read_sampling_frame_members(
+    publication: object, *, require_exists: bool = True
+) -> dict[str, bytes]:
+    try:
+        if require_exists and not publication.final_exists("v1"):
+            _fail("E1A4_SAMPLING_FRAME_MISSING")
+        return publication.read_exact_tree("v1", _sampling_frame_layout())
+    except E1A4SamplingFrameError:
+        raise
+    except Exception as error:
+        raise E1A4SamplingFrameError(
+            "E1A4_SAMPLING_FRAME_VERIFY_FAILED"
+        ) from error
+
+
+def _verify_sampling_frame_members(
+    *,
+    source_register: Mapping[str, object],
+    allocation: Mapping[str, object],
+    members: Mapping[str, bytes],
+    expected_source_register_sha256: str | None = None,
+    expected_allocation_sha256: str | None = None,
+) -> E1A4SamplingFrameSeal:
+    try:
+        prepared = (
+            (SOURCE_REGISTER_NAME, _canonical(source_register)),
+            (ALLOCATION_NAME, _canonical(allocation)),
+        )
+        digests: list[str] = []
+        for name, expected in prepared:
+            digest = hashlib.sha256(expected).hexdigest()
+            if (
+                members[f"sealed/{name}"] != expected
+                or members[f"manifests/{_manifest_name(name)}"]
+                != f"{digest}\n".encode("ascii")
+            ):
+                _fail("E1A4_SAMPLING_FRAME_BINDING_MISMATCH")
+            digests.append(digest)
+    except E1A4SamplingFrameError:
+        raise
+    except (KeyError, TypeError, UnicodeError, ValueError):
+        _fail("E1A4_SAMPLING_FRAME_VERIFY_FAILED")
+    anchors = (
+        expected_source_register_sha256,
+        expected_allocation_sha256,
+    )
+    for anchor, actual in zip(anchors, digests, strict=True):
+        if anchor is not None and _digest(
+            anchor, "E1A4_SAMPLING_FRAME_BINDING_MISMATCH"
+        ) != actual:
+            _fail("E1A4_SAMPLING_FRAME_BINDING_MISMATCH")
+    source_count = source_register.get("source_record_count")
+    if type(source_count) is not int or source_count < 1:
+        _fail("E1A4_SAMPLING_FRAME_BINDING_MISMATCH")
+    return E1A4SamplingFrameSeal(
+        source_record_count=source_count,
+        sufficient_strata_count=8,
+        slot_count=96,
+        source_register_sha256=digests[0],
+        allocation_sha256=digests[1],
+    )
+
+
+def verify_sampling_frame(
+    *,
+    source_register: Mapping[str, object],
+    allocation: Mapping[str, object],
+    approved_private_root: Path,
+    output_root: Path,
+    expected_source_register_sha256: str | None = None,
+    expected_allocation_sha256: str | None = None,
+) -> E1A4SamplingFrameSeal:
+    try:
+        with authenticated_publication_directory(
+            approved_private_root=approved_private_root,
+            publication_parent=_frame_directory(output_root).parent,
+            lock_name=_PUBLISH_LOCK_NAME,
+        ) as publication:
+            publication.ensure_no_staging(".v1.", ".tmp")
+            members = _read_sampling_frame_members(publication)
+            return _verify_sampling_frame_members(
+                source_register=source_register,
+                allocation=allocation,
+                members=members,
+                expected_source_register_sha256=(
+                    expected_source_register_sha256
+                ),
+                expected_allocation_sha256=expected_allocation_sha256,
+            )
+    except E1A4SamplingFrameError:
+        raise
+    except Exception as error:
+        raise E1A4SamplingFrameError(
+            "E1A4_SAMPLING_FRAME_WRITE_FAILED"
+        ) from error
+
+
+def _publish_sampling_frame(
+    *,
+    source_register: Mapping[str, object],
+    allocation: Mapping[str, object],
+    approved_private_root: Path,
+    output_root: Path,
+) -> E1A4SamplingFrameSeal:
+    try:
+        with authenticated_publication_directory(
+            approved_private_root=approved_private_root,
+            publication_parent=_frame_directory(output_root).parent,
+            lock_name=_PUBLISH_LOCK_NAME,
+        ) as publication:
+            publication.ensure_no_staging(".v1.", ".tmp")
+            if not publication.final_exists("v1"):
+                staging = publication.create_staging(".v1.", ".tmp")
+                staging.mkdir("sealed")
+                staging.mkdir("manifests")
+                for name, content in (
+                    (SOURCE_REGISTER_NAME, _canonical(source_register)),
+                    (ALLOCATION_NAME, _canonical(allocation)),
+                ):
+                    staging.write_exclusive(f"sealed/{name}", content)
+                    staging.write_exclusive(
+                        f"manifests/{_manifest_name(name)}",
+                        (hashlib.sha256(content).hexdigest() + "\n").encode(
+                            "ascii"
+                        ),
+                    )
+                staging.sync_directory("sealed")
+                staging.sync_directory("manifests")
+                staging.sync_root()
+                publication.publish_no_replace(staging, "v1")
+                publication.sync_parent()
+            members = _read_sampling_frame_members(
+                publication, require_exists=False
+            )
+            return _verify_sampling_frame_members(
+                source_register=source_register,
+                allocation=allocation,
+                members=members,
+            )
+    except E1A4SamplingFrameError:
+        raise
+    except Exception as error:
+        raise E1A4SamplingFrameError(
+            "E1A4_SAMPLING_FRAME_WRITE_FAILED"
+        ) from error
+
+
+def seal_sampling_frame(**values: object) -> E1A4SamplingFrameSeal:
+    _presence_preflight_values(values)
+    source_register, allocation = _expected_frame(**values)
+    return _publish_sampling_frame(
+        source_register=source_register,
+        allocation=allocation,
+        approved_private_root=Path(values["approved_private_root"]),
+        output_root=Path(values["output_root"]),
+    )
+
+
+def verify_current_sampling_frame(**values: object) -> E1A4SamplingFrameSeal:
+    _presence_preflight_values(values)
+    output_root = Path(values["output_root"])
+    try:
+        with authenticated_publication_directory(
+            approved_private_root=Path(values["approved_private_root"]),
+            publication_parent=_frame_directory(output_root).parent,
+            lock_name=_PUBLISH_LOCK_NAME,
+        ) as publication:
+            publication.ensure_no_staging(".v1.", ".tmp")
+            source_register, allocation = _expected_frame(**values)
+            members = _read_sampling_frame_members(publication)
+            return _verify_sampling_frame_members(
+                source_register=source_register,
+                allocation=allocation,
+                members=members,
+                expected_source_register_sha256=values.get(
+                    "expected_source_register_sha256"
+                ),
+                expected_allocation_sha256=values.get(
+                    "expected_allocation_sha256"
+                ),
+            )
+    except E1A4SamplingFrameError:
+        raise
+    except Exception as error:
+        raise E1A4SamplingFrameError(
+            "E1A4_SAMPLING_FRAME_WRITE_FAILED"
+        ) from error
+
+
+def _values(args: argparse.Namespace) -> dict[str, object]:
+    return {
+        "reconciliation_root": args.reconciliation_root,
+        "run_id": args.run_id,
+        "core_audit_id": args.core_audit_id,
+        "supplement_audit_id": args.supplement_audit_id,
+        "expected_reconciliation_binding_sha256": (
+            args.expected_reconciliation_binding_sha256
+        ),
+        "expected_core_binding_sha256": args.expected_core_binding_sha256,
+        "expected_supplement_binding_sha256": (
+            args.expected_supplement_binding_sha256
+        ),
+        "mapping_root": args.mapping_root,
+        "expected_mapping_binding_sha256": (
+            args.expected_mapping_binding_sha256
+        ),
+        "e1a3_allocation_path": args.e1a3_allocation_path,
+        "e1a3_allocation_manifest_path": (
+            args.e1a3_allocation_manifest_path
+        ),
+        "e1a3_private_root": args.e1a3_private_root,
+        "approved_private_root": args.approved_private_root,
+        "database_url": args.database_url,
+        "index_contract_path": args.index_contract_path,
+        "output_root": args.output_root,
+        "expected_source_register_sha256": (
+            args.expected_source_register_sha256
+        ),
+        "expected_allocation_sha256": args.expected_allocation_sha256,
+    }
+
+
+def _safe_code(error: Exception) -> str:
+    value = str(error)
+    if isinstance(error, E1A4SamplingFrameError) and value in _SAFE_CODES:
+        return value
+    return "E1A4_SAMPLING_FRAME_OPERATION_FAILED"
+
+
+def cli(argv: Sequence[str] | None = None) -> int:
+    try:
+        args = _parser().parse_args(argv)
+        _validate_private_paths(
+            args.approved_private_root,
+            (args.mapping_root, args.output_root),
+        )
+        if args.preflight:
+            if args.command is not None:
+                _fail("E1A4_SAMPLING_FRAME_ARGUMENT_INVALID")
+            _presence_preflight(args)
+            output: dict[str, object] = {
+                "status": "E1A4_SAMPLING_FRAME_PREFLIGHT_READY"
+            }
+        else:
+            if args.command is None:
+                _fail("E1A4_SAMPLING_FRAME_ARGUMENT_INVALID")
+            _presence_preflight(args)
+            values = _values(args)
+            if args.command == "seal":
+                sealed = seal_sampling_frame(**values)
+                status = "E1A4_SAMPLING_FRAME_SEALED"
+            else:
+                sealed = verify_current_sampling_frame(**values)
+                status = "E1A4_SAMPLING_FRAME_VERIFIED"
+            output = {
+                "status": status,
+                "source_record_count": sealed.source_record_count,
+                "sufficient_strata_count": sealed.sufficient_strata_count,
+                "slot_count": sealed.slot_count,
+            }
+    except Exception as error:
+        print(
+            json.dumps(
+                {
+                    "status": "E1A4_SAMPLING_FRAME_BLOCKED",
+                    "error_code": _safe_code(error),
+                },
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+        )
+        return 1
+    print(json.dumps(output, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(cli())

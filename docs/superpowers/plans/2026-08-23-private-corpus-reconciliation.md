@@ -369,3 +369,20 @@ git commit -m "docs: record private corpus reconciliation gate"
 - Artifact result: the earlier six-file set is historical evidence only and is not accepted by the corrected seven-artifact active-run binding contract. No private artifacts were read or resealed during this correction.
 - Verification: tracked regression and full-suite evidence for the corrected contract is recorded in PR #1; private revalidation remains pending.
 - Decision: do not run the E1a-4 sampling-frame sealer, ingest/reindex documents, reuse E1a-3 locators, or weaken the exact grid. The next approval gate is bounded human review of the unresolved identity candidates followed by a new versioned, active-run-bound reconciliation seal; the foundational-locator audit remains downstream of that gate.
+
+## Reconciliation Closure — 2026-08-26
+
+- Status: the bounded identity-review gate is closed and the corrected active-run-bound reconciliation seal is complete. E1a-4 allocation remains unavailable because foundational locator capacity is still insufficient.
+- Identity result: all 117 filename-and-size candidates have one validated current closed decision; all 117 were confirmed byte-identical against both the frozen local inventory hash and raw Drive bytes, with zero unresolved candidates. Superseded provisional decisions remain preserved in the append-only private review log and are excluded from current-decision counts.
+- Checkpoint result: `document_matching` is `COMPLETE`. Drive, local, index, matching, and locator-capacity checkpoints are complete; the E1a-4 dry run remains fail-closed with the exact allocation-unavailable outcome.
+- Artifact result: the historical six-artifact set remains preserved as non-active evidence. The active private seal contains six canonical database-derived snapshots plus one active-run binding artifact, each with its own manifest; all seven artifacts and all seven manifests passed no-write verification against the current SQLite run.
+- Capacity result: all four supporting strata remain sufficient and all four foundational strata remain insufficient after exact E1a-3 locator exclusion.
+- Verification to date: 62 focused reconciliation tests pass and the changed controller/test files are Ruff-clean. Full-suite and final independent review remain pending.
+- Decision: do not run E1a-4 sampling, ingestion, reindexing, retrieval changes, locator reuse, or grid weakening. The next authorized gate is the bounded foundational-locator audit; any corpus change requires a separate reviewed plan after that audit reports aggregate evidence gaps.
+
+## Foundational-Locator Audit Closure — 2026-08-26
+
+- Status: the bounded 133-candidate evidence audit is complete and durably persisted. All saved decisions were revalidated against page text extracted from the exact verified PDF bytes. It produced 92 proposed promotions, 41 retained ineligible decisions, and zero unresolved or second-review items.
+- Capacity result: all four supporting strata remain sufficient. Proposed foundational capacity is sufficient for scale, corrosion, and paraffin, while iron sulfide remains insufficient at 5 of 12 fresh locators. The deterministic 96-slot allocation therefore remains unavailable.
+- Artifact result: the stricter v2 two-artifact correction seal and both manifests passed separate no-write verification after atomic publication. It binds the active reconciliation seal, Drive provenance, PDF bytes, candidate set, and page-text digests; the prior v1 seal remains preserved as superseded history. The proposal has not been applied to the reconciliation inventory or index.
+- Review and decision: independent review approved the v2 proposal contract with no findings. E1a-4 sampling, ingestion, reindexing, retrieval changes, locator reuse, grid weakening, and mapping application remain unauthorized because the exact allocation is still unavailable. The next approval choice is a narrow acquisition plan for at least seven fresh substantive foundational iron-sulfide locators or closure of E1a-4 as infeasible under the current grid.
