@@ -130,7 +130,7 @@ git commit -m "feat: add authenticated private publication capability"
 - Changes: `_publish_mapping_directory(mapping, binding, output_root, approved_private_root) -> E1A4MappingSeal`
 - Preserves: mapping filenames, canonical bytes, digest anchors, `E1A4MappingSeal`, and existing verification API
 
-- [ ] **Step 1: Write mapping-publication RED tests**
+- [x] **Step 1: Write mapping-publication RED tests**
 
 Add focused tests:
 
@@ -143,7 +143,7 @@ def test_mapping_publisher_uses_capability_for_lock_stage_sync_and_rename(...): 
 
 The retarget test must swap during the real mapping publication acquisition/staging flow and fail on the current pathname-based implementation by detecting synthetic locator bytes in the replacement tree.
 
-- [ ] **Step 2: Run Task 2 tests and verify RED**
+- [x] **Step 2: Run Task 2 tests and verify RED**
 
 Run:
 
@@ -153,7 +153,7 @@ uv run pytest -q tests/evaluation/test_e1a4_mapping_application.py -k "retargete
 
 Expected: failures show that mapping publication does not accept or use the shared authenticated capability.
 
-- [ ] **Step 3: Replace mapping pathname publication**
+- [x] **Step 3: Replace mapping pathname publication**
 
 Pass `approved_private_root` from the CLI to `seal_e1a4_role_mapping` and `_publish_mapping_directory`. Inside the publisher:
 
@@ -171,7 +171,7 @@ with authenticated_publication_directory(
 
 Remove mapping publisher-only pathname lock/staging/rename/sync helpers after their consumers and tests migrate. Do not change the separately hardened mapping artifact reader unless compilation proves a private helper is shared with verification; if shared, move only that helper to the capability module without altering verification semantics.
 
-- [ ] **Step 4: Run mapping GREEN and regressions**
+- [x] **Step 4: Run mapping GREEN and regressions**
 
 Run:
 
@@ -183,7 +183,7 @@ git diff --check
 
 Expected: all mapping/capability tests pass with only documented platform skips; no artifact contract changes.
 
-- [ ] **Step 5: Commit Task 2**
+- [x] **Step 5: Commit Task 2**
 
 ```powershell
 git add src/oilfield_chemical_copilot/evaluation/e1a4_mapping_application.py eval/apply_e1a4_role_corrections.py tests/evaluation/test_e1a4_mapping_application.py
