@@ -230,7 +230,10 @@ def _operate(args: argparse.Namespace) -> dict[str, object]:
             "output_root": args.output_root,
         }
         if args.command == "apply":
-            sealed = seal_e1a4_role_mapping(**common)
+            sealed = seal_e1a4_role_mapping(
+                **common,
+                approved_private_root=args.approved_private_root,
+            )
             status = "E1A4_ROLE_MAPPING_SEALED"
         else:
             if args.expected_mapping_binding_sha256 is None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 import hashlib
 from pathlib import Path
@@ -8,7 +9,6 @@ import shutil
 import sqlite3
 import stat
 from tempfile import mkdtemp
-from threading import Event, Thread, current_thread
 from types import SimpleNamespace
 
 import pytest
@@ -533,6 +533,245 @@ def _payloads() -> tuple[dict[str, object], dict[str, object]]:
     return mapping, {"schema_version": 1, "mapping_payload_sha256": "a" * 64}
 
 
+def test_mapping_publisher_never_writes_through_retargeted_ancestor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import oilfield_chemical_copilot.evaluation.e1a4_mapping_application as module
+    from oilfield_chemical_copilot.evaluation import private_artifact_publication
+
+    approved = tmp_path / "private"
+    output = approved / "output"
+    displaced = approved / "authenticated-output"
+    replacement = approved / "replacement-output"
+    approved.mkdir()
+    output.mkdir()
+    mapping, binding = _payloads()
+    mapping["sources"][0]["locators"] = ["synthetic-private-locator"]  # type: ignore[index]
+    attack_happened = False
+    platform_class = (
+        private_artifact_publication._WindowsPublicationDirectory
+        if private_artifact_publication.os.name == "nt"
+        else private_artifact_publication._PosixPublicationDirectory
+    )
+    real_take = platform_class.take
+
+    def swap_then_take(cls: type[object], handle: object) -> object:
+        nonlocal attack_happened
+        attack_happened = True
+        output.rename(displaced)
+        output.mkdir()
+        return real_take(handle)
+
+    monkeypatch.setattr(platform_class, "take", classmethod(swap_then_take))
+
+    try:
+        try:
+            module._publish_mapping_directory(
+                mapping,
+                binding,
+                output,
+                approved,
+            )
+        except module.E1A4MappingApplicationError:
+            pass
+    finally:
+        if output.exists() and displaced.exists():
+            output.rename(replacement)
+            displaced.rename(output)
+
+    leaked = (
+        tuple(
+            candidate
+            for candidate in replacement.rglob("*")
+            if candidate.is_file()
+            and b"synthetic-private-locator" in candidate.read_bytes()
+        )
+        if replacement.exists()
+        else ()
+    )
+    assert attack_happened
+    assert not leaked
+
+
+def test_mapping_cli_passes_approved_root_to_sealer_before_inputs_open(
+    trust_chain: _TrustChain,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import eval.apply_e1a4_role_corrections as runner
+
+    events: list[str] = []
+    captured: dict[str, object] = {}
+    real_validate = runner._validate_private_outputs
+    real_open = runner.ReconciliationStore.open
+
+    def validate(approved: Path, outputs: tuple[Path, ...]) -> None:
+        events.append("validate")
+        real_validate(approved, outputs)
+
+    def open_store(_cls: object, **kwargs: object) -> object:
+        events.append("open")
+        return real_open(**kwargs)  # type: ignore[arg-type]
+
+    def seal(**kwargs: object) -> object:
+        events.append("seal")
+        captured.update(kwargs)
+        return SimpleNamespace(
+            artifacts=(
+                SimpleNamespace(
+                    name="role-mapping.v1.json",
+                    record_count=1,
+                ),
+            )
+        )
+
+    monkeypatch.setattr(runner, "_validate_private_outputs", validate)
+    monkeypatch.setattr(
+        runner.ReconciliationStore,
+        "open",
+        classmethod(open_store),
+    )
+    monkeypatch.setattr(runner, "seal_e1a4_role_mapping", seal)
+
+    assert runner.cli(_mapping_runner_args(trust_chain, "apply")) == 0
+    assert events[0] == "validate"
+    assert events.index("validate") < events.index("open") < events.index("seal")
+    assert captured["approved_private_root"] == trust_chain.private_root
+    assert capsys.readouterr().err == ""
+
+
+def test_mapping_publisher_preserves_existing_final_and_staging_residue(
+    mapping_root: Path,
+) -> None:
+    import oilfield_chemical_copilot.evaluation.e1a4_mapping_application as module
+
+    mapping, binding = _payloads()
+    parent = mapping_root / "e1a4-role-mapping"
+    final = parent / "v1"
+    residue = parent / ".v1.synthetic.tmp"
+    final.mkdir(parents=True)
+    residue.mkdir()
+    final_sentinel = final / "existing.bin"
+    residue_sentinel = residue / "staged.bin"
+    final_sentinel.write_bytes(b"existing-final")
+    residue_sentinel.write_bytes(b"staging-residue")
+
+    with pytest.raises(
+        module.E1A4MappingApplicationError,
+        match="^E1A4_MAPPING_SEAL_WRITE_FAILED$",
+    ):
+        module._publish_mapping_directory(
+            mapping,
+            binding,
+            mapping_root,
+            mapping_root,
+        )
+
+    assert final_sentinel.read_bytes() == b"existing-final"
+    assert residue_sentinel.read_bytes() == b"staging-residue"
+
+
+def test_mapping_publisher_uses_capability_for_lock_stage_sync_and_rename(
+    mapping_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import oilfield_chemical_copilot.evaluation.e1a4_mapping_application as module
+
+    mapping, binding = _payloads()
+    mapping_bytes = _canonical_json(mapping)
+    binding_bytes = _canonical_json(binding)
+    members = {
+        "sealed/role-mapping.v1.json": mapping_bytes,
+        "sealed/role-mapping.v1.json.sha256": (
+            hashlib.sha256(mapping_bytes).hexdigest() + "\n"
+        ).encode("ascii"),
+        "sealed/mapping-binding.v1.json": binding_bytes,
+        "sealed/mapping-binding.v1.json.sha256": (
+            hashlib.sha256(binding_bytes).hexdigest() + "\n"
+        ).encode("ascii"),
+    }
+    events: list[tuple[object, ...]] = []
+
+    class Staging:
+        def mkdir(self, name: str) -> None:
+            events.append(("mkdir", name))
+
+        def write_exclusive(self, name: str, content: bytes) -> None:
+            events.append(("write", name, content))
+
+        def sync_directory(self, name: str) -> None:
+            events.append(("sync-directory", name))
+
+        def sync_root(self) -> None:
+            events.append(("sync-root",))
+
+    class Publication:
+        def ensure_no_staging(self, prefix: str, suffix: str) -> None:
+            events.append(("ensure-no-staging", prefix, suffix))
+
+        def final_exists(self, name: str) -> bool:
+            events.append(("final-exists", name))
+            return False
+
+        def create_staging(self, prefix: str, suffix: str) -> Staging:
+            events.append(("create-staging", prefix, suffix))
+            return Staging()
+
+        def publish_no_replace(self, staging: Staging, name: str) -> None:
+            events.append(("publish-no-replace", staging.__class__.__name__, name))
+
+        def sync_parent(self) -> None:
+            events.append(("sync-parent",))
+
+        def read_exact_tree(
+            self, name: str, layout: object
+        ) -> dict[str, bytes]:
+            events.append(("read-exact-tree", name, layout))
+            return members
+
+    @contextmanager
+    def acquire(**kwargs: object) -> object:
+        events.append(("acquire", kwargs))
+        yield Publication()
+
+    monkeypatch.setattr(module, "authenticated_publication_directory", acquire)
+
+    seal = module._publish_mapping_directory(
+        mapping,
+        binding,
+        mapping_root,
+        mapping_root,
+    )
+
+    assert seal.binding_sha256 == hashlib.sha256(binding_bytes).hexdigest()
+    assert events[0] == (
+        "acquire",
+        {
+            "approved_private_root": mapping_root,
+            "publication_parent": mapping_root / "e1a4-role-mapping",
+            "lock_name": ".v1.publish.lock",
+        },
+    )
+    assert events[1:5] == [
+        ("ensure-no-staging", ".v1.", ".tmp"),
+        ("final-exists", "v1"),
+        ("create-staging", ".v1.", ".tmp"),
+        ("mkdir", "sealed"),
+    ]
+    assert [event[:2] for event in events if event[0] == "write"] == [
+        ("write", "sealed/role-mapping.v1.json"),
+        ("write", "sealed/role-mapping.v1.json.sha256"),
+        ("write", "sealed/mapping-binding.v1.json"),
+        ("write", "sealed/mapping-binding.v1.json.sha256"),
+    ]
+    assert events[-5:] == [
+        ("sync-directory", "sealed"),
+        ("sync-root",),
+        ("publish-no-replace", "Staging", "v1"),
+        ("sync-parent",),
+        ("read-exact-tree", "v1", {"sealed": module._NAMES}),
+    ]
+
+
 def test_mapping_seal_is_exact_idempotent_and_verifies_without_writing(
     mapping_root: Path,
 ) -> None:
@@ -544,7 +783,7 @@ def test_mapping_seal_is_exact_idempotent_and_verifies_without_writing(
     )
 
     mapping, binding = _payloads()
-    sealed = _publish_mapping_directory(mapping, binding, mapping_root)
+    sealed = _publish_mapping_directory(mapping, binding, mapping_root, mapping_root)
     before = tuple((path.name, path.stat().st_mtime_ns) for path in sealed.artifacts[0].path.parent.iterdir())
     verified = _verify_mapping_directory(mapping, binding, mapping_root, sealed.binding_sha256)
 
@@ -563,7 +802,7 @@ def test_mapping_seal_fails_closed_for_tampering(mapping_root: Path, mutation: s
     )
 
     mapping, binding = _payloads()
-    seal = _publish_mapping_directory(mapping, binding, mapping_root)
+    seal = _publish_mapping_directory(mapping, binding, mapping_root, mapping_root)
     directory = _mapping_directory(mapping_root)
     if mutation == "extra":
         (directory / "unexpected").write_text("x", encoding="utf-8")
@@ -575,24 +814,6 @@ def test_mapping_seal_fails_closed_for_tampering(mapping_root: Path, mutation: s
         (directory / "mapping-binding.v1.json").write_text(json.dumps({"altered": True}) + "\n", encoding="utf-8")
     with pytest.raises(E1A4MappingApplicationError, match="E1A4_MAPPING_(SEAL_PARTIAL|BINDING_MISMATCH)"):
         _verify_mapping_directory(mapping, binding, mapping_root, seal.binding_sha256)
-
-
-def test_mapping_seal_cleans_staging_after_rename_crash(
-    mapping_root: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Leaving a partial visible seal after a crash must fail this test."""
-    import oilfield_chemical_copilot.evaluation.e1a4_mapping_application as module
-
-    mapping, binding = _payloads()
-    monkeypatch.setattr(
-        module,
-        "_rename_no_replace",
-        lambda *_args: (_ for _ in ()).throw(OSError("crash")),
-    )
-    with pytest.raises(module.E1A4MappingApplicationError, match="E1A4_MAPPING_SEAL_WRITE_FAILED"):
-        module._publish_mapping_directory(mapping, binding, mapping_root)
-    assert not module._mapping_directory(mapping_root).exists()
-    assert not tuple(module._mapping_directory(mapping_root).parent.glob(".sealed.*.tmp"))
 
 
 @pytest.mark.parametrize(
@@ -614,7 +835,7 @@ def test_mapping_verification_fails_closed_for_anchor_and_partial_artifacts(
     )
 
     mapping, binding = _payloads()
-    seal = _publish_mapping_directory(mapping, binding, mapping_root)
+    seal = _publish_mapping_directory(mapping, binding, mapping_root, mapping_root)
     if operation == "partial":
         (_mapping_directory(mapping_root) / "mapping-binding.v1.json.sha256").unlink()
     with pytest.raises(E1A4MappingApplicationError, match=code):
@@ -1122,6 +1343,7 @@ def test_mapping_seal_is_atomic_exact_and_publicly_idempotent(
     inventory_before = _locator_rows(trust_chain.store)
     sealed = seal_e1a4_role_mapping(
         output_root=trust_chain.output_root,
+        approved_private_root=trust_chain.private_root,
         **trust_chain.inputs(),  # type: ignore[arg-type]
     )
     sealed_root = sealed.artifacts[0].path.parent
@@ -1150,29 +1372,6 @@ def test_mapping_seal_is_atomic_exact_and_publicly_idempotent(
     assert _locator_rows(trust_chain.store) == inventory_before
 
 
-def test_mapping_seal_crash_removes_staging_and_visible_output(
-    trust_chain: _TrustChain, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    import oilfield_chemical_copilot.evaluation.e1a4_mapping_application as module
-
-    monkeypatch.setattr(
-        module,
-        "_rename_no_replace",
-        lambda *_args: (_ for _ in ()).throw(OSError("synthetic crash")),
-    )
-    with pytest.raises(
-        E1A4MappingApplicationError,
-        match="E1A4_MAPPING_SEAL_WRITE_FAILED",
-    ):
-        seal_e1a4_role_mapping(
-            output_root=trust_chain.output_root,
-            **trust_chain.inputs(),  # type: ignore[arg-type]
-        )
-    sealed = trust_chain.output_root / "e1a4-role-mapping" / "v1" / "sealed"
-    assert not sealed.exists()
-    assert not tuple(sealed.parent.glob(".sealed.*.tmp"))
-
-
 @pytest.mark.parametrize(
     "mutation",
     [
@@ -1189,6 +1388,7 @@ def test_mapping_verification_rejects_nonexact_or_altered_file_set(
 ) -> None:
     sealed = seal_e1a4_role_mapping(
         output_root=trust_chain.output_root,
+        approved_private_root=trust_chain.private_root,
         **trust_chain.inputs(),  # type: ignore[arg-type]
     )
     root = sealed.artifacts[0].path.parent
@@ -1221,6 +1421,7 @@ def test_mapping_verification_rejects_wrong_mapping_binding_anchor(
 ) -> None:
     seal_e1a4_role_mapping(
         output_root=trust_chain.output_root,
+        approved_private_root=trust_chain.private_root,
         **trust_chain.inputs(),  # type: ignore[arg-type]
     )
     with pytest.raises(
@@ -1239,6 +1440,7 @@ def test_mapping_verification_rejects_sqlite_state_drift_without_rewriting_seal(
 ) -> None:
     sealed = seal_e1a4_role_mapping(
         output_root=trust_chain.output_root,
+        approved_private_root=trust_chain.private_root,
         **trust_chain.inputs(),  # type: ignore[arg-type]
     )
     root = sealed.artifacts[0].path.parent
@@ -1278,6 +1480,7 @@ def _invoke_public_mapping_operation(
     if operation == "seal":
         return seal_e1a4_role_mapping(
             output_root=chain.output_root,
+            approved_private_root=chain.private_root,
             **chain.inputs(),  # type: ignore[arg-type]
         )
     assert operation == "verify" and mapping_binding is not None
@@ -1293,6 +1496,7 @@ def _prepare_public_verify(chain: _TrustChain, operation: str) -> str | None:
         return None
     return seal_e1a4_role_mapping(
         output_root=chain.output_root,
+        approved_private_root=chain.private_root,
         **chain.inputs(),  # type: ignore[arg-type]
     ).binding_sha256
 
@@ -1403,445 +1607,6 @@ def test_public_mapping_operations_reject_post_verification_sqlite_drift(
         )
 
 
-def test_mapping_publisher_preserves_concurrent_destination(
-    mapping_root: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    import oilfield_chemical_copilot.evaluation.e1a4_mapping_application as module
-
-    mapping, binding = _payloads()
-    final = module._mapping_directory(mapping_root)
-
-    def concurrent_publish(_staged: Path, destination: Path) -> None:
-        assert destination == final
-        destination.mkdir()
-        (destination / "concurrent-owner").write_text(
-            "preserve me", encoding="utf-8"
-        )
-        raise FileExistsError("private concurrent detail")
-
-    monkeypatch.setattr(
-        module,
-        "_rename_no_replace",
-        concurrent_publish,
-        raising=False,
-    )
-
-    with pytest.raises(
-        E1A4MappingApplicationError,
-        match="^E1A4_MAPPING_SEAL_WRITE_FAILED$",
-    ):
-        module._publish_mapping_directory(mapping, binding, mapping_root)
-    assert (final / "concurrent-owner").read_text(encoding="utf-8") == (
-        "preserve me"
-    )
-    assert not tuple(final.parent.glob(".sealed.*.tmp"))
-
-
-def test_mapping_publisher_retry_removes_only_abandoned_staging(
-    mapping_root: Path,
-) -> None:
-    import oilfield_chemical_copilot.evaluation.e1a4_mapping_application as module
-
-    mapping, binding = _payloads()
-    parent = module._mapping_directory(mapping_root).parent
-    abandoned = parent / ".sealed.abandoned.tmp"
-    abandoned.mkdir(parents=True)
-    (abandoned / "sentinel").write_text("synthetic", encoding="utf-8")
-    unrelated = parent / ".sealed.tmp"
-    unrelated.mkdir()
-    (unrelated / "sentinel").write_text("preserve", encoding="utf-8")
-
-    seal = module._publish_mapping_directory(mapping, binding, mapping_root)
-
-    assert not abandoned.exists()
-    assert (unrelated / "sentinel").read_text(encoding="utf-8") == "preserve"
-    assert module._verify_mapping_directory(
-        mapping, binding, mapping_root, seal.binding_sha256
-    ) == seal
-
-
-def test_mapping_publisher_lock_contends_then_releases(
-    mapping_root: Path,
-) -> None:
-    import oilfield_chemical_copilot.evaluation.e1a4_mapping_application as module
-
-    mapping, binding = _payloads()
-    parent = module._mapping_directory(mapping_root).parent
-    parent.mkdir(parents=True)
-    results: list[object] = []
-
-    def contend() -> None:
-        try:
-            results.append(
-                module._publish_mapping_directory(mapping, binding, mapping_root)
-            )
-        except module.E1A4MappingApplicationError as error:
-            results.append(error)
-
-    with module._publisher_lock(parent):
-        contender = Thread(target=contend)
-        contender.start()
-        contender.join(10)
-        assert not contender.is_alive()
-        assert [str(item) for item in results] == [
-            "E1A4_MAPPING_SEAL_WRITE_FAILED"
-        ]
-        assert not module._mapping_directory(mapping_root).exists()
-
-    seal = module._publish_mapping_directory(mapping, binding, mapping_root)
-    assert module._verify_mapping_directory(
-        mapping, binding, mapping_root, seal.binding_sha256
-    ) == seal
-
-
-def test_failed_mapping_publisher_cleans_owned_final_before_unlock(
-    mapping_root: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    import oilfield_chemical_copilot.evaluation.e1a4_mapping_application as module
-
-    mapping, binding = _payloads()
-    real_verify = module._verify_mapping_directory
-    real_remove = getattr(module, "_remove_owned_publication", None)
-    assert real_remove is not None
-    cleanup_started = Event()
-    publisher_two_done = Event()
-    results: dict[str, object] = {}
-
-    def fail_first_verification(*args: object, **kwargs: object) -> object:
-        if current_thread().name == "publisher-1":
-            raise module.E1A4MappingApplicationError(
-                "E1A4_MAPPING_SEAL_VERIFY_FAILED"
-            )
-        return real_verify(*args, **kwargs)
-
-    def coordinated_remove(final: Path, identity: object) -> None:
-        if current_thread().name == "publisher-1":
-            cleanup_started.set()
-            assert publisher_two_done.wait(10)
-        real_remove(final, identity)
-
-    monkeypatch.setattr(module, "_verify_mapping_directory", fail_first_verification)
-    monkeypatch.setattr(module, "_remove_owned_publication", coordinated_remove)
-
-    def publish(name: str) -> None:
-        try:
-            results[name] = module._publish_mapping_directory(
-                mapping, binding, mapping_root
-            )
-        except module.E1A4MappingApplicationError as error:
-            results[name] = error
-        finally:
-            if name == "publisher-2":
-                publisher_two_done.set()
-
-    first = Thread(target=publish, args=("publisher-1",), name="publisher-1")
-    second = Thread(target=publish, args=("publisher-2",), name="publisher-2")
-    first.start()
-    assert cleanup_started.wait(10)
-    second.start()
-    first.join(10)
-    second.join(10)
-
-    assert not first.is_alive()
-    assert not second.is_alive()
-    assert str(results["publisher-1"]) == "E1A4_MAPPING_SEAL_VERIFY_FAILED"
-    assert str(results["publisher-2"]) == "E1A4_MAPPING_SEAL_WRITE_FAILED"
-    final = module._mapping_directory(mapping_root)
-    assert not final.exists()
-    assert not tuple(final.parent.glob(".sealed.*.tmp"))
-
-
-def test_mapping_rename_no_replace_preserves_existing_destination(
-    mapping_root: Path,
-) -> None:
-    import oilfield_chemical_copilot.evaluation.e1a4_mapping_application as module
-
-    staged = mapping_root / "staged"
-    final = mapping_root / "final"
-    staged.mkdir()
-    (staged / "candidate").write_text("candidate", encoding="utf-8")
-    final.mkdir()
-    (final / "owner").write_text("preserve", encoding="utf-8")
-
-    with pytest.raises(OSError):
-        module._rename_no_replace(staged, final)
-
-    assert (staged / "candidate").read_text(encoding="utf-8") == "candidate"
-    assert (final / "owner").read_text(encoding="utf-8") == "preserve"
-
-
-def test_mapping_publisher_fsyncs_all_files_and_directory_state(
-    mapping_root: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    import oilfield_chemical_copilot.evaluation.e1a4_mapping_application as module
-
-    mapping, binding = _payloads()
-    file_syncs: list[int] = []
-    directory_syncs: list[Path] = []
-    real_fsync = module.os.fsync
-
-    def tracked_fsync(descriptor: int) -> None:
-        file_syncs.append(descriptor)
-        real_fsync(descriptor)
-
-    def tracked_directory_sync(path: Path) -> None:
-        directory_syncs.append(path)
-
-    monkeypatch.setattr(module.os, "fsync", tracked_fsync)
-    monkeypatch.setattr(
-        module,
-        "_fsync_directory",
-        tracked_directory_sync,
-        raising=False,
-    )
-
-    module._publish_mapping_directory(mapping, binding, mapping_root)
-
-    parent = module._mapping_directory(mapping_root).parent
-    assert len(file_syncs) == 4
-    assert len(directory_syncs) >= 4
-    assert mapping_root in directory_syncs
-    assert mapping_root / "e1a4-role-mapping" in directory_syncs
-    assert directory_syncs[-1] == parent
-    assert any(
-        path.parent == parent and path.name.startswith(".sealed.")
-        for path in directory_syncs
-    )
-
-
-def _fake_mapping_windows_mutex(
-    wait_result: int,
-) -> tuple[SimpleNamespace, list[tuple[object, ...]]]:
-    events: list[tuple[object, ...]] = []
-
-    def owner_sid() -> str:
-        events.append(("owner-sid",))
-        return "S-1-5-21-111-222-333-1001"
-
-    def build_security_attributes(policy: str) -> SimpleNamespace:
-        events.append(("build-security", policy))
-        return SimpleNamespace(attributes="secure", descriptor=77)
-
-    def create_mutex(name: str, attributes: object) -> int:
-        events.append(("create", name, attributes))
-        return 91
-
-    def free_security_descriptor(security: object) -> None:
-        events.append(("free-security", security))
-
-    def wait(handle: int, timeout_ms: int) -> int:
-        events.append(("wait", handle, timeout_ms))
-        return wait_result
-
-    def release_mutex(handle: int) -> None:
-        events.append(("release", handle))
-
-    def close_handle(handle: int) -> None:
-        events.append(("close", handle))
-
-    return (
-        SimpleNamespace(
-            owner_sid=owner_sid,
-            build_security_attributes=build_security_attributes,
-            create_mutex=create_mutex,
-            free_security_descriptor=free_security_descriptor,
-            wait=wait,
-            release_mutex=release_mutex,
-            close_handle=close_handle,
-        ),
-        events,
-    )
-
-
-def test_mapping_windows_mutex_uses_protected_global_dacl_and_cleans_up(
-    mapping_root: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    import oilfield_chemical_copilot.evaluation.e1a4_mapping_application as module
-
-    parent = module._mapping_directory(mapping_root).parent
-    parent.mkdir(parents=True)
-    api, events = _fake_mapping_windows_mutex(0)
-    monkeypatch.setattr(module, "_windows_mutex_api", lambda: api)
-
-    with module._windows_publisher_lock(parent):
-        pass
-
-    policy = str(events[1][1])
-    assert policy == (
-        "O:S-1-5-21-111-222-333-1001"
-        "D:P"
-        "(A;;0x001F0001;;;S-1-5-21-111-222-333-1001)"
-        "(A;;0x001F0001;;;SY)"
-    )
-    assert "WD" not in policy
-    mutex_name = str(events[2][1])
-    assert mutex_name.startswith("Global\\E1A4RoleMapping-")
-    assert len(mutex_name.removeprefix("Global\\E1A4RoleMapping-")) == 64
-    assert str(parent) not in mutex_name
-    assert [event[0] for event in events] == [
-        "owner-sid",
-        "build-security",
-        "create",
-        "free-security",
-        "wait",
-        "release",
-        "close",
-    ]
-
-
-def test_mapping_windows_mutex_contention_closes_without_release(
-    mapping_root: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    import oilfield_chemical_copilot.evaluation.e1a4_mapping_application as module
-
-    parent = module._mapping_directory(mapping_root).parent
-    parent.mkdir(parents=True)
-    api, events = _fake_mapping_windows_mutex(0x00000102)
-    monkeypatch.setattr(module, "_windows_mutex_api", lambda: api)
-
-    with pytest.raises(
-        E1A4MappingApplicationError,
-        match="^E1A4_MAPPING_SEAL_WRITE_FAILED$",
-    ):
-        with module._windows_publisher_lock(parent):
-            pass
-
-    assert [event[0] for event in events] == [
-        "owner-sid",
-        "build-security",
-        "create",
-        "free-security",
-        "wait",
-        "close",
-    ]
-
-
-class _FakeMappingPosixOS:
-    O_RDONLY = 0x01
-    O_RDWR = 0x02
-    O_CREAT = 0x04
-    O_EXCL = 0x08
-    O_CLOEXEC = 0x10
-    O_DIRECTORY = 0x20
-    O_NOFOLLOW = 0x40
-    O_NONBLOCK = 0x80
-
-    def __init__(self, parent_stat: object, lock_stat: object) -> None:
-        self.parent_stat = parent_stat
-        self.lock_stat = lock_stat
-        self.lock_created = False
-        self.calls: list[tuple[object, ...]] = []
-
-    def lstat(self, path: object) -> object:
-        self.calls.append(("lstat-parent", path))
-        return self.parent_stat
-
-    def open(
-        self,
-        path: object,
-        flags: int,
-        mode: int = 0o777,
-        *,
-        dir_fd: int | None = None,
-    ) -> int:
-        self.calls.append(("open", path, flags, mode, dir_fd))
-        if dir_fd is None:
-            return 41
-        self.lock_created = True
-        return 42
-
-    def fstat(self, descriptor: int) -> object:
-        self.calls.append(("fstat", descriptor))
-        return self.parent_stat if descriptor == 41 else self.lock_stat
-
-    def stat(
-        self, path: object, *, dir_fd: int, follow_symlinks: bool
-    ) -> object:
-        self.calls.append(("stat-lock", path, dir_fd, follow_symlinks))
-        if not self.lock_created:
-            raise FileNotFoundError
-        return self.lock_stat
-
-    def close(self, descriptor: int) -> None:
-        self.calls.append(("close", descriptor))
-
-
-class _FakeMappingFlock:
-    LOCK_EX = 0x01
-    LOCK_NB = 0x02
-    LOCK_UN = 0x04
-
-    def __init__(self) -> None:
-        self.calls: list[tuple[int, int]] = []
-
-    def flock(self, descriptor: int, operation: int) -> None:
-        self.calls.append((descriptor, operation))
-
-
-def test_mapping_posix_lock_is_parent_relative_nofollow_and_os_released(
-    mapping_root: Path,
-) -> None:
-    import oilfield_chemical_copilot.evaluation.e1a4_mapping_application as module
-
-    parent = module._mapping_directory(mapping_root).parent
-    parent.mkdir(parents=True)
-    reference = mapping_root / "reference-lock"
-    reference.touch()
-    fake_os = _FakeMappingPosixOS(parent.stat(), reference.stat())
-    fake_flock = _FakeMappingFlock()
-
-    with module._posix_publisher_lock(
-        parent, os_api=fake_os, flock_api=fake_flock
-    ):
-        pass
-
-    parent_open = next(
-        call
-        for call in fake_os.calls
-        if call[:2] == ("open", parent.resolve())
-    )
-    relative_open = next(
-        call
-        for call in fake_os.calls
-        if call[:2] == ("open", ".sealed.publish.lock")
-    )
-    assert parent_open[2] & fake_os.O_DIRECTORY
-    assert parent_open[2] & fake_os.O_NOFOLLOW
-    assert relative_open[4] == 41
-    assert relative_open[2] & fake_os.O_CREAT
-    assert relative_open[2] & fake_os.O_EXCL
-    assert relative_open[2] & fake_os.O_NOFOLLOW
-    assert relative_open[2] & fake_os.O_NONBLOCK
-    assert fake_flock.calls == [(42, 0x03), (42, 0x04)]
-    assert fake_os.calls[-2:] == [("close", 42), ("close", 41)]
-
-
-def test_mapping_posix_lock_missing_nofollow_fails_closed(
-    mapping_root: Path,
-) -> None:
-    import oilfield_chemical_copilot.evaluation.e1a4_mapping_application as module
-
-    parent = module._mapping_directory(mapping_root).parent
-    parent.mkdir(parents=True)
-    reference = mapping_root / "reference-lock"
-    reference.touch()
-    fake_os = _FakeMappingPosixOS(parent.stat(), reference.stat())
-    fake_os.O_NOFOLLOW = 0
-    fake_flock = _FakeMappingFlock()
-
-    with pytest.raises(
-        E1A4MappingApplicationError,
-        match="^E1A4_MAPPING_SEAL_WRITE_FAILED$",
-    ):
-        with module._posix_publisher_lock(
-            parent, os_api=fake_os, flock_api=fake_flock
-        ):
-            pass
-
-    assert not fake_os.calls
-    assert not fake_flock.calls
-
-
 @pytest.mark.parametrize(
     "member_name",
     ["role-mapping.v1.json", "role-mapping.v1.json.sha256"],
@@ -1852,7 +1617,7 @@ def test_mapping_verifier_rejects_member_symlink(
     import oilfield_chemical_copilot.evaluation.e1a4_mapping_application as module
 
     mapping, binding = _payloads()
-    seal = module._publish_mapping_directory(mapping, binding, mapping_root)
+    seal = module._publish_mapping_directory(mapping, binding, mapping_root, mapping_root)
     sealed = module._mapping_directory(mapping_root)
     member = sealed / member_name
     target = mapping_root / f"{member_name}.target"
@@ -1927,7 +1692,7 @@ def test_mapping_verifier_rejects_member_replacement_race(
     import oilfield_chemical_copilot.evaluation.e1a4_mapping_application as module
 
     mapping, binding = _payloads()
-    seal = module._publish_mapping_directory(mapping, binding, mapping_root)
+    seal = module._publish_mapping_directory(mapping, binding, mapping_root, mapping_root)
     sealed = module._mapping_directory(mapping_root)
     members = {name: (sealed / name).read_bytes() for name in module._NAMES}
     api = _FakeMappingWindowsSealReader(
@@ -1963,7 +1728,7 @@ def test_mapping_windows_verifier_rejects_member_symlink_reparse_point(
     import oilfield_chemical_copilot.evaluation.e1a4_mapping_application as module
 
     mapping, binding = _payloads()
-    seal = module._publish_mapping_directory(mapping, binding, mapping_root)
+    seal = module._publish_mapping_directory(mapping, binding, mapping_root, mapping_root)
     sealed = module._mapping_directory(mapping_root)
     members = {name: (sealed / name).read_bytes() for name in module._NAMES}
     api = _FakeMappingWindowsSealReader(members, unsafe_name=member_name)
@@ -1981,34 +1746,13 @@ def test_mapping_windows_verifier_rejects_member_symlink_reparse_point(
         )
 
 
-def test_first_mapping_publication_syncs_each_new_ancestor_entry(
-    mapping_root: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    import oilfield_chemical_copilot.evaluation.e1a4_mapping_application as module
-
-    mapping, binding = _payloads()
-    synced: list[Path] = []
-    monkeypatch.setattr(module, "_fsync_directory", synced.append)
-
-    module._publish_mapping_directory(mapping, binding, mapping_root)
-
-    role_root = mapping_root / "e1a4-role-mapping"
-    version_root = role_root / "v1"
-    assert synced[:2] == [mapping_root, role_root]
-    assert synced[-1] == version_root
-    assert any(
-        path.parent == version_root and path.name.startswith(".sealed.")
-        for path in synced
-    )
-
-
 def test_mapping_verifier_missing_native_safe_open_fails_closed(
     mapping_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import oilfield_chemical_copilot.evaluation.e1a4_mapping_application as module
 
     mapping, binding = _payloads()
-    seal = module._publish_mapping_directory(mapping, binding, mapping_root)
+    seal = module._publish_mapping_directory(mapping, binding, mapping_root, mapping_root)
 
     def missing_api() -> object:
         raise AttributeError("private primitive detail")
@@ -2153,7 +1897,7 @@ def test_mapping_posix_close_failure_attempts_all_member_and_directory_closes(
     import oilfield_chemical_copilot.evaluation.e1a4_mapping_application as module
 
     mapping, binding = _payloads()
-    seal = module._publish_mapping_directory(mapping, binding, mapping_root)
+    seal = module._publish_mapping_directory(mapping, binding, mapping_root, mapping_root)
     sealed = module._mapping_directory(mapping_root)
     members = {name: (sealed / name).read_bytes() for name in module._NAMES}
     fake_os = _FakeMappingPosixSealOS(members, fail_close=21)
@@ -2182,7 +1926,7 @@ def test_mapping_windows_close_failure_attempts_all_member_and_directory_closes(
     import oilfield_chemical_copilot.evaluation.e1a4_mapping_application as module
 
     mapping, binding = _payloads()
-    seal = module._publish_mapping_directory(mapping, binding, mapping_root)
+    seal = module._publish_mapping_directory(mapping, binding, mapping_root, mapping_root)
     sealed = module._mapping_directory(mapping_root)
     members = {name: (sealed / name).read_bytes() for name in module._NAMES}
     first_name = sorted(module._NAMES)[0]
