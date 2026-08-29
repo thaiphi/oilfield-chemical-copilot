@@ -537,7 +537,9 @@ def test_mapping_publisher_never_writes_through_retargeted_ancestor(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import oilfield_chemical_copilot.evaluation.e1a4_mapping_application as module
-    from oilfield_chemical_copilot.evaluation import private_artifact_publication
+    from oilfield_chemical_copilot.evaluation.private_artifact_publication import (
+        authenticated_publication_directory,
+    )
 
     approved = tmp_path / "private"
     output = approved / "output"
@@ -547,22 +549,30 @@ def test_mapping_publisher_never_writes_through_retargeted_ancestor(
     output.mkdir()
     mapping, binding = _payloads()
     mapping["sources"][0]["locators"] = ["synthetic-private-locator"]  # type: ignore[index]
-    attack_happened = False
-    platform_class = (
-        private_artifact_publication._WindowsPublicationDirectory
-        if private_artifact_publication.os.name == "nt"
-        else private_artifact_publication._PosixPublicationDirectory
+    capability_called = False
+    capability_yielded = False
+    retarget_attempted = False
+
+    @contextmanager
+    def retarget_after_public_acquisition(**kwargs: object) -> object:
+        nonlocal capability_called, capability_yielded, retarget_attempted
+        capability_called = True
+        with authenticated_publication_directory(**kwargs) as publication:  # type: ignore[arg-type]
+            capability_yielded = True
+            retarget_attempted = True
+            try:
+                output.rename(displaced)
+            except OSError:
+                pass
+            else:
+                output.mkdir()
+            yield publication
+
+    monkeypatch.setattr(
+        module,
+        "authenticated_publication_directory",
+        retarget_after_public_acquisition,
     )
-    real_take = platform_class.take
-
-    def swap_then_take(cls: type[object], handle: object) -> object:
-        nonlocal attack_happened
-        attack_happened = True
-        output.rename(displaced)
-        output.mkdir()
-        return real_take(handle)
-
-    monkeypatch.setattr(platform_class, "take", classmethod(swap_then_take))
 
     try:
         try:
@@ -589,7 +599,9 @@ def test_mapping_publisher_never_writes_through_retargeted_ancestor(
         if replacement.exists()
         else ()
     )
-    assert attack_happened
+    assert capability_called
+    assert capability_yielded
+    assert retarget_attempted
     assert not leaked
 
 
