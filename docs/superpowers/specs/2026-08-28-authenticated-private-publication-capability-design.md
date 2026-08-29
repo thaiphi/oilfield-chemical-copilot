@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-28
 
-**Status:** Approved in principle; written design awaiting final user review before implementation
+**Status:** Implemented and independently verified; PR re-review pending
 
 ## Objective
 

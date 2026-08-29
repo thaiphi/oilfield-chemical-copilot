@@ -280,7 +280,7 @@ git commit -m "fix: verify e1a4 frames through private capability"
 - Consumes: Tasks 1-3 commits and test evidence
 - Produces: aggregate-only public closure and a clean PR #2 head
 
-- [ ] **Step 1: Run exact final-tree verification**
+- [x] **Step 1: Run exact final-tree verification**
 
 Run:
 
@@ -294,7 +294,7 @@ git ls-files | rg '(^|/)\.private(/|$)'
 
 Expected: full suite passes; Ruff and diff checks pass; worktree is clean after documentation commit; private-file query returns no paths.
 
-- [ ] **Step 2: Perform privacy and contract checks**
+- [x] **Step 2: Perform privacy and contract checks**
 
 Verify from tracked code and tests only:
 
@@ -304,11 +304,11 @@ Verify from tracked code and tests only:
 - every original and second-round Codex finding has a covering regression;
 - the Windows double-close minor has an exact-once ownership regression.
 
-- [ ] **Step 3: Request scoped independent review**
+- [x] **Step 3: Request scoped independent review**
 
 Give the reviewer the spec, this plan, exact Task 1-3 diff package, implementer reports, original six GitHub findings, and deferred double-close minor. Review is public-code-only and read-only. All Critical and Important findings must be corrected and re-reviewed before push.
 
-- [ ] **Step 4: Update aggregate-only status and commit**
+- [x] **Step 4: Update aggregate-only status and commit**
 
 Mark this plan complete and change the design status to implemented only after the scoped review is clean. Do not add private paths, identifiers, locators, hashes, source titles, or artifact contents.
 
@@ -324,3 +324,11 @@ Push the verified commits to `codex/corpus-reconciliation-review`, reply in each
 ## Execution Boundary
 
 This plan authorizes synthetic code/test work and aggregate-only documentation only. It does not authorize reading private artifacts, resealing existing mapping/frame outputs, running evaluation data, changing the corpus, or modifying retrieval/ingestion behavior.
+
+## Internal Closure Evidence
+
+- Full tracked test suite: 845 passed, 14 documented platform/integration skips.
+- Ruff and diff checks: clean.
+- Tracked private paths: zero.
+- Scoped independent review: APPROVE with no Critical or Important findings; one non-runtime unused-declaration Minor deferred.
+- Artifact contracts and evaluation/retrieval/ingestion behavior: unchanged.
