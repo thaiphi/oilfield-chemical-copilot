@@ -1017,8 +1017,7 @@ def _windows_mutex_api() -> _NativeWindowsMutex:
 
 
 def _windows_mutex_name(parent: Path) -> str:
-    resolved = parent.resolve(strict=True)
-    canonical = os.path.normcase(os.path.normpath(str(resolved)))
+    canonical = os.path.normcase(os.path.normpath(str(parent.absolute())))
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     return f"Global\\E1A4SamplingFrame-{digest}"
 
@@ -1038,25 +1037,17 @@ def _windows_mutex_policy(owner_sid: str) -> str:
 
 
 class _WindowsPublicationDirectory:
-    def __init__(self, parent: Path) -> None:
+    def __init__(
+        self,
+        parent: Path,
+        *,
+        descriptor: int,
+        api: object,
+    ) -> None:
         self.parent = parent
-        self.api = _mapping_application._windows_seal_reader_api()
+        self.api = api
         self._configure_kernel_calls()
-        handle = self.api._kernel32.CreateFileW(
-            str(parent),
-            0x001F01FF,
-            0x00000007,
-            None,
-            3,
-            0x02200000,
-            None,
-        )
-        if handle == self.api._ctypes.c_void_p(-1).value:
-            raise OSError(
-                self.api._ctypes.get_last_error(),
-                "publication directory unavailable",
-            )
-        self.descriptor = int(handle)
+        self.descriptor = descriptor
         try:
             self.api._validate_handle(self.descriptor, directory=True)
         except Exception:
@@ -1312,14 +1303,173 @@ def _publish_bound_staging(
     publication.publish(staging)
 
 
+def _publication_relative_path(
+    approved_private_root: Path, publication_parent: Path
+) -> tuple[Path, Path]:
+    root = approved_private_root.absolute()
+    parent = publication_parent.absolute()
+    relative = parent.relative_to(root)
+    if any(part in {"", ".", ".."} for part in relative.parts):
+        raise OSError(errno.EPERM, "publication parent is outside private root")
+    return root, relative
+
+
+def _windows_relative_directory_attributes(
+    api: object, parent: object, name: str
+) -> tuple[object, ...]:
+    if not name or name in {".", ".."} or "\\" in name or "/" in name:
+        raise OSError(errno.EINVAL, "unsafe publication path component")
+    name_buffer = api._ctypes.create_unicode_buffer(name)
+    name_length = len(name.encode("utf-16-le"))
+    unicode_name = api._UNICODE_STRING(
+        name_length,
+        name_length + 2,
+        api._ctypes.cast(name_buffer, api._wintypes.LPWSTR),
+    )
+    attributes = api._OBJECT_ATTRIBUTES(
+        api._ctypes.sizeof(api._OBJECT_ATTRIBUTES),
+        parent,
+        api._ctypes.pointer(unicode_name),
+        0x00000040,
+        None,
+        None,
+    )
+    return name_buffer, unicode_name, attributes
+
+
+def _windows_nt_open_directory(
+    api: object,
+    parent: object,
+    name: str,
+    *,
+    create_disposition: int,
+    writable: bool,
+) -> int:
+    buffers = _windows_relative_directory_attributes(api, parent, name)
+    status_block = api._IO_STATUS_BLOCK()
+    handle = api._wintypes.HANDLE()
+    status = api._ntdll.NtCreateFile(
+        api._ctypes.byref(handle),
+        0x001F01FF if writable else 0x00100081,
+        api._ctypes.byref(buffers[2]),
+        api._ctypes.byref(status_block),
+        None,
+        0x00000010,
+        0x00000007,
+        create_disposition,
+        0x00200021,
+        None,
+        0,
+    )
+    if status < 0:
+        number = int(api._ntdll.RtlNtStatusToDosError(status))
+        raise OSError(number, "relative private directory open failed")
+    descriptor = int(handle.value)
+    try:
+        api._validate_handle(descriptor, directory=True)
+    except Exception:
+        api.close_handle(descriptor)
+        raise
+    return descriptor
+
+
+def _windows_open_directory_component(
+    api: object,
+    parent: object,
+    name: str,
+    *,
+    create: bool,
+    writable: bool,
+) -> int:
+    try:
+        return _windows_nt_open_directory(
+            api,
+            parent,
+            name,
+            create_disposition=1,
+            writable=writable,
+        )
+    except OSError as error:
+        if not create or getattr(error, "errno", None) not in {2, 3}:
+            raise
+    try:
+        return _windows_nt_open_directory(
+            api,
+            parent,
+            name,
+            create_disposition=2,
+            writable=writable,
+        )
+    except OSError as error:
+        if getattr(error, "errno", None) not in {80, 183}:
+            raise
+    return _windows_nt_open_directory(
+        api,
+        parent,
+        name,
+        create_disposition=1,
+        writable=writable,
+    )
+
+
+def _acquire_windows_publication_parent(
+    approved_private_root: Path, publication_parent: Path
+) -> tuple[object, int]:
+    root, relative = _publication_relative_path(
+        approved_private_root, publication_parent
+    )
+    if (
+        not root.is_absolute()
+        or not root.drive
+        or root.drive.startswith("\\")
+        or root.anchor.casefold() != f"{root.drive}\\".casefold()
+    ):
+        raise OSError(errno.ENOTSUP, "safe Windows root anchor unavailable")
+    api = _mapping_application._windows_seal_reader_api()
+    anchor = Path(root.anchor)
+    descriptor = api.open_directory(anchor)
+    try:
+        root_components = root.relative_to(anchor).parts
+        if not root_components:
+            raise OSError(errno.EPERM, "private root cannot be a volume root")
+        for index, component in enumerate(root_components):
+            child = _windows_open_directory_component(
+                api,
+                descriptor,
+                component,
+                create=False,
+                writable=index == len(root_components) - 1,
+            )
+            api.close_handle(descriptor)
+            descriptor = child
+        for component in relative.parts:
+            child = _windows_open_directory_component(
+                api,
+                descriptor,
+                component,
+                create=True,
+                writable=True,
+            )
+            api.close_handle(descriptor)
+            descriptor = child
+        return api, descriptor
+    except BaseException:
+        api.close_handle(descriptor)
+        raise
+
+
 @contextmanager
-def _windows_publisher_lock(parent: Path) -> Iterator[_WindowsPublicationDirectory]:
+def _windows_publisher_lock(
+    parent: Path,
+    *,
+    publication: _WindowsPublicationDirectory | None = None,
+) -> Iterator[_WindowsPublicationDirectory]:
     api = _windows_mutex_api()
-    publication: _WindowsPublicationDirectory | None = None
     handle: int | None = None
     acquired = False
     try:
-        publication = _WindowsPublicationDirectory(parent)
+        if publication is None:
+            raise OSError(errno.ENOTSUP, "bound publication handle required")
         policy = _windows_mutex_policy(api.owner_sid())
         security = api.build_security_attributes(policy)
         try:
@@ -1388,9 +1538,84 @@ def _required_posix_flag(os_api: object, name: str) -> int:
     return value
 
 
+def _posix_open_directory_component(
+    os_api: object,
+    parent_descriptor: int,
+    component: str,
+    *,
+    create: bool,
+) -> int:
+    if not component or component in {".", ".."} or "/" in component:
+        raise OSError(errno.EINVAL, "unsafe publication path component")
+    flags = (
+        os_api.O_RDONLY
+        | _required_posix_flag(os_api, "O_DIRECTORY")
+        | _required_posix_flag(os_api, "O_NOFOLLOW")
+        | getattr(os_api, "O_CLOEXEC", 0)
+    )
+    try:
+        descriptor = os_api.open(component, flags, dir_fd=parent_descriptor)
+    except FileNotFoundError:
+        if not create:
+            raise
+        try:
+            os_api.mkdir(component, 0o700, dir_fd=parent_descriptor)
+        except FileExistsError:
+            pass
+        else:
+            os_api.fsync(parent_descriptor)
+        descriptor = os_api.open(component, flags, dir_fd=parent_descriptor)
+    observed = os_api.fstat(descriptor)
+    if not stat.S_ISDIR(observed.st_mode):
+        os_api.close(descriptor)
+        raise OSError(errno.ENOTDIR, "unsafe private directory component")
+    return descriptor
+
+
+def _acquire_posix_publication_parent(
+    approved_private_root: Path,
+    publication_parent: Path,
+    *,
+    os_api: object,
+) -> int:
+    root, relative = _publication_relative_path(
+        approved_private_root, publication_parent
+    )
+    if not root.is_absolute() or root.anchor != os.path.sep:
+        raise OSError(errno.ENOTSUP, "safe POSIX root anchor unavailable")
+    flags = (
+        os_api.O_RDONLY
+        | _required_posix_flag(os_api, "O_DIRECTORY")
+        | _required_posix_flag(os_api, "O_NOFOLLOW")
+        | getattr(os_api, "O_CLOEXEC", 0)
+    )
+    descriptor = os_api.open(os.path.sep, flags)
+    try:
+        for component in root.parts[1:]:
+            child = _posix_open_directory_component(
+                os_api, descriptor, component, create=False
+            )
+            os_api.close(descriptor)
+            descriptor = child
+        for component in relative.parts:
+            child = _posix_open_directory_component(
+                os_api, descriptor, component, create=True
+            )
+            os_api.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os_api.close(descriptor)
+        raise
+
+
 @contextmanager
 def _posix_publisher_lock(
-    parent: Path, *, os_api: object | None = None, flock_api: object | None = None
+    parent: Path,
+    *,
+    os_api: object | None = None,
+    flock_api: object | None = None,
+    parent_descriptor: int | None = None,
 ) -> Iterator[_PosixPublicationDirectory]:
     if os_api is None:
         os_api = os
@@ -1398,29 +1623,31 @@ def _posix_publisher_lock(
         import fcntl
 
         flock_api = fcntl
-    parent_descriptor: int | None = None
     lock_descriptor: int | None = None
     acquired = False
     try:
         directory_flag = _required_posix_flag(os_api, "O_DIRECTORY")
         nofollow_flag = _required_posix_flag(os_api, "O_NOFOLLOW")
         nonblock_flag = _required_posix_flag(os_api, "O_NONBLOCK")
-        resolved_parent = parent.resolve(strict=True)
-        initial_parent = os_api.lstat(resolved_parent)
-        if not stat.S_ISDIR(initial_parent.st_mode):
+        if parent_descriptor is None:
+            resolved_parent = parent.resolve(strict=True)
+            initial_parent = os_api.lstat(resolved_parent)
+            if not stat.S_ISDIR(initial_parent.st_mode):
+                raise OSError(errno.ENOTDIR, "unsafe publisher parent")
+            parent_flags = (
+                os_api.O_RDONLY
+                | directory_flag
+                | nofollow_flag
+                | getattr(os_api, "O_CLOEXEC", 0)
+            )
+            parent_descriptor = os_api.open(resolved_parent, parent_flags)
+            opened_parent = os_api.fstat(parent_descriptor)
+            if not stat.S_ISDIR(opened_parent.st_mode) or not os.path.samestat(
+                initial_parent, opened_parent
+            ):
+                raise OSError(errno.EAGAIN, "publisher parent changed")
+        elif not stat.S_ISDIR(os_api.fstat(parent_descriptor).st_mode):
             raise OSError(errno.ENOTDIR, "unsafe publisher parent")
-        parent_flags = (
-            os_api.O_RDONLY
-            | directory_flag
-            | nofollow_flag
-            | getattr(os_api, "O_CLOEXEC", 0)
-        )
-        parent_descriptor = os_api.open(resolved_parent, parent_flags)
-        opened_parent = os_api.fstat(parent_descriptor)
-        if not stat.S_ISDIR(opened_parent.st_mode) or not os.path.samestat(
-            initial_parent, opened_parent
-        ):
-            raise OSError(errno.EAGAIN, "publisher parent changed")
 
         lock_flags = (
             os_api.O_RDWR
@@ -1515,12 +1742,80 @@ def _posix_publisher_lock(
 
 
 @contextmanager
-def _publisher_lock(parent: Path) -> Iterator[object]:
+def _authenticated_windows_publisher_lock(
+    approved_private_root: Path, parent: Path
+) -> Iterator[_WindowsPublicationDirectory]:
+    api: object | None = None
+    descriptor: int | None = None
+    try:
+        api, descriptor = _acquire_windows_publication_parent(
+            approved_private_root, parent
+        )
+        publication = _WindowsPublicationDirectory(
+            parent,
+            descriptor=descriptor,
+            api=api,
+        )
+        descriptor = None
+        with _windows_publisher_lock(parent, publication=publication) as locked:
+            yield locked
+    except E1A4SamplingFrameError:
+        raise
+    except Exception as error:
+        raise E1A4SamplingFrameError(
+            "E1A4_SAMPLING_FRAME_WRITE_FAILED"
+        ) from error
+    finally:
+        if descriptor is not None and api is not None:
+            api.close_handle(descriptor)
+
+
+@contextmanager
+def _authenticated_posix_publisher_lock(
+    approved_private_root: Path, parent: Path
+) -> Iterator[_PosixPublicationDirectory]:
+    descriptor: int | None = None
+    try:
+        descriptor = _acquire_posix_publication_parent(
+            approved_private_root,
+            parent,
+            os_api=os,
+        )
+        acquired_descriptor = descriptor
+        descriptor = None
+        with _posix_publisher_lock(
+            parent,
+            os_api=os,
+            parent_descriptor=acquired_descriptor,
+        ) as publication:
+            yield publication
+    except E1A4SamplingFrameError:
+        raise
+    except Exception as error:
+        raise E1A4SamplingFrameError(
+            "E1A4_SAMPLING_FRAME_WRITE_FAILED"
+        ) from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+@contextmanager
+def _publisher_lock(
+    parent: Path,
+    *,
+    approved_private_root: Path | None = None,
+) -> Iterator[object]:
     """Hold an OS-released exclusive lock for the whole publication attempt."""
+    authentication_root = approved_private_root or parent
     if os.name == "nt":
-        lock = _windows_publisher_lock(parent)
+        lock = _authenticated_windows_publisher_lock(
+            authentication_root, parent
+        )
     elif os.name == "posix":
-        lock = _posix_publisher_lock(parent)
+        lock = _authenticated_posix_publisher_lock(
+            authentication_root, parent
+        )
     else:
         raise E1A4SamplingFrameError("E1A4_SAMPLING_FRAME_WRITE_FAILED")
     with lock as publication:
@@ -1931,6 +2226,7 @@ def _publish_sampling_frame(
     *,
     source_register: Mapping[str, object],
     allocation: Mapping[str, object],
+    approved_private_root: Path,
     output_root: Path,
 ) -> E1A4SamplingFrameSeal:
     final = _frame_directory(output_root)
@@ -1938,8 +2234,10 @@ def _publish_sampling_frame(
     staged: _BoundStagingDirectory | None = None
     try:
         _reject_unsafe_directory_ancestors(output_root)
-        parent.mkdir(parents=True, exist_ok=True)
-        with _publisher_lock(parent) as publication:
+        with _publisher_lock(
+            parent,
+            approved_private_root=approved_private_root,
+        ) as publication:
             try:
                 publication.ensure_no_staging()
                 if publication.final_exists():
@@ -1994,6 +2292,7 @@ def seal_sampling_frame(**values: object) -> E1A4SamplingFrameSeal:
     return _publish_sampling_frame(
         source_register=source_register,
         allocation=allocation,
+        approved_private_root=Path(values["approved_private_root"]),
         output_root=Path(values["output_root"]),
     )
 
@@ -2005,7 +2304,10 @@ def verify_current_sampling_frame(**values: object) -> E1A4SamplingFrameSeal:
     if not final.exists():
         _fail("E1A4_SAMPLING_FRAME_MISSING")
     try:
-        with _publisher_lock(final.parent):
+        with _publisher_lock(
+            final.parent,
+            approved_private_root=Path(values["approved_private_root"]),
+        ):
             _remove_abandoned_staging(final.parent)
             source_register, allocation = _expected_frame(**values)
             return verify_sampling_frame(

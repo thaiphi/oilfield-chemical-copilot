@@ -1900,6 +1900,129 @@ class _FakeFlock:
         self.calls.append((descriptor, operation))
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows capability traversal")
+def test_windows_publication_parent_acquisition_traverses_from_volume_handle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import eval.seal_e1a4_sampling_frame as runner
+
+    approved = tmp_path
+    parent = approved / "output" / "e1a4" / "sampling-frame"
+    opened: list[tuple[object, str, bool, bool]] = []
+    closed: list[object] = []
+    next_descriptor = 10
+
+    def open_component(
+        _api: object,
+        descriptor: object,
+        component: str,
+        *,
+        create: bool,
+        writable: bool,
+    ) -> int:
+        nonlocal next_descriptor
+        opened.append((descriptor, component, create, writable))
+        next_descriptor += 1
+        return next_descriptor
+
+    api = SimpleNamespace(
+        open_directory=lambda anchor: (
+            10
+            if anchor == Path(approved.absolute().anchor)
+            else pytest.fail("acquisition did not start at the volume anchor")
+        ),
+        close_handle=closed.append,
+    )
+    monkeypatch.setattr(
+        runner._mapping_application,
+        "_windows_seal_reader_api",
+        lambda: api,
+    )
+    monkeypatch.setattr(
+        runner,
+        "_windows_open_directory_component",
+        open_component,
+    )
+
+    acquired_api, descriptor = runner._acquire_windows_publication_parent(
+        approved, parent
+    )
+
+    root_parts = approved.absolute().relative_to(
+        Path(approved.absolute().anchor)
+    ).parts
+    assert acquired_api is api
+    assert [item[1] for item in opened] == [
+        *root_parts,
+        "output",
+        "e1a4",
+        "sampling-frame",
+    ]
+    assert [item[2] for item in opened] == [
+        *([False] * len(root_parts)),
+        True,
+        True,
+        True,
+    ]
+    assert opened[len(root_parts) - 1][3]
+    assert all(item[3] for item in opened[len(root_parts) :])
+    assert descriptor == next_descriptor
+    assert closed == list(range(10, next_descriptor))
+
+
+def test_posix_publication_component_creation_is_relative_nofollow_and_synced(
+) -> None:
+    import eval.seal_e1a4_sampling_frame as runner
+
+    calls: list[tuple[object, ...]] = []
+
+    class ComponentOS:
+        O_RDONLY = 0x01
+        O_DIRECTORY = 0x02
+        O_NOFOLLOW = 0x04
+        O_CLOEXEC = 0x08
+
+        def open(
+            self, name: str, flags: int, *, dir_fd: int
+        ) -> int:
+            calls.append(("open", name, flags, dir_fd))
+            if sum(call[0] == "open" for call in calls) == 1:
+                raise FileNotFoundError
+            return 22
+
+        def mkdir(
+            self, name: str, mode: int, *, dir_fd: int
+        ) -> None:
+            calls.append(("mkdir", name, mode, dir_fd))
+
+        def fsync(self, descriptor: int) -> None:
+            calls.append(("fsync", descriptor))
+
+        def fstat(self, descriptor: int) -> object:
+            calls.append(("fstat", descriptor))
+            return SimpleNamespace(st_mode=stat.S_IFDIR | 0o700)
+
+        def close(self, descriptor: int) -> None:
+            calls.append(("close", descriptor))
+
+    api = ComponentOS()
+    descriptor = runner._posix_open_directory_component(
+        api,
+        11,
+        "sampling-frame",
+        create=True,
+    )
+
+    assert descriptor == 22
+    assert calls[:4] == [
+        ("open", "sampling-frame", 0x0F, 11),
+        ("mkdir", "sampling-frame", 0o700, 11),
+        ("fsync", 11),
+        ("open", "sampling-frame", 0x0F, 11),
+    ]
+    assert calls[4] == ("fstat", 22)
+
+
 def test_posix_lock_creates_only_by_relative_validated_parent_fd(
     tmp_path: Path,
 ) -> None:
@@ -2089,6 +2212,7 @@ def test_frame_publisher_rejects_symlinked_output_ancestor_without_mutation(
         runner._publish_sampling_frame(
             source_register={"schema_version": 1},
             allocation={"schema_version": 1},
+            approved_private_root=approved,
             output_root=linked,
         )
 
@@ -2096,68 +2220,50 @@ def test_frame_publisher_rejects_symlinked_output_ancestor_without_mutation(
     assert not (actual / "e1a4").exists()
 
 
-def test_frame_publisher_never_writes_through_concurrently_retargeted_parent(
+def test_frame_publisher_never_binds_retargeted_ancestor_during_acquisition(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import eval.seal_e1a4_sampling_frame as runner
 
     _patch_frame_trust(runner, tmp_path, monkeypatch)
-    parent = tmp_path / "output" / "e1a4" / "sampling-frame"
-    displaced = tmp_path / "authenticated-parent"
-    adversary = tmp_path / "retargeted-parent"
+    output = tmp_path / "output"
+    parent = output / "e1a4" / "sampling-frame"
+    displaced = tmp_path / "authenticated-output"
+    adversary = tmp_path / "retargeted-output"
     attack_happened = False
+    publication_class = (
+        runner._WindowsPublicationDirectory
+        if runner.os.name == "nt"
+        else runner._PosixPublicationDirectory
+    )
+    real_init = publication_class.__init__
+    real_lock = runner._publisher_lock
 
-    class StablePublication:
-        def ensure_no_staging(self) -> None:
-            nonlocal attack_happened
-            attack_happened = True
-            parent.rename(displaced)
-            parent.mkdir()
-
-        def final_exists(self) -> bool:
-            return False
-
-        def create_staging(self) -> object:
-            staging = displaced / ".v1.bound.tmp"
-            sealed = staging / "sealed"
-            manifests = staging / "manifests"
-            sealed.mkdir(parents=True)
-            manifests.mkdir()
-            return runner._BoundStagingDirectory(
-                name=staging.name,
-                path=staging,
-                root=staging,
-                sealed=sealed,
-                manifests=manifests,
-            )
-
-        def write_file(
-            self, directory: Path, name: str, content: bytes
-        ) -> None:
-            (directory / name).write_bytes(content)
-
-        def sync_staging(self, _staging: object) -> None:
-            pass
-
-        def publish(self, staging: object) -> None:
-            parent.rename(adversary)
-            displaced.rename(parent)
-            (parent / staging.name).rename(parent / "v1")
-
-        def sync_parent(self) -> None:
-            pass
-
-        def close_staging(self, _staging: object) -> None:
-            pass
+    def swap_then_acquire(self: object, *args: object, **kwargs: object) -> None:
+        nonlocal attack_happened
+        attack_happened = True
+        output.rename(displaced)
+        parent.mkdir(parents=True)
+        real_init(self, *args, **kwargs)
 
     @contextmanager
-    def retargeting_lock(_parent: Path) -> object:
-        yield StablePublication()
+    def restore_after_real_lock(*args: object, **kwargs: object) -> object:
+        try:
+            with real_lock(*args, **kwargs) as publication:
+                yield publication
+        finally:
+            if displaced.exists():
+                output.rename(adversary)
+                displaced.rename(output)
 
-    monkeypatch.setattr(runner, "_publisher_lock", retargeting_lock)
+    monkeypatch.setattr(publication_class, "__init__", swap_then_acquire)
+    monkeypatch.setattr(runner, "_publisher_lock", restore_after_real_lock)
 
-    sealed = runner.seal_sampling_frame(**_frame_kwargs(tmp_path))
+    try:
+        sealed = runner.seal_sampling_frame(**_frame_kwargs(tmp_path))
+    except runner.E1A4SamplingFrameError:
+        sealed = None
 
     leaked = tuple(
         path.relative_to(adversary).as_posix()
@@ -2166,8 +2272,8 @@ def test_frame_publisher_never_writes_through_concurrently_retargeted_parent(
     ) if adversary.exists() else ()
     assert not leaked
     assert attack_happened
-    assert sealed.slot_count == 96
-    assert (parent / "v1").is_dir()
+    if sealed is not None:
+        assert sealed.slot_count == 96
 
 
 def test_frame_publisher_syncs_directory_hierarchy_before_and_after_rename(
