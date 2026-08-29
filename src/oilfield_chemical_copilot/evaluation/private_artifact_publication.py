@@ -1258,6 +1258,7 @@ class _PosixPublicationDirectory(AuthenticatedPublicationDirectory):
             name,
             self._os.O_RDONLY
             | _required_posix_flag(self._os, "O_NOFOLLOW")
+            | _required_posix_flag(self._os, "O_NONBLOCK")
             | getattr(self._os, "O_CLOEXEC", 0),
             dir_fd=parent,
         )

@@ -323,6 +323,99 @@ def test_posix_creation_is_component_relative_nofollow_and_parent_synced() -> No
     assert calls[4] == ("fstat", 22)
 
 
+def test_posix_member_read_is_nonblocking_and_rejects_fifo_before_read() -> None:
+    events: list[tuple[object, ...]] = []
+
+    class PosixOS:
+        O_RDONLY = 0x01
+        O_NOFOLLOW = 0x02
+        O_NONBLOCK = 0x04
+        O_CLOEXEC = 0x08
+
+        @staticmethod
+        def open(
+            name: str, flags: int, *, dir_fd: int
+        ) -> int:
+            events.append(("open", name, flags, dir_fd))
+            return 42
+
+        @staticmethod
+        def fstat(descriptor: int) -> object:
+            events.append(("fstat", descriptor))
+            return SimpleNamespace(
+                st_mode=stat.S_IFIFO | 0o600,
+                st_nlink=1,
+            )
+
+        @staticmethod
+        def stat(
+            name: str, *, dir_fd: int, follow_symlinks: bool
+        ) -> object:
+            events.append(("stat", name, dir_fd, follow_symlinks))
+            return SimpleNamespace(st_mode=stat.S_IFIFO | 0o600, st_nlink=1)
+
+        @staticmethod
+        def read(descriptor: int, size: int) -> bytes:
+            events.append(("read", descriptor, size))
+            raise AssertionError("FIFO was read")
+
+        @staticmethod
+        def close(descriptor: int) -> None:
+            events.append(("close", descriptor))
+
+    bound = publication._PosixPublicationDirectory(10, os_api=PosixOS())
+
+    with pytest.raises(OSError, match="unsafe artifact member"):
+        bound._read_member(11, "payload.bin")
+
+    assert events == [
+        ("open", "payload.bin", 0x0F, 11),
+        ("fstat", 42),
+        ("stat", "payload.bin", 11, False),
+        ("close", 42),
+    ]
+
+
+def test_posix_member_read_fails_closed_without_nonblocking_flag() -> None:
+    class PosixOS:
+        O_RDONLY = 0x01
+        O_NOFOLLOW = 0x02
+        O_CLOEXEC = 0x04
+
+        @staticmethod
+        def open(*_args: object, **_kwargs: object) -> int:
+            raise AssertionError("member opened without O_NONBLOCK")
+
+    bound = publication._PosixPublicationDirectory(10, os_api=PosixOS())
+
+    with pytest.raises(OSError, match="required relative primitive unavailable"):
+        bound._read_member(11, "payload.bin")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires native POSIX FIFO")
+def test_posix_native_fifo_member_is_rejected_without_blocking(
+    tmp_path: Path,
+) -> None:
+    approved = tmp_path / "private"
+    parent = approved / "output"
+    member = parent / "v1" / "sealed" / "payload.bin"
+    member.parent.mkdir(parents=True)
+    os.mkfifo(member)
+
+    with publication.authenticated_publication_directory(
+        approved_private_root=approved,
+        publication_parent=parent,
+        lock_name=".publish.lock",
+    ) as bound:
+        with pytest.raises(
+            publication.PrivateArtifactPublicationError,
+            match="^PRIVATE_ARTIFACT_OPERATION_FAILED$",
+        ):
+            bound.read_exact_tree(
+                "v1", {"sealed": frozenset({"payload.bin"})}
+            )
+
+
 def test_posix_parent_close_failure_closes_each_acquired_descriptor_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
