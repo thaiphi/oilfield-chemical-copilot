@@ -6,7 +6,6 @@ from hashlib import sha256
 import json
 import os
 from pathlib import Path
-import stat
 from threading import Thread, current_thread
 from types import SimpleNamespace
 
@@ -906,17 +905,363 @@ def test_frame_rejects_index_contract_a_to_b_to_a_race(
     assert not (tmp_path / "output" / "e1a4" / "sampling-frame" / "v1").exists()
 
 
+def _synthetic_frame_members(
+    source_register: dict[str, object],
+    allocation: dict[str, object],
+) -> dict[str, bytes]:
+    payloads = {
+        "source-register.v1.json": (
+            json.dumps(source_register, sort_keys=True, separators=(",", ":"))
+            + "\n"
+        ).encode(),
+        "sampling-allocation.v1.json": (
+            json.dumps(allocation, sort_keys=True, separators=(",", ":"))
+            + "\n"
+        ).encode(),
+    }
+    return {
+        **{f"sealed/{name}": content for name, content in payloads.items()},
+        **{
+            f"manifests/{name.removesuffix('.json')}.sha256": (
+                sha256(content).hexdigest() + "\n"
+            ).encode("ascii")
+            for name, content in payloads.items()
+        },
+    }
+
+
+def _write_synthetic_frame(
+    final: Path, members: dict[str, bytes]
+) -> None:
+    for relative_name, content in members.items():
+        path = final / relative_name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+
+
+def _frame_payloads(marker: str) -> tuple[dict[str, object], dict[str, object]]:
+    return (
+        {
+            "schema_version": 1,
+            "source_record_count": 1,
+            "marker": marker,
+        },
+        {"schema_version": 1, "slot_count": 96, "marker": marker},
+    )
+
+
+def test_locked_frame_verification_never_reopens_output_by_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import eval.seal_e1a4_sampling_frame as runner
+
+    source_register, allocation = _frame_payloads("authenticated")
+    output = tmp_path / "output"
+    approved = tmp_path
+    runner._publish_sampling_frame(
+        source_register=source_register,
+        allocation=allocation,
+        approved_private_root=approved,
+        output_root=output,
+    )
+    displaced = tmp_path / "authenticated-output"
+    replacement = tmp_path / "replacement-output"
+    replacement_members = _synthetic_frame_members(
+        *_frame_payloads("replacement")
+    )
+    real_acquire = runner.authenticated_publication_directory
+    retarget_succeeded = False
+
+    @contextmanager
+    def retarget_after_acquisition(**kwargs: object) -> object:
+        nonlocal retarget_succeeded
+        with real_acquire(**kwargs) as publication:
+            try:
+                output.rename(displaced)
+                _write_synthetic_frame(
+                    output / "e1a4" / "sampling-frame" / "v1",
+                    replacement_members,
+                )
+                retarget_succeeded = True
+            except OSError:
+                pass
+            try:
+                yield publication
+            finally:
+                if retarget_succeeded:
+                    output.rename(replacement)
+                    displaced.rename(output)
+
+    monkeypatch.setattr(
+        runner,
+        "authenticated_publication_directory",
+        retarget_after_acquisition,
+    )
+    monkeypatch.setattr(
+        runner,
+        "_read_frame_members",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("locked verification reopened output by pathname")
+        ),
+        raising=False,
+    )
+
+    verified = runner._publish_sampling_frame(
+        source_register=source_register,
+        allocation=allocation,
+        approved_private_root=approved,
+        output_root=output,
+    )
+
+    assert verified.source_register_sha256 == sha256(
+        _synthetic_frame_members(source_register, allocation)[
+            "sealed/source-register.v1.json"
+        ]
+    ).hexdigest()
+
+
+def test_standalone_frame_verification_reads_through_authenticated_capability(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import eval.seal_e1a4_sampling_frame as runner
+
+    _patch_frame_trust(runner, tmp_path, monkeypatch)
+    sealed = runner.seal_sampling_frame(**_frame_kwargs(tmp_path))
+    real_acquire = runner.authenticated_publication_directory
+    events: list[str] = []
+
+    @contextmanager
+    def observe_capability(**kwargs: object) -> object:
+        events.append("acquire")
+        with real_acquire(**kwargs) as publication:
+            original_read = publication.read_exact_tree
+
+            def read_exact_tree(*args: object, **read_kwargs: object) -> object:
+                events.append("read")
+                return original_read(*args, **read_kwargs)
+
+            monkeypatch.setattr(publication, "read_exact_tree", read_exact_tree)
+            yield publication
+
+    monkeypatch.setattr(
+        runner, "authenticated_publication_directory", observe_capability
+    )
+    monkeypatch.setattr(
+        runner,
+        "_read_frame_members",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("standalone verification reopened output by pathname")
+        ),
+        raising=False,
+    )
+
+    assert runner.verify_current_sampling_frame(**_frame_kwargs(tmp_path)) == sealed
+    assert events == ["acquire", "read"]
+
+
+def test_frame_existing_final_is_verified_from_locked_tree_not_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import eval.seal_e1a4_sampling_frame as runner
+
+    original_source, original_allocation = _frame_payloads("authenticated")
+    replacement_source, replacement_allocation = _frame_payloads("replacement")
+    output = tmp_path / "output"
+    runner._publish_sampling_frame(
+        source_register=original_source,
+        allocation=original_allocation,
+        approved_private_root=tmp_path,
+        output_root=output,
+    )
+    displaced = tmp_path / "authenticated-output"
+    replacement = tmp_path / "replacement-output"
+    real_acquire = runner.authenticated_publication_directory
+    retarget_succeeded = False
+    retarget_denial: OSError | None = None
+
+    @contextmanager
+    def retarget_after_acquisition(**kwargs: object) -> object:
+        nonlocal retarget_succeeded, retarget_denial
+        with real_acquire(**kwargs) as publication:
+            try:
+                output.rename(displaced)
+                _write_synthetic_frame(
+                    output / "e1a4" / "sampling-frame" / "v1",
+                    _synthetic_frame_members(
+                        replacement_source, replacement_allocation
+                    ),
+                )
+                retarget_succeeded = True
+            except OSError as error:
+                retarget_denial = error
+            try:
+                yield publication
+            finally:
+                if retarget_succeeded:
+                    output.rename(replacement)
+                    displaced.rename(output)
+
+    monkeypatch.setattr(
+        runner,
+        "authenticated_publication_directory",
+        retarget_after_acquisition,
+    )
+
+    observed_error: runner.E1A4SamplingFrameError | None = None
+    try:
+        runner._publish_sampling_frame(
+            source_register=replacement_source,
+            allocation=replacement_allocation,
+            approved_private_root=tmp_path,
+            output_root=output,
+        )
+    except runner.E1A4SamplingFrameError as error:
+        observed_error = error
+    if retarget_denial is not None:
+        pytest.skip(
+            "authenticated capability denied ancestor retarget: "
+            f"{retarget_denial.__class__.__name__}"
+        )
+    assert retarget_succeeded
+    assert str(observed_error) == "E1A4_SAMPLING_FRAME_BINDING_MISMATCH"
+
+
+def test_frame_publisher_preserves_directory_sync_order_with_shared_capability(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import eval.seal_e1a4_sampling_frame as runner
+
+    source_register, allocation = _frame_payloads("ordered")
+    members = _synthetic_frame_members(source_register, allocation)
+    events: list[tuple[object, ...]] = []
+
+    class Staging:
+        def mkdir(self, name: str) -> None:
+            events.append(("mkdir", name))
+
+        def write_exclusive(self, name: str, content: bytes) -> None:
+            events.append(("write", name, content))
+
+        def sync_directory(self, name: str) -> None:
+            events.append(("sync", name))
+
+        def sync_root(self) -> None:
+            events.append(("sync-root",))
+
+    class Publication:
+        staging = Staging()
+        published = False
+
+        def ensure_no_staging(self, prefix: str, suffix: str) -> None:
+            events.append(("residue", prefix, suffix))
+
+        def final_exists(self, name: str) -> bool:
+            events.append(("exists", name))
+            return self.published
+
+        def create_staging(self, prefix: str, suffix: str) -> Staging:
+            events.append(("create", prefix, suffix))
+            return self.staging
+
+        def publish_no_replace(self, staging: Staging, name: str) -> None:
+            assert staging is self.staging
+            events.append(("publish", name))
+            self.published = True
+
+        def sync_parent(self) -> None:
+            events.append(("sync-parent",))
+
+        def read_exact_tree(
+            self, name: str, layout: object
+        ) -> dict[str, bytes]:
+            events.append(("read", name, layout))
+            return members
+
+    @contextmanager
+    def capability(**kwargs: object) -> object:
+        events.append(("acquire", kwargs))
+        yield Publication()
+
+    monkeypatch.setattr(
+        runner, "authenticated_publication_directory", capability, raising=False
+    )
+
+    sealed = runner._publish_sampling_frame(
+        source_register=source_register,
+        allocation=allocation,
+        approved_private_root=tmp_path,
+        output_root=tmp_path / "output",
+    )
+
+    assert sealed.slot_count == 96
+    labels = [event[:2] for event in events]
+    assert labels == [
+        ("acquire", {
+            "approved_private_root": tmp_path,
+            "publication_parent": tmp_path
+            / "output"
+            / "e1a4"
+            / "sampling-frame",
+            "lock_name": ".v1.publish.lock",
+        }),
+        ("residue", ".v1."),
+        ("exists", "v1"),
+        ("create", ".v1."),
+        ("mkdir", "sealed"),
+        ("mkdir", "manifests"),
+        ("write", "sealed/source-register.v1.json"),
+        ("write", "manifests/source-register.v1.sha256"),
+        ("write", "sealed/sampling-allocation.v1.json"),
+        ("write", "manifests/sampling-allocation.v1.sha256"),
+        ("sync", "sealed"),
+        ("sync", "manifests"),
+        ("sync-root",),
+        ("publish", "v1"),
+        ("sync-parent",),
+        ("read", "v1"),
+    ]
+
+
+def test_frame_runner_has_no_duplicate_platform_publication_implementation() -> None:
+    import eval.seal_e1a4_sampling_frame as runner
+
+    duplicate_symbols = (
+        "_PosixPublicationDirectory",
+        "_WindowsPublicationDirectory",
+        "_publisher_lock",
+        "_authenticated_posix_publisher_lock",
+        "_authenticated_windows_publisher_lock",
+        "_acquire_posix_publication_parent",
+        "_acquire_windows_publication_parent",
+        "_rename_no_replace_at",
+    )
+    assert not [name for name in duplicate_symbols if hasattr(runner, name)]
+
+
 def test_frame_publication_failure_preserves_owned_staging_for_manual_review(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import eval.seal_e1a4_sampling_frame as runner
 
     _patch_frame_trust(runner, tmp_path, monkeypatch)
-    publish_bound_staging = runner._publish_bound_staging
+    real_acquire = runner.authenticated_publication_directory
+
+    @contextmanager
+    def fail_publish(**kwargs: object) -> object:
+        with real_acquire(**kwargs) as publication:
+            class PublicationProxy:
+                def __getattr__(self, name: str) -> object:
+                    return getattr(publication, name)
+
+                def publish_no_replace(
+                    self, _staging: object, _name: str
+                ) -> None:
+                    raise OSError("private path")
+
+            yield PublicationProxy()
+
     monkeypatch.setattr(
-        runner,
-        "_publish_bound_staging",
-        lambda *_args: (_ for _ in ()).throw(OSError("private path")),
+        runner, "authenticated_publication_directory", fail_publish
     )
 
     with pytest.raises(
@@ -929,7 +1274,7 @@ def test_frame_publication_failure_preserves_owned_staging_for_manual_review(
     assert len(tuple(parent.glob(".v1.*.tmp"))) == 1
 
     monkeypatch.setattr(
-        runner, "_publish_bound_staging", publish_bound_staging
+        runner, "authenticated_publication_directory", real_acquire
     )
     with pytest.raises(
         runner.E1A4SamplingFrameError,
@@ -997,7 +1342,11 @@ def test_standalone_frame_verify_fails_closed_on_publisher_lock_contention(
         except runner.E1A4SamplingFrameError as error:
             result.append(error)
 
-    with runner._publisher_lock(parent):
+    with runner.authenticated_publication_directory(
+        approved_private_root=tmp_path,
+        publication_parent=parent,
+        lock_name=".v1.publish.lock",
+    ):
         contender = Thread(target=verify)
         contender.start()
         contender.join(10)
@@ -1087,1048 +1436,13 @@ def test_frame_verifier_rejects_fifo_member_without_blocking(
     assert process.exitcode == 0
 
 
-def test_abandoned_staging_detection_does_not_resolve_or_delete_entry(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    import eval.seal_e1a4_sampling_frame as runner
-
-    parent = tmp_path / "parent"
-    parent.mkdir()
-    candidate = parent / ".v1.abandoned.tmp"
-    candidate.mkdir()
-    (candidate / "owned").write_text("owned")
-    monkeypatch.setattr(
-        Path,
-        "resolve",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("staging detection must not resolve")
-        ),
-    )
-
-    with pytest.raises(OSError):
-        runner._remove_abandoned_staging(parent)
-
-    assert (candidate / "owned").read_text() == "owned"
-
-
-class _FakeFrameWindowsReader:
-    def __init__(
-        self,
-        members: dict[str, bytes],
-        *,
-        unsafe_member: str | None = None,
-        replaced_member: str | None = None,
-        unsafe_root: bool = False,
-        replaced_root: bool = False,
-        replaced_child: str | None = None,
-        fail_close: object | None = None,
-    ) -> None:
-        self.members = members
-        self.unsafe_member = unsafe_member
-        self.replaced_member = replaced_member
-        self.unsafe_root = unsafe_root
-        self.replaced_root = replaced_root
-        self.replaced_child = replaced_child
-        self.fail_close = fail_close
-        self.opens: dict[str, int] = {}
-        self.closed: list[object] = []
-
-    def open_directory(self, _path: Path) -> tuple[str, int]:
-        if self.unsafe_root:
-            raise OSError("frame directory is reparse")
-        self.opens["root"] = self.opens.get("root", 0) + 1
-        return "root", self.opens["root"]
-
-    def open_child(self, _parent: object, name: str) -> tuple[str, int]:
-        self.opens[name] = self.opens.get(name, 0) + 1
-        return name, self.opens[name]
-
-    def _validate_handle(self, handle: object, *, directory: bool) -> tuple[object, ...]:
-        if directory:
-            name, generation = handle
-            replacement = (
-                (name == "root" and self.replaced_root)
-                or name == self.replaced_child
-            ) and generation > 1
-            return name, "replacement" if replacement else "original"
-        raise AssertionError("member validation uses member_snapshot")
-
-    def directory_entries(self, handle: object) -> set[str]:
-        name = handle[0]
-        if name == "root":
-            return {"sealed", "manifests"}
-        return {
-            key.removeprefix(f"{name}/")
-            for key in self.members
-            if key.startswith(f"{name}/")
-        }
-
-    def open_member(self, directory: object, name: str) -> tuple[str, int]:
-        key = f"{directory[0]}/{name}"
-        self.opens[key] = self.opens.get(key, 0) + 1
-        return key, self.opens[key]
-
-    def member_snapshot(self, handle: tuple[str, int]) -> tuple[object, ...]:
-        key, generation = handle
-        if key == self.unsafe_member:
-            raise OSError("member is reparse")
-        identity = (
-            "replacement"
-            if key == self.replaced_member and generation > 1
-            else "original"
-        )
-        return key, identity, len(self.members[key])
-
-    def read_member(self, handle: tuple[str, int]) -> bytes:
-        return self.members[handle[0]]
-
-    def close_handle(self, handle: object) -> None:
-        self.closed.append(handle)
-        if handle == self.fail_close:
-            raise OSError("synthetic close failure")
-
-
-def test_frame_windows_reader_rejects_reparse_member_via_native_seam(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    import eval.seal_e1a4_sampling_frame as runner
-
-    _patch_frame_trust(runner, tmp_path, monkeypatch)
-    runner.seal_sampling_frame(**_frame_kwargs(tmp_path))
-    final = tmp_path / "output" / "e1a4" / "sampling-frame" / "v1"
-    members = {
-        path.relative_to(final).as_posix(): path.read_bytes()
-        for path in final.rglob("*")
-        if path.is_file()
-    }
-    api = _FakeFrameWindowsReader(
-        members, unsafe_member=f"sealed/{runner.SOURCE_REGISTER_NAME}"
-    )
-    monkeypatch.setattr(
-        runner._mapping_application, "_windows_seal_reader_api", lambda: api
-    )
-    monkeypatch.setattr(
-        runner,
-        "_open_windows_child_directory",
-        lambda _api, parent, name: api.open_child(parent, name),
-    )
-
-    with pytest.raises(OSError, match="member is reparse"):
-        runner._read_windows_frame_members(final)
-
-    assert f"sealed/{runner.SOURCE_REGISTER_NAME}" in api.opens
-    assert ("root", 1) in api.closed
-
-
-def test_frame_windows_reader_rejects_reparse_final_directory_via_native_seam(
-    monkeypatch: pytest.MonkeyPatch
-) -> None:
-    import eval.seal_e1a4_sampling_frame as runner
-
-    api = _FakeFrameWindowsReader({}, unsafe_root=True)
-    monkeypatch.setattr(
-        runner._mapping_application, "_windows_seal_reader_api", lambda: api
-    )
-
-    with pytest.raises(OSError, match="directory is reparse"):
-        runner._read_windows_frame_members(Path("frame"))
-
-    assert not api.closed
-
-
-def test_frame_windows_reader_rejects_member_replacement_via_native_seam(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    import eval.seal_e1a4_sampling_frame as runner
-
-    _patch_frame_trust(runner, tmp_path, monkeypatch)
-    runner.seal_sampling_frame(**_frame_kwargs(tmp_path))
-    final = tmp_path / "output" / "e1a4" / "sampling-frame" / "v1"
-    members = {
-        path.relative_to(final).as_posix(): path.read_bytes()
-        for path in final.rglob("*")
-        if path.is_file()
-    }
-    replaced = f"sealed/{runner.SOURCE_REGISTER_NAME}"
-    api = _FakeFrameWindowsReader(members, replaced_member=replaced)
-    monkeypatch.setattr(
-        runner._mapping_application, "_windows_seal_reader_api", lambda: api
-    )
-    monkeypatch.setattr(
-        runner,
-        "_open_windows_child_directory",
-        lambda _api, parent, name: api.open_child(parent, name),
-    )
-
-    with pytest.raises(OSError, match="frame member changed"):
-        runner._read_windows_frame_members(final)
-
-    assert api.opens[replaced] == 2
-
-
-def test_frame_windows_reader_rejects_final_directory_replacement_via_native_seam(
-    monkeypatch: pytest.MonkeyPatch
-) -> None:
-    import eval.seal_e1a4_sampling_frame as runner
-
-    members = {
-        f"sealed/{runner.SOURCE_REGISTER_NAME}": b"source",
-        f"sealed/{runner.ALLOCATION_NAME}": b"allocation",
-        f"manifests/{runner._manifest_name(runner.SOURCE_REGISTER_NAME)}": b"digest\n",
-        f"manifests/{runner._manifest_name(runner.ALLOCATION_NAME)}": b"digest\n",
-    }
-    api = _FakeFrameWindowsReader(members, replaced_root=True)
-    monkeypatch.setattr(
-        runner._mapping_application, "_windows_seal_reader_api", lambda: api
-    )
-    monkeypatch.setattr(
-        runner,
-        "_open_windows_child_directory",
-        lambda _api, parent, name: api.open_child(parent, name),
-    )
-
-    with pytest.raises(OSError, match="frame directory changed"):
-        runner._read_windows_frame_members(Path("frame"))
-
-
-def test_frame_windows_reader_rejects_child_name_replacement_via_native_seam(
-    monkeypatch: pytest.MonkeyPatch
-) -> None:
-    import eval.seal_e1a4_sampling_frame as runner
-
-    api = _FakeFrameWindowsReader(
-        _frame_reader_members(runner), replaced_child="sealed"
-    )
-    monkeypatch.setattr(
-        runner._mapping_application, "_windows_seal_reader_api", lambda: api
-    )
-    monkeypatch.setattr(
-        runner,
-        "_open_windows_child_directory",
-        lambda _api, parent, name: api.open_child(parent, name),
-    )
-
-    with pytest.raises(OSError, match="frame directory changed"):
-        runner._read_windows_frame_members(Path("frame"))
-
-    assert api.opens["sealed"] == 2
-
-
-def test_frame_windows_reader_attempts_all_closes_after_close_failure(
-    monkeypatch: pytest.MonkeyPatch
-) -> None:
-    import eval.seal_e1a4_sampling_frame as runner
-
-    members = {
-        f"sealed/{runner.SOURCE_REGISTER_NAME}": b"source",
-        f"sealed/{runner.ALLOCATION_NAME}": b"allocation",
-        f"manifests/{runner._manifest_name(runner.SOURCE_REGISTER_NAME)}": b"digest\n",
-        f"manifests/{runner._manifest_name(runner.ALLOCATION_NAME)}": b"digest\n",
-    }
-    api = _FakeFrameWindowsReader(members, fail_close=("manifests", 1))
-    monkeypatch.setattr(
-        runner._mapping_application, "_windows_seal_reader_api", lambda: api
-    )
-    monkeypatch.setattr(
-        runner,
-        "_open_windows_child_directory",
-        lambda _api, parent, name: api.open_child(parent, name),
-    )
-
-    with pytest.raises(OSError, match="synthetic close failure"):
-        runner._read_windows_frame_members(Path("frame"))
-
-    assert api.closed[-1] == ("root", 1)
-
-
-def test_frame_windows_reader_closes_original_member_after_current_close_failure(
-    monkeypatch: pytest.MonkeyPatch
-) -> None:
-    import eval.seal_e1a4_sampling_frame as runner
-
-    member = f"sealed/{runner.ALLOCATION_NAME}"
-    api = _FakeFrameWindowsReader(
-        _frame_reader_members(runner), fail_close=(member, 2)
-    )
-    monkeypatch.setattr(
-        runner._mapping_application, "_windows_seal_reader_api", lambda: api
-    )
-    monkeypatch.setattr(
-        runner,
-        "_open_windows_child_directory",
-        lambda _api, parent, name: api.open_child(parent, name),
-    )
-
-    with pytest.raises(OSError, match="synthetic close failure"):
-        runner._read_windows_frame_members(Path("frame"))
-
-    assert (member, 1) in api.closed
-    assert api.closed[-1] == ("root", 1)
-
-
-class _FakeFramePosixOS:
-    O_RDONLY = 0x01
-    O_CLOEXEC = 0x02
-    O_DIRECTORY = 0x04
-    O_NOFOLLOW = 0x08
-    O_NONBLOCK = 0x10
-
-    def __init__(self, members: dict[str, bytes], *, fifo: str) -> None:
-        self.members = members
-        self.fifo = fifo
-        self.events: list[tuple[object, ...]] = []
-        self.next_fd = 10
-        self.handles: dict[int, str] = {}
-        self.read_done: set[int] = set()
-
-    def open(self, path: object, flags: int, *, dir_fd: int | None = None) -> int:
-        name = str(path)
-        self.events.append(("open", name, flags, dir_fd))
-        if dir_fd is not None and "/" in self.handles[dir_fd]:
-            if name == self.fifo:
-                raise AssertionError("blocking FIFO open attempted")
-            key = f"{self.handles[dir_fd]}/{name}"
-        elif dir_fd is not None and name in {"sealed", "manifests"}:
-            key = name
-        elif dir_fd is None:
-            key = "root"
-        else:
-            key = f"{self.handles[dir_fd]}/{name}"
-        fd = self.next_fd
-        self.next_fd += 1
-        self.handles[fd] = key
-        return fd
-
-    def fstat(self, fd: int) -> object:
-        key = self.handles[fd]
-        if key in {"root", "sealed", "manifests"}:
-            return SimpleNamespace(
-                st_mode=stat.S_IFDIR | 0o700,
-                st_dev=1,
-                st_ino={"root": 1, "sealed": 2, "manifests": 3}[key],
-            )
-        content = self.members[key]
-        return SimpleNamespace(
-            st_mode=(stat.S_IFIFO if key.endswith(self.fifo) else stat.S_IFREG) | 0o600,
-            st_nlink=1,
-            st_dev=1,
-            st_ino=100 + sorted(self.members).index(key),
-            st_size=len(content),
-            st_mtime_ns=1,
-            st_ctime_ns=1,
-        )
-
-    def stat(self, path: object, *, dir_fd: int, follow_symlinks: bool) -> object:
-        key = f"{self.handles[dir_fd]}/{path}"
-        self.events.append(("stat", key, follow_symlinks))
-        if key in {"root/sealed", "root/manifests"}:
-            return SimpleNamespace(
-                st_mode=stat.S_IFDIR | 0o700,
-                st_dev=1,
-                st_ino=2 if key.endswith("sealed") else 3,
-            )
-        content = self.members[key]
-        return SimpleNamespace(
-            st_mode=(stat.S_IFIFO if key.endswith(self.fifo) else stat.S_IFREG) | 0o600,
-            st_nlink=1,
-            st_dev=1,
-            st_ino=100 + sorted(self.members).index(key),
-            st_size=len(content),
-            st_mtime_ns=1,
-            st_ctime_ns=1,
-        )
-
-    def listdir(self, fd: int) -> list[str]:
-        key = self.handles[fd]
-        if key == "root":
-            return ["sealed", "manifests"]
-        return [
-            item.removeprefix(f"{key}/")
-            for item in self.members
-            if item.startswith(f"{key}/")
-        ]
-
-    def read(self, fd: int, _count: int) -> bytes:
-        key = self.handles[fd]
-        if fd in self.read_done:
-            return b""
-        self.read_done.add(fd)
-        return self.members[key]
-
-    def close(self, _fd: int) -> None:
-        return None
-
-
-def test_frame_posix_reader_rejects_fifo_before_opening_it() -> None:
-    import eval.seal_e1a4_sampling_frame as runner
-
-    fifo = runner.SOURCE_REGISTER_NAME
-    members = {
-        f"sealed/{runner.SOURCE_REGISTER_NAME}": b"source",
-        f"sealed/{runner.ALLOCATION_NAME}": b"allocation",
-        f"manifests/{runner._manifest_name(runner.SOURCE_REGISTER_NAME)}": b"digest\n",
-        f"manifests/{runner._manifest_name(runner.ALLOCATION_NAME)}": b"digest\n",
-    }
-    fake_os = _FakeFramePosixOS(members, fifo=fifo)
-
-    with pytest.raises(OSError, match="unsafe sealed member"):
-        runner._read_posix_frame_members(Path("frame"), os_api=fake_os)
-
-    assert ("stat", f"sealed/{fifo}", False) in fake_os.events
-    assert not any(
-        event[:2] == ("open", fifo) for event in fake_os.events
-    )
-
-
-def _frame_reader_members(runner: object) -> dict[str, bytes]:
-    return {
-        f"sealed/{runner.SOURCE_REGISTER_NAME}": b"source",
-        f"sealed/{runner.ALLOCATION_NAME}": b"allocation",
-        f"manifests/{runner._manifest_name(runner.SOURCE_REGISTER_NAME)}": b"digest\n",
-        f"manifests/{runner._manifest_name(runner.ALLOCATION_NAME)}": b"digest\n",
-    }
-
-
-def test_frame_posix_reader_rejects_member_name_replacement_after_read() -> None:
-    import eval.seal_e1a4_sampling_frame as runner
-
-    fake_os = _FakeFramePosixOS(
-        _frame_reader_members(runner), fifo="never-a-member"
-    )
-    original_open = fake_os.open
-    original_fstat = fake_os.fstat
-    target = runner.SOURCE_REGISTER_NAME
-    target_opens = 0
-    changed: set[int] = set()
-
-    def replace_member(path: object, flags: int, *, dir_fd: int | None = None) -> int:
-        nonlocal target_opens
-        descriptor = original_open(path, flags, dir_fd=dir_fd)
-        if str(path) == target:
-            target_opens += 1
-            if target_opens > 1:
-                changed.add(descriptor)
-        return descriptor
-
-    def replacement_fstat(descriptor: int) -> object:
-        observed = original_fstat(descriptor)
-        if descriptor in changed:
-            values = vars(observed).copy()
-            values["st_ino"] = 999
-            return SimpleNamespace(**values)
-        return observed
-
-    fake_os.open = replace_member  # type: ignore[method-assign]
-    fake_os.fstat = replacement_fstat  # type: ignore[method-assign]
-
-    with pytest.raises(OSError, match="frame member changed"):
-        runner._read_posix_frame_members(Path("frame"), os_api=fake_os)
-
-
-def test_frame_posix_reader_rejects_child_name_replacement_after_traversal() -> None:
-    import eval.seal_e1a4_sampling_frame as runner
-
-    fake_os = _FakeFramePosixOS(
-        _frame_reader_members(runner), fifo="never-a-member"
-    )
-    original_open = fake_os.open
-    original_fstat = fake_os.fstat
-    sealed_opens = 0
-    changed: set[int] = set()
-
-    def replace_child(path: object, flags: int, *, dir_fd: int | None = None) -> int:
-        nonlocal sealed_opens
-        descriptor = original_open(path, flags, dir_fd=dir_fd)
-        if str(path) == "sealed" and dir_fd is not None:
-            sealed_opens += 1
-            if sealed_opens > 1:
-                changed.add(descriptor)
-        return descriptor
-
-    def replacement_fstat(descriptor: int) -> object:
-        observed = original_fstat(descriptor)
-        if descriptor in changed:
-            values = vars(observed).copy()
-            values["st_ino"] = 999
-            return SimpleNamespace(**values)
-        return observed
-
-    fake_os.open = replace_child  # type: ignore[method-assign]
-    fake_os.fstat = replacement_fstat  # type: ignore[method-assign]
-
-    with pytest.raises(OSError, match="frame directory changed"):
-        runner._read_posix_frame_members(Path("frame"), os_api=fake_os)
-
-    assert sealed_opens == 2
-
-
-def test_frame_posix_reader_rejects_final_name_replacement_after_traversal() -> None:
-    import eval.seal_e1a4_sampling_frame as runner
-
-    fake_os = _FakeFramePosixOS(
-        _frame_reader_members(runner), fifo="never-a-member"
-    )
-    original_open = fake_os.open
-    original_fstat = fake_os.fstat
-    root_opens = 0
-    changed: set[int] = set()
-
-    def replace_final(path: object, flags: int, *, dir_fd: int | None = None) -> int:
-        nonlocal root_opens
-        descriptor = original_open(path, flags, dir_fd=dir_fd)
-        if dir_fd is None:
-            root_opens += 1
-            if root_opens > 1:
-                changed.add(descriptor)
-        return descriptor
-
-    def replacement_fstat(descriptor: int) -> object:
-        observed = original_fstat(descriptor)
-        if descriptor in changed:
-            values = vars(observed).copy()
-            values["st_ino"] = 999
-            return SimpleNamespace(**values)
-        return observed
-
-    fake_os.open = replace_final  # type: ignore[method-assign]
-    fake_os.fstat = replacement_fstat  # type: ignore[method-assign]
-
-    with pytest.raises(OSError, match="frame directory changed"):
-        runner._read_posix_frame_members(Path("frame"), os_api=fake_os)
-
-    assert root_opens == 2
-
-
-def test_frame_publisher_lock_fails_closed_then_releases(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    import eval.seal_e1a4_sampling_frame as runner
-
-    _patch_frame_trust(runner, tmp_path, monkeypatch)
-    parent = tmp_path / "output" / "e1a4" / "sampling-frame"
-    parent.mkdir(parents=True)
-    result: list[object] = []
-
-    def contend() -> None:
-        try:
-            result.append(runner.seal_sampling_frame(**_frame_kwargs(tmp_path)))
-        except runner.E1A4SamplingFrameError as error:
-            result.append(error)
-
-    with runner._publisher_lock(parent):
-        contender = Thread(target=contend)
-        contender.start()
-        contender.join(10)
-        assert not contender.is_alive()
-        assert [str(item) for item in result] == [
-            "E1A4_SAMPLING_FRAME_WRITE_FAILED"
-        ]
-        assert not (parent / "v1").exists()
-
-    sealed = runner.seal_sampling_frame(**_frame_kwargs(tmp_path))
-    assert runner.verify_current_sampling_frame(
-        **_frame_kwargs(tmp_path)
-    ) == sealed
-
-
-def _fake_windows_mutex(
-    wait_result: int,
-    on_create: object | None = None,
-    create_error: Exception | None = None,
-) -> tuple[SimpleNamespace, list[tuple[object, ...]]]:
-    events: list[tuple[object, ...]] = []
-
-    def owner_sid() -> str:
-        events.append(("owner-sid",))
-        return "S-1-5-21-111-222-333-1001"
-
-    def build_security_attributes(policy: str) -> SimpleNamespace:
-        events.append(("build-security", policy))
-        return SimpleNamespace(attributes="secure-attributes", descriptor=77)
-
-    def create_mutex(name: str, attributes: object) -> int:
-        events.append(("create", name, attributes))
-        if callable(on_create):
-            on_create()
-        if create_error is not None:
-            raise create_error
-        return 91
-
-    def free_security_descriptor(security: object) -> None:
-        events.append(("free-security", security))
-
-    def wait(handle: int, timeout_ms: int) -> int:
-        events.append(("wait", handle, timeout_ms))
-        return wait_result
-
-    def release_mutex(handle: int) -> None:
-        events.append(("release", handle))
-
-    def close_handle(handle: int) -> None:
-        events.append(("close", handle))
-
-    return (
-        SimpleNamespace(
-            owner_sid=owner_sid,
-            build_security_attributes=build_security_attributes,
-            create_mutex=create_mutex,
-            free_security_descriptor=free_security_descriptor,
-            wait=wait,
-            release_mutex=release_mutex,
-            close_handle=close_handle,
-        ),
-        events,
-    )
-
-
-@pytest.mark.parametrize("wait_result", (0, 0x00000080))
-def test_windows_mutex_acquired_or_abandoned_never_opens_lock_path(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    wait_result: int,
-) -> None:
-    import eval.seal_e1a4_sampling_frame as runner
-
-    parent = tmp_path / "sampling-frame"
-    parent.mkdir()
-    trap = parent / ".v1.publish.lock"
-
-    def install_final_component_trap() -> None:
-        trap.mkdir()
-        (trap / "sentinel").write_text("preserve")
-
-    api, events = _fake_windows_mutex(wait_result, install_final_component_trap)
-    monkeypatch.setattr(runner, "_windows_mutex_api", lambda: api, raising=False)
-    real_open = runner.os.open
-
-    def forbid_filesystem_lock(path: object, *args: object, **kwargs: object) -> int:
-        if Path(path).name == ".v1.publish.lock":
-            raise AssertionError("filesystem lock opened")
-        return real_open(path, *args, **kwargs)
-
-    monkeypatch.setattr(runner.os, "open", forbid_filesystem_lock)
-
-    with runner._publisher_lock(parent):
-        pass
-
-    policy = str(events[1][1])
-    assert policy == (
-        "O:S-1-5-21-111-222-333-1001"
-        "D:P"
-        "(A;;0x001F0001;;;S-1-5-21-111-222-333-1001)"
-        "(A;;0x001F0001;;;SY)"
-    )
-    assert "WD" not in policy
-    mutex_name = str(events[2][1])
-    assert mutex_name.startswith("Global\\E1A4SamplingFrame-")
-    assert len(mutex_name.removeprefix("Global\\E1A4SamplingFrame-")) == 64
-    assert str(parent) not in mutex_name
-    assert events[2][2] == "secure-attributes"
-    assert events[3:] == [
-        ("free-security", SimpleNamespace(attributes="secure-attributes", descriptor=77)),
-        ("wait", 91, 0),
-        ("release", 91),
-        ("close", 91),
-    ]
-    assert (trap / "sentinel").read_text() == "preserve"
-
-
-def test_windows_mutex_contention_closes_without_release(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    import eval.seal_e1a4_sampling_frame as runner
-
-    parent = tmp_path / "sampling-frame"
-    parent.mkdir()
-    api, events = _fake_windows_mutex(0x00000102)
-    monkeypatch.setattr(runner, "_windows_mutex_api", lambda: api, raising=False)
-
-    with pytest.raises(
-        runner.E1A4SamplingFrameError,
-        match="^E1A4_SAMPLING_FRAME_WRITE_FAILED$",
-    ):
-        with runner._publisher_lock(parent):
-            pass
-
-    assert [event[0] for event in events] == [
-        "owner-sid",
-        "build-security",
-        "create",
-        "free-security",
-        "wait",
-        "close",
-    ]
-    assert not (parent / ".v1.publish.lock").exists()
-
-
-def test_windows_mutex_access_denial_frees_security_and_fails_closed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    import eval.seal_e1a4_sampling_frame as runner
-
-    parent = tmp_path / "sampling-frame"
-    parent.mkdir()
-    api, events = _fake_windows_mutex(
-        0,
-        create_error=PermissionError("private access detail"),
-    )
-    monkeypatch.setattr(runner, "_windows_mutex_api", lambda: api)
-
-    with pytest.raises(
-        runner.E1A4SamplingFrameError,
-        match="^E1A4_SAMPLING_FRAME_WRITE_FAILED$",
-    ):
-        with runner._publisher_lock(parent):
-            pass
-
-    assert [event[0] for event in events] == [
-        "owner-sid",
-        "build-security",
-        "create",
-        "free-security",
-    ]
-    assert not (parent / ".v1.publish.lock").exists()
-
-
-def test_windows_mutex_parent_swap_never_mutates_replacement(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    import eval.seal_e1a4_sampling_frame as runner
-
-    parent = tmp_path / "sampling-frame"
-    displaced = tmp_path / "displaced-frame"
-    parent.mkdir()
-
-    def swap_parent() -> None:
-        parent.rename(displaced)
-        parent.mkdir()
-        trap = parent / ".v1.publish.lock"
-        trap.mkdir()
-        (trap / "sentinel").write_text("replacement")
-
-    api, events = _fake_windows_mutex(0, swap_parent)
-    monkeypatch.setattr(runner, "_windows_mutex_api", lambda: api, raising=False)
-
-    with runner._publisher_lock(parent):
-        pass
-
-    assert [event[0] for event in events] == [
-        "owner-sid",
-        "build-security",
-        "create",
-        "free-security",
-        "wait",
-        "release",
-        "close",
-    ]
-    assert not (displaced / ".v1.publish.lock").exists()
-    assert (parent / ".v1.publish.lock" / "sentinel").read_text() == "replacement"
-
-
-class _FakePosixOS:
-    O_RDONLY = 0x01
-    O_RDWR = 0x02
-    O_CREAT = 0x04
-    O_EXCL = 0x08
-    O_CLOEXEC = 0x10
-    O_DIRECTORY = 0x20
-    O_NOFOLLOW = 0x40
-    O_NONBLOCK = 0x80
-
-    def __init__(
-        self,
-        *,
-        parent_stat: object,
-        lock_stat: object,
-        parent_open_stat: object | None = None,
-        initial_lock_stat: object | None = None,
-        lock_open_stat: object | None = None,
-    ) -> None:
-        self.parent_stat = parent_stat
-        self.parent_open_stat = parent_open_stat or parent_stat
-        self.lock_stat = lock_stat
-        self.initial_lock_stat = initial_lock_stat
-        self.lock_open_stat = lock_open_stat or lock_stat
-        self.lock_created = initial_lock_stat is not None
-        self.calls: list[tuple[object, ...]] = []
-
-    def lstat(self, path: object) -> object:
-        self.calls.append(("lstat-parent", path))
-        return self.parent_stat
-
-    def open(
-        self,
-        path: object,
-        flags: int,
-        mode: int = 0o777,
-        *,
-        dir_fd: int | None = None,
-    ) -> int:
-        self.calls.append(("open", path, flags, mode, dir_fd))
-        if dir_fd is None:
-            return 41
-        self.lock_created = True
-        return 42
-
-    def fstat(self, descriptor: int) -> object:
-        self.calls.append(("fstat", descriptor))
-        if descriptor == 41:
-            return self.parent_open_stat
-        return self.lock_open_stat
-
-    def stat(
-        self, path: object, *, dir_fd: int, follow_symlinks: bool
-    ) -> object:
-        self.calls.append(("stat-lock", path, dir_fd, follow_symlinks))
-        if not self.lock_created:
-            raise FileNotFoundError
-        return self.initial_lock_stat or self.lock_stat
-
-    def close(self, descriptor: int) -> None:
-        self.calls.append(("close", descriptor))
-
-
-class _FakeFlock:
-    LOCK_EX = 0x01
-    LOCK_NB = 0x02
-    LOCK_UN = 0x04
-
-    def __init__(self) -> None:
-        self.calls: list[tuple[int, int]] = []
-
-    def flock(self, descriptor: int, operation: int) -> None:
-        self.calls.append((descriptor, operation))
-
-
-@pytest.mark.skipif(os.name != "nt", reason="Windows capability traversal")
-def test_windows_publication_parent_acquisition_traverses_from_volume_handle(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    import eval.seal_e1a4_sampling_frame as runner
-
-    approved = tmp_path
-    parent = approved / "output" / "e1a4" / "sampling-frame"
-    opened: list[tuple[object, str, bool, bool]] = []
-    closed: list[object] = []
-    next_descriptor = 10
-
-    def open_component(
-        _api: object,
-        descriptor: object,
-        component: str,
-        *,
-        create: bool,
-        writable: bool,
-    ) -> int:
-        nonlocal next_descriptor
-        opened.append((descriptor, component, create, writable))
-        next_descriptor += 1
-        return next_descriptor
-
-    api = SimpleNamespace(
-        open_directory=lambda anchor: (
-            10
-            if anchor == Path(approved.absolute().anchor)
-            else pytest.fail("acquisition did not start at the volume anchor")
-        ),
-        close_handle=closed.append,
-    )
-    monkeypatch.setattr(
-        runner._mapping_application,
-        "_windows_seal_reader_api",
-        lambda: api,
-    )
-    monkeypatch.setattr(
-        runner,
-        "_windows_open_directory_component",
-        open_component,
-    )
-
-    acquired_api, descriptor = runner._acquire_windows_publication_parent(
-        approved, parent
-    )
-
-    root_parts = approved.absolute().relative_to(
-        Path(approved.absolute().anchor)
-    ).parts
-    assert acquired_api is api
-    assert [item[1] for item in opened] == [
-        *root_parts,
-        "output",
-        "e1a4",
-        "sampling-frame",
-    ]
-    assert [item[2] for item in opened] == [
-        *([False] * len(root_parts)),
-        True,
-        True,
-        True,
-    ]
-    assert opened[len(root_parts) - 1][3]
-    assert all(item[3] for item in opened[len(root_parts) :])
-    assert descriptor == next_descriptor
-    assert closed == list(range(10, next_descriptor))
-
-
-def test_posix_publication_component_creation_is_relative_nofollow_and_synced(
-) -> None:
-    import eval.seal_e1a4_sampling_frame as runner
-
-    calls: list[tuple[object, ...]] = []
-
-    class ComponentOS:
-        O_RDONLY = 0x01
-        O_DIRECTORY = 0x02
-        O_NOFOLLOW = 0x04
-        O_CLOEXEC = 0x08
-
-        def open(
-            self, name: str, flags: int, *, dir_fd: int
-        ) -> int:
-            calls.append(("open", name, flags, dir_fd))
-            if sum(call[0] == "open" for call in calls) == 1:
-                raise FileNotFoundError
-            return 22
-
-        def mkdir(
-            self, name: str, mode: int, *, dir_fd: int
-        ) -> None:
-            calls.append(("mkdir", name, mode, dir_fd))
-
-        def fsync(self, descriptor: int) -> None:
-            calls.append(("fsync", descriptor))
-
-        def fstat(self, descriptor: int) -> object:
-            calls.append(("fstat", descriptor))
-            return SimpleNamespace(st_mode=stat.S_IFDIR | 0o700)
-
-        def close(self, descriptor: int) -> None:
-            calls.append(("close", descriptor))
-
-    api = ComponentOS()
-    descriptor = runner._posix_open_directory_component(
-        api,
-        11,
-        "sampling-frame",
-        create=True,
-    )
-
-    assert descriptor == 22
-    assert calls[:4] == [
-        ("open", "sampling-frame", 0x0F, 11),
-        ("mkdir", "sampling-frame", 0o700, 11),
-        ("fsync", 11),
-        ("open", "sampling-frame", 0x0F, 11),
-    ]
-    assert calls[4] == ("fstat", 22)
-
-
-def test_posix_lock_creates_only_by_relative_validated_parent_fd(
-    tmp_path: Path,
-) -> None:
-    import eval.seal_e1a4_sampling_frame as runner
-
-    parent = tmp_path / "sampling-frame"
-    parent.mkdir()
-    reference = tmp_path / "reference-lock"
-    reference.touch()
-    fake_os = _FakePosixOS(
-        parent_stat=parent.stat(),
-        lock_stat=reference.stat(),
-    )
-    fake_flock = _FakeFlock()
-    posix_lock = getattr(runner, "_posix_publisher_lock", None)
-    assert posix_lock is not None
-
-    with posix_lock(parent, os_api=fake_os, flock_api=fake_flock):
-        pass
-
-    parent_open = next(call for call in fake_os.calls if call[:2] == ("open", parent.resolve()))
-    relative_open = next(
-        call for call in fake_os.calls if call[0:2] == ("open", ".v1.publish.lock")
-    )
-    assert parent_open[2] & fake_os.O_DIRECTORY
-    assert parent_open[2] & fake_os.O_NOFOLLOW
-    assert relative_open[4] == 41
-    assert relative_open[2] & fake_os.O_CREAT
-    assert relative_open[2] & fake_os.O_EXCL
-    assert relative_open[2] & fake_os.O_NOFOLLOW
-    assert relative_open[2] & fake_os.O_NONBLOCK
-    assert fake_flock.calls == [(42, 0x03), (42, 0x04)]
-    assert fake_os.calls[-2:] == [("close", 42), ("close", 41)]
-
-
-def test_posix_parent_swap_fails_before_relative_lock_open(
-    tmp_path: Path,
-) -> None:
-    import eval.seal_e1a4_sampling_frame as runner
-
-    parent = tmp_path / "sampling-frame"
-    replacement = tmp_path / "replacement-frame"
-    reference = tmp_path / "reference-lock"
-    parent.mkdir()
-    replacement.mkdir()
-    reference.touch()
-    fake_os = _FakePosixOS(
-        parent_stat=parent.stat(),
-        parent_open_stat=replacement.stat(),
-        lock_stat=reference.stat(),
-    )
-    fake_flock = _FakeFlock()
-    posix_lock = getattr(runner, "_posix_publisher_lock", None)
-    assert posix_lock is not None
-
-    with pytest.raises(
-        runner.E1A4SamplingFrameError,
-        match="^E1A4_SAMPLING_FRAME_WRITE_FAILED$",
-    ):
-        with posix_lock(parent, os_api=fake_os, flock_api=fake_flock):
-            pass
-
-    assert not any(call[-1] == 41 for call in fake_os.calls if call[0] == "open")
-    assert not (replacement / ".v1.publish.lock").exists()
-    assert not fake_flock.calls
-
-
-def test_posix_final_component_swap_fails_before_flock(
-    tmp_path: Path,
-) -> None:
-    import eval.seal_e1a4_sampling_frame as runner
-
-    parent = tmp_path / "sampling-frame"
-    initial = tmp_path / "initial-lock"
-    replacement = tmp_path / "replacement-lock"
-    parent.mkdir()
-    initial.touch()
-    replacement.write_text("preserve")
-    fake_os = _FakePosixOS(
-        parent_stat=parent.stat(),
-        lock_stat=initial.stat(),
-        initial_lock_stat=initial.stat(),
-        lock_open_stat=replacement.stat(),
-    )
-    fake_flock = _FakeFlock()
-    posix_lock = getattr(runner, "_posix_publisher_lock", None)
-    assert posix_lock is not None
-
-    with pytest.raises(
-        runner.E1A4SamplingFrameError,
-        match="^E1A4_SAMPLING_FRAME_WRITE_FAILED$",
-    ):
-        with posix_lock(parent, os_api=fake_os, flock_api=fake_flock):
-            pass
-
-    assert replacement.read_text() == "preserve"
-    assert not fake_flock.calls
-
-
 def test_failed_publisher_preserves_owned_final_for_manual_review(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import eval.seal_e1a4_sampling_frame as runner
 
     _patch_frame_trust(runner, tmp_path, monkeypatch)
-    real_verify = runner.verify_sampling_frame
+    real_verify = runner._verify_sampling_frame_members
 
     def fail_first_verification(**kwargs: object) -> object:
         if current_thread().name == "publisher-1":
@@ -2137,7 +1451,9 @@ def test_failed_publisher_preserves_owned_final_for_manual_review(
             )
         return real_verify(**kwargs)
 
-    monkeypatch.setattr(runner, "verify_sampling_frame", fail_first_verification)
+    monkeypatch.setattr(
+        runner, "_verify_sampling_frame_members", fail_first_verification
+    )
     failures: list[BaseException] = []
 
     def publish() -> None:
@@ -2167,17 +1483,26 @@ def test_frame_publication_race_preserves_concurrent_destination(
     _patch_frame_trust(runner, tmp_path, monkeypatch)
     parent = tmp_path / "output" / "e1a4" / "sampling-frame"
     final = parent / "v1"
+    real_acquire = runner.authenticated_publication_directory
 
-    def concurrent_publish(_publication: object, _staged: object) -> None:
-        final.mkdir()
-        (final / "concurrent-owner").write_text("preserve me")
-        raise FileExistsError("private concurrent detail")
+    @contextmanager
+    def race_at_publish(**kwargs: object) -> object:
+        with real_acquire(**kwargs) as publication:
+            class PublicationProxy:
+                def __getattr__(self, name: str) -> object:
+                    return getattr(publication, name)
+
+                def publish_no_replace(
+                    self, staging: object, name: str
+                ) -> None:
+                    final.mkdir()
+                    (final / "concurrent-owner").write_text("preserve me")
+                    publication.publish_no_replace(staging, name)
+
+            yield PublicationProxy()
 
     monkeypatch.setattr(
-        runner,
-        "_publish_bound_staging",
-        concurrent_publish,
-        raising=False,
+        runner, "authenticated_publication_directory", race_at_publish
     )
 
     with pytest.raises(
@@ -2220,99 +1545,6 @@ def test_frame_publisher_rejects_symlinked_output_ancestor_without_mutation(
     assert not (actual / "e1a4").exists()
 
 
-def test_frame_publisher_never_binds_retargeted_ancestor_during_acquisition(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import eval.seal_e1a4_sampling_frame as runner
-
-    _patch_frame_trust(runner, tmp_path, monkeypatch)
-    output = tmp_path / "output"
-    parent = output / "e1a4" / "sampling-frame"
-    displaced = tmp_path / "authenticated-output"
-    adversary = tmp_path / "retargeted-output"
-    attack_happened = False
-    publication_class = (
-        runner._WindowsPublicationDirectory
-        if runner.os.name == "nt"
-        else runner._PosixPublicationDirectory
-    )
-    real_init = publication_class.__init__
-    real_lock = runner._publisher_lock
-
-    def swap_then_acquire(self: object, *args: object, **kwargs: object) -> None:
-        nonlocal attack_happened
-        attack_happened = True
-        output.rename(displaced)
-        parent.mkdir(parents=True)
-        real_init(self, *args, **kwargs)
-
-    @contextmanager
-    def restore_after_real_lock(*args: object, **kwargs: object) -> object:
-        try:
-            with real_lock(*args, **kwargs) as publication:
-                yield publication
-        finally:
-            if displaced.exists():
-                output.rename(adversary)
-                displaced.rename(output)
-
-    monkeypatch.setattr(publication_class, "__init__", swap_then_acquire)
-    monkeypatch.setattr(runner, "_publisher_lock", restore_after_real_lock)
-
-    try:
-        sealed = runner.seal_sampling_frame(**_frame_kwargs(tmp_path))
-    except runner.E1A4SamplingFrameError:
-        sealed = None
-
-    leaked = tuple(
-        path.relative_to(adversary).as_posix()
-        for path in adversary.rglob("*")
-        if path.is_file()
-    ) if adversary.exists() else ()
-    assert not leaked
-    assert attack_happened
-    if sealed is not None:
-        assert sealed.slot_count == 96
-
-
-def test_frame_publisher_syncs_directory_hierarchy_before_and_after_rename(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import eval.seal_e1a4_sampling_frame as runner
-
-    _patch_frame_trust(runner, tmp_path, monkeypatch)
-    events: list[tuple[str, str]] = []
-    real_publish = runner._publish_bound_staging
-
-    def record_sync(directory: Path, **_kwargs: object) -> None:
-        events.append(("sync", directory.name))
-
-    def record_publish(publication: object, staged: object) -> None:
-        events.append(("rename", "v1"))
-        real_publish(publication, staged)
-
-    monkeypatch.setattr(runner, "_sync_directory", record_sync, raising=False)
-    monkeypatch.setattr(runner, "_publish_bound_staging", record_publish)
-
-    sealed = runner.seal_sampling_frame(**_frame_kwargs(tmp_path))
-
-    assert sealed.slot_count == 96
-    parent = tmp_path / "output" / "e1a4" / "sampling-frame"
-    staging_name = next(
-        name for event, name in events if event == "sync" and name.startswith(".v1.")
-    )
-    assert events == [
-        ("sync", "sealed"),
-        ("sync", "manifests"),
-        ("sync", staging_name),
-        ("rename", "v1"),
-        ("sync", "sampling-frame"),
-    ]
-    assert (parent / "v1" / "sealed" / runner.SOURCE_REGISTER_NAME).is_file()
-
-
 @pytest.mark.parametrize("failed_sync", ("sealed", "manifests", "staging", "parent"))
 def test_frame_publisher_fails_closed_when_directory_sync_fails(
     tmp_path: Path,
@@ -2323,20 +1555,59 @@ def test_frame_publisher_fails_closed_when_directory_sync_fails(
 
     _patch_frame_trust(runner, tmp_path, monkeypatch)
     calls: list[str] = []
+    real_acquire = runner.authenticated_publication_directory
 
-    def fail_selected(directory: Path, **_kwargs: object) -> None:
-        label = (
-            "staging"
-            if directory.name.startswith(".v1.")
-            else "parent"
-            if directory.name == "sampling-frame"
-            else directory.name
-        )
+    def record_sync(label: str) -> None:
         calls.append(label)
         if label == failed_sync:
             raise OSError("synthetic directory sync failure")
 
-    monkeypatch.setattr(runner, "_sync_directory", fail_selected, raising=False)
+    @contextmanager
+    def fail_sync(**kwargs: object) -> object:
+        with real_acquire(**kwargs) as publication:
+            class StagingProxy:
+                def __init__(self, staging: object) -> None:
+                    self.staging = staging
+
+                def __getattr__(self, name: str) -> object:
+                    return getattr(self.staging, name)
+
+                def sync_directory(self, name: str) -> None:
+                    record_sync(name)
+                    self.staging.sync_directory(name)
+
+                def sync_root(self) -> None:
+                    record_sync("staging")
+                    self.staging.sync_root()
+
+            class PublicationProxy:
+                staging: StagingProxy | None = None
+
+                def __getattr__(self, name: str) -> object:
+                    return getattr(publication, name)
+
+                def create_staging(
+                    self, prefix: str, suffix: str
+                ) -> StagingProxy:
+                    self.staging = StagingProxy(
+                        publication.create_staging(prefix, suffix)
+                    )
+                    return self.staging
+
+                def publish_no_replace(
+                    self, staging: StagingProxy, name: str
+                ) -> None:
+                    publication.publish_no_replace(staging.staging, name)
+
+                def sync_parent(self) -> None:
+                    record_sync("parent")
+                    publication.sync_parent()
+
+            yield PublicationProxy()
+
+    monkeypatch.setattr(
+        runner, "authenticated_publication_directory", fail_sync
+    )
 
     with pytest.raises(
         runner.E1A4SamplingFrameError,

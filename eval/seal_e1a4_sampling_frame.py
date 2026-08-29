@@ -3,17 +3,14 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
 from dataclasses import dataclass
-import errno
 import hashlib
 import json
 import os
 from pathlib import Path
-import secrets
 import stat
 import sys
-from typing import Iterator, Mapping, Sequence
+from typing import Mapping, Sequence
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -32,9 +29,6 @@ from oilfield_chemical_copilot.evaluation.e1a3_sampling import (  # noqa: E402
 from oilfield_chemical_copilot.evaluation.e1a4_mapping_application import (  # noqa: E402
     E1A4MappingApplicationError,
     verify_e1a4_role_mapping,
-)
-from oilfield_chemical_copilot.evaluation import (  # noqa: E402
-    e1a4_mapping_application as _mapping_application,
 )
 from oilfield_chemical_copilot.evaluation.e1a4_sampling import (  # noqa: E402
     E1A4SamplingError,
@@ -55,21 +49,14 @@ from oilfield_chemical_copilot.evaluation.iron_sulfide_supplement_audit import (
     IronSulfideSupplementAuditError,
     IronSulfideSupplementAuditStore,
 )
+from oilfield_chemical_copilot.evaluation.private_artifact_publication import (  # noqa: E402
+    authenticated_publication_directory,
+)
 
 
 SOURCE_REGISTER_NAME = "source-register.v1.json"
 ALLOCATION_NAME = "sampling-allocation.v1.json"
 _PUBLISH_LOCK_NAME = ".v1.publish.lock"
-_EXPECTED_PATHS = frozenset(
-    {
-        "sealed",
-        "manifests",
-        f"sealed/{SOURCE_REGISTER_NAME}",
-        f"sealed/{ALLOCATION_NAME}",
-        f"manifests/{SOURCE_REGISTER_NAME.removesuffix('.json')}.sha256",
-        f"manifests/{ALLOCATION_NAME.removesuffix('.json')}.sha256",
-    }
-)
 _MAPPING_BINDING_FIELDS = frozenset(
     {
         "schema_version",
@@ -246,26 +233,6 @@ def _validate_private_paths(
         raise E1A4SamplingFrameError(
             "E1A4_SAMPLING_FRAME_PRIVATE_ROOT_INVALID"
         ) from error
-
-
-def _reject_unsafe_directory_ancestors(path: Path) -> None:
-    for component in _existing_directory_chain(path):
-        _require_safe_directory_component(component)
-
-
-def _sync_directory(
-    path: Path,
-    *,
-    descriptor: object | None = None,
-    os_api: object | None = None,
-    windows_api: object | None = None,
-) -> None:
-    if descriptor is None:
-        _mapping_application._fsync_directory(path)
-    elif windows_api is not None:
-        windows_api.flush_handle(descriptor)
-    else:
-        (os_api or os).fsync(descriptor)
 
 
 def _presence_paths(args: argparse.Namespace) -> tuple[Path, ...]:
@@ -642,1547 +609,42 @@ def _manifest_name(payload_name: str) -> str:
     return f"{payload_name.removesuffix('.json')}.sha256"
 
 
-def _rename_no_replace_at(
-    directory_descriptor: int, staged_name: str, final_name: str
-) -> None:
-    """Atomically rename within one authenticated POSIX directory handle."""
-    import ctypes
-
-    library = ctypes.CDLL(None, use_errno=True)
-    source = os.fsencode(staged_name)
-    destination = os.fsencode(final_name)
-    if sys.platform.startswith("linux"):
-        rename = getattr(library, "renameat2", None)
-        if rename is None:
-            raise OSError(errno.ENOTSUP, "exclusive relative rename unavailable")
-        rename.argtypes = (
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_uint,
-        )
-        rename.restype = ctypes.c_int
-        result = rename(
-            directory_descriptor,
-            source,
-            directory_descriptor,
-            destination,
-            1,
-        )
-    elif sys.platform == "darwin":
-        rename = getattr(library, "renameatx_np", None)
-        if rename is None:
-            raise OSError(errno.ENOTSUP, "exclusive relative rename unavailable")
-        rename.argtypes = (
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_uint,
-        )
-        rename.restype = ctypes.c_int
-        result = rename(
-            directory_descriptor,
-            source,
-            directory_descriptor,
-            destination,
-            0x00000004,
-        )
-    else:
-        raise OSError(errno.ENOTSUP, "exclusive relative rename unavailable")
-    if result != 0:
-        error_number = ctypes.get_errno()
-        if error_number == errno.EEXIST:
-            raise FileExistsError(error_number, os.strerror(error_number), final_name)
-        raise OSError(error_number, os.strerror(error_number), final_name)
-
-
-@dataclass
-class _BoundStagingDirectory:
-    name: str
-    path: Path
-    root: object
-    sealed: object | None
-    manifests: object | None
-
-
-class _PosixPublicationDirectory:
-    def __init__(
-        self,
-        parent: Path,
-        descriptor: int,
-        *,
-        os_api: object,
-    ) -> None:
-        self.parent = parent
-        self.descriptor = descriptor
-        self.os_api = os_api
-        self._directory_flag = _required_posix_flag(os_api, "O_DIRECTORY")
-        self._nofollow_flag = _required_posix_flag(os_api, "O_NOFOLLOW")
-
-    def _open_directory(self, name: str, *, parent: int) -> int:
-        descriptor = self.os_api.open(
-            name,
-            self.os_api.O_RDONLY
-            | self._directory_flag
-            | self._nofollow_flag
-            | getattr(self.os_api, "O_CLOEXEC", 0),
-            dir_fd=parent,
-        )
-        observed = self.os_api.fstat(descriptor)
-        if not stat.S_ISDIR(observed.st_mode):
-            self.os_api.close(descriptor)
-            raise OSError(errno.ENOTDIR, "unsafe publication directory")
-        return descriptor
-
-    def ensure_no_staging(self) -> None:
-        for name in self.os_api.listdir(self.descriptor):
-            if _is_staging_name(name):
-                raise OSError(errno.EBUSY, "abandoned staging requires manual review")
-
-    def final_exists(self) -> bool:
-        try:
-            observed = self.os_api.stat(
-                "v1", dir_fd=self.descriptor, follow_symlinks=False
-            )
-        except FileNotFoundError:
-            return False
-        if not stat.S_ISDIR(observed.st_mode) or stat.S_ISLNK(observed.st_mode):
-            raise OSError(errno.EPERM, "unsafe final publication")
-        return True
-
-    def create_staging(self) -> _BoundStagingDirectory:
-        name = f".v1.{secrets.token_hex(16)}.tmp"
-        self.os_api.mkdir(name, 0o700, dir_fd=self.descriptor)
-        root: int | None = None
-        sealed: int | None = None
-        manifests: int | None = None
-        try:
-            root = self._open_directory(name, parent=self.descriptor)
-            self.os_api.mkdir("sealed", 0o700, dir_fd=root)
-            sealed = self._open_directory("sealed", parent=root)
-            self.os_api.mkdir("manifests", 0o700, dir_fd=root)
-            manifests = self._open_directory("manifests", parent=root)
-            return _BoundStagingDirectory(
-                name=name,
-                path=self.parent / name,
-                root=root,
-                sealed=sealed,
-                manifests=manifests,
-            )
-        except BaseException:
-            for descriptor in (manifests, sealed, root):
-                if descriptor is not None:
-                    try:
-                        self.os_api.close(descriptor)
-                    except Exception:
-                        pass
-            raise
-
-    def write_file(self, directory: object, name: str, content: bytes) -> None:
-        descriptor = self.os_api.open(
-            name,
-            self.os_api.O_WRONLY
-            | self.os_api.O_CREAT
-            | self.os_api.O_EXCL
-            | self._nofollow_flag
-            | getattr(self.os_api, "O_CLOEXEC", 0),
-            0o600,
-            dir_fd=directory,
-        )
-        try:
-            offset = 0
-            while offset < len(content):
-                written = self.os_api.write(descriptor, content[offset:])
-                if type(written) is not int or written < 1:
-                    raise OSError(errno.EIO, "publication member write failed")
-                offset += written
-            self.os_api.fsync(descriptor)
-        finally:
-            self.os_api.close(descriptor)
-
-    def sync_staging(self, staging: _BoundStagingDirectory) -> None:
-        for path, descriptor in (
-            (staging.path / "sealed", staging.sealed),
-            (staging.path / "manifests", staging.manifests),
-            (staging.path, staging.root),
-        ):
-            _sync_directory(path, descriptor=descriptor, os_api=self.os_api)
-
-    def publish(self, staging: _BoundStagingDirectory) -> None:
-        _rename_no_replace_at(self.descriptor, staging.name, "v1")
-
-    def sync_parent(self) -> None:
-        _sync_directory(
-            self.parent, descriptor=self.descriptor, os_api=self.os_api
-        )
-
-    def close_staging(self, staging: _BoundStagingDirectory) -> None:
-        error: BaseException | None = None
-        for descriptor in (staging.manifests, staging.sealed, staging.root):
-            if descriptor is None:
-                continue
-            try:
-                self.os_api.close(descriptor)
-            except BaseException as close_error:
-                error = error or close_error
-        if error is not None:
-            raise error
-
-
-_WAIT_OBJECT_0 = 0x00000000
-_WAIT_ABANDONED = 0x00000080
-_WAIT_TIMEOUT = 0x00000102
-
-
-@dataclass(frozen=True)
-class _WindowsSecurity:
-    attributes: object
-    descriptor: object
-
-
-class _NativeWindowsMutex:
-    def __init__(self) -> None:
-        import ctypes
-        from ctypes import wintypes
-
-        class SID_AND_ATTRIBUTES(ctypes.Structure):
-            _fields_ = (
-                ("Sid", wintypes.LPVOID),
-                ("Attributes", wintypes.DWORD),
-            )
-
-        class TOKEN_USER(ctypes.Structure):
-            _fields_ = (("User", SID_AND_ATTRIBUTES),)
-
-        class SECURITY_ATTRIBUTES(ctypes.Structure):
-            _fields_ = (
-                ("nLength", wintypes.DWORD),
-                ("lpSecurityDescriptor", wintypes.LPVOID),
-                ("bInheritHandle", wintypes.BOOL),
-            )
-
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
-        kernel32.CreateMutexW.argtypes = (
-            ctypes.POINTER(SECURITY_ATTRIBUTES),
-            wintypes.BOOL,
-            wintypes.LPCWSTR,
-        )
-        kernel32.CreateMutexW.restype = wintypes.HANDLE
-        kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
-        kernel32.WaitForSingleObject.restype = wintypes.DWORD
-        kernel32.ReleaseMutex.argtypes = (wintypes.HANDLE,)
-        kernel32.ReleaseMutex.restype = wintypes.BOOL
-        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
-        kernel32.CloseHandle.restype = wintypes.BOOL
-        kernel32.GetCurrentProcess.argtypes = ()
-        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
-        kernel32.LocalFree.argtypes = (wintypes.HLOCAL,)
-        kernel32.LocalFree.restype = wintypes.HLOCAL
-        advapi32.OpenProcessToken.argtypes = (
-            wintypes.HANDLE,
-            wintypes.DWORD,
-            ctypes.POINTER(wintypes.HANDLE),
-        )
-        advapi32.OpenProcessToken.restype = wintypes.BOOL
-        advapi32.GetTokenInformation.argtypes = (
-            wintypes.HANDLE,
-            wintypes.DWORD,
-            wintypes.LPVOID,
-            wintypes.DWORD,
-            wintypes.LPDWORD,
-        )
-        advapi32.GetTokenInformation.restype = wintypes.BOOL
-        advapi32.ConvertSidToStringSidW.argtypes = (
-            wintypes.LPVOID,
-            ctypes.POINTER(wintypes.LPWSTR),
-        )
-        advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
-        advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = (
-            wintypes.LPCWSTR,
-            wintypes.DWORD,
-            ctypes.POINTER(wintypes.LPVOID),
-            wintypes.LPDWORD,
-        )
-        advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = (
-            wintypes.BOOL
-        )
-        self._ctypes = ctypes
-        self._kernel32 = kernel32
-        self._advapi32 = advapi32
-        self._TOKEN_USER = TOKEN_USER
-        self._SECURITY_ATTRIBUTES = SECURITY_ATTRIBUTES
-
-    def owner_sid(self) -> str:
-        token = self._ctypes.c_void_p()
-        if not self._advapi32.OpenProcessToken(
-            self._kernel32.GetCurrentProcess(),
-            0x0008,
-            self._ctypes.byref(token),
-        ):
-            raise OSError(self._ctypes.get_last_error(), "token unavailable")
-        try:
-            required = self._ctypes.c_ulong()
-            self._advapi32.GetTokenInformation(token, 1, None, 0, required)
-            if required.value == 0:
-                raise OSError(self._ctypes.get_last_error(), "token query failed")
-            buffer = self._ctypes.create_string_buffer(required.value)
-            if not self._advapi32.GetTokenInformation(
-                token,
-                1,
-                self._ctypes.cast(buffer, self._ctypes.c_void_p),
-                required.value,
-                required,
-            ):
-                raise OSError(self._ctypes.get_last_error(), "token query failed")
-            token_user = self._ctypes.cast(
-                buffer,
-                self._ctypes.POINTER(self._TOKEN_USER),
-            ).contents
-            sid_text = self._ctypes.c_wchar_p()
-            if not self._advapi32.ConvertSidToStringSidW(
-                token_user.User.Sid,
-                self._ctypes.byref(sid_text),
-            ):
-                raise OSError(
-                    self._ctypes.get_last_error(),
-                    "SID conversion failed",
-                )
-            try:
-                if sid_text.value is None:
-                    raise OSError(errno.EIO, "SID conversion failed")
-                return sid_text.value
-            finally:
-                if self._kernel32.LocalFree(sid_text):
-                    raise OSError(
-                        self._ctypes.get_last_error(),
-                        "SID free failed",
-                    )
-        finally:
-            if not self._kernel32.CloseHandle(token):
-                raise OSError(self._ctypes.get_last_error(), "token close failed")
-
-    def build_security_attributes(self, policy: str) -> _WindowsSecurity:
-        descriptor = self._ctypes.c_void_p()
-        if not self._advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            policy,
-            1,
-            self._ctypes.byref(descriptor),
-            None,
-        ):
-            raise OSError(
-                self._ctypes.get_last_error(),
-                "security descriptor conversion failed",
-            )
-        attributes = self._SECURITY_ATTRIBUTES(
-            self._ctypes.sizeof(self._SECURITY_ATTRIBUTES),
-            descriptor,
-            False,
-        )
-        return _WindowsSecurity(attributes=attributes, descriptor=descriptor)
-
-    def free_security_descriptor(self, security: _WindowsSecurity) -> None:
-        if self._kernel32.LocalFree(security.descriptor):
-            raise OSError(
-                self._ctypes.get_last_error(),
-                "security descriptor free failed",
-            )
-
-    def create_mutex(self, name: str, attributes: object) -> int:
-        handle = self._kernel32.CreateMutexW(
-            self._ctypes.byref(attributes),
-            False,
-            name,
-        )
-        if not handle:
-            raise OSError(self._ctypes.get_last_error(), "mutex creation failed")
-        return int(handle)
-
-    def wait(self, handle: int, timeout_ms: int) -> int:
-        return int(self._kernel32.WaitForSingleObject(handle, timeout_ms))
-
-    def release_mutex(self, handle: int) -> None:
-        if not self._kernel32.ReleaseMutex(handle):
-            raise OSError(self._ctypes.get_last_error(), "mutex release failed")
-
-    def close_handle(self, handle: int) -> None:
-        if not self._kernel32.CloseHandle(handle):
-            raise OSError(self._ctypes.get_last_error(), "mutex close failed")
-
-
-def _windows_mutex_api() -> _NativeWindowsMutex:
-    return _NativeWindowsMutex()
-
-
-def _windows_mutex_name(parent: Path) -> str:
-    canonical = os.path.normcase(os.path.normpath(str(parent.absolute())))
-    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-    return f"Global\\E1A4SamplingFrame-{digest}"
-
-
-def _windows_mutex_policy(owner_sid: str) -> str:
-    parts = owner_sid.split("-")
-    if len(parts) < 3 or parts[0] != "S" or not all(
-        part.isdecimal() for part in parts[1:]
-    ):
-        raise OSError(errno.EINVAL, "invalid owner SID")
-    # CreateMutexW reopens with full access; grant it only to owner and System.
-    return (
-        f"O:{owner_sid}D:P"
-        f"(A;;0x001F0001;;;{owner_sid})"
-        "(A;;0x001F0001;;;SY)"
-    )
-
-
-class _WindowsPublicationDirectory:
-    def __init__(
-        self,
-        parent: Path,
-        *,
-        descriptor: int,
-        api: object,
-    ) -> None:
-        self.parent = parent
-        self.api = api
-        self._configure_kernel_calls()
-        self.descriptor = descriptor
-        try:
-            self.api._validate_handle(self.descriptor, directory=True)
-        except Exception:
-            self.api.close_handle(self.descriptor)
-            raise
-
-    def _configure_kernel_calls(self) -> None:
-        kernel32 = self.api._kernel32
-        wintypes = self.api._wintypes
-        ctypes = self.api._ctypes
-        kernel32.WriteFile.argtypes = (
-            wintypes.HANDLE,
-            wintypes.LPVOID,
-            wintypes.DWORD,
-            wintypes.LPDWORD,
-            wintypes.LPVOID,
-        )
-        kernel32.WriteFile.restype = wintypes.BOOL
-        kernel32.FlushFileBuffers.argtypes = (wintypes.HANDLE,)
-        kernel32.FlushFileBuffers.restype = wintypes.BOOL
-        kernel32.SetFileInformationByHandle.argtypes = (
-            wintypes.HANDLE,
-            ctypes.c_int,
-            wintypes.LPVOID,
-            wintypes.DWORD,
-        )
-        kernel32.SetFileInformationByHandle.restype = wintypes.BOOL
-        self.api._ntdll.NtSetInformationFile.argtypes = (
-            wintypes.HANDLE,
-            ctypes.POINTER(self.api._IO_STATUS_BLOCK),
-            wintypes.LPVOID,
-            wintypes.ULONG,
-            ctypes.c_int,
-        )
-        self.api._ntdll.NtSetInformationFile.restype = ctypes.c_long
-
-    def _relative_attributes(self, parent: object, name: str) -> tuple[object, ...]:
-        name_buffer = self.api._ctypes.create_unicode_buffer(name)
-        name_length = len(name.encode("utf-16-le"))
-        unicode_name = self.api._UNICODE_STRING(
-            name_length,
-            name_length + 2,
-            self.api._ctypes.cast(name_buffer, self.api._wintypes.LPWSTR),
-        )
-        attributes = self.api._OBJECT_ATTRIBUTES(
-            self.api._ctypes.sizeof(self.api._OBJECT_ATTRIBUTES),
-            parent,
-            self.api._ctypes.pointer(unicode_name),
-            0x00000040,
-            None,
-            None,
-        )
-        return name_buffer, unicode_name, attributes
-
-    def _open_relative(
-        self,
-        parent: object,
-        name: str,
-        *,
-        directory: bool,
-        create: bool,
-    ) -> int:
-        buffers = self._relative_attributes(parent, name)
-        attributes = buffers[2]
-        status_block = self.api._IO_STATUS_BLOCK()
-        handle = self.api._wintypes.HANDLE()
-        status = self.api._ntdll.NtCreateFile(
-            self.api._ctypes.byref(handle),
-            0x001F01FF if directory else 0x0012019F,
-            self.api._ctypes.byref(attributes),
-            self.api._ctypes.byref(status_block),
-            None,
-            0x00000010 if directory else 0x00000080,
-            0x00000007,
-            2 if create else 1,
-            0x00200021 if directory else 0x00200060,
-            None,
-            0,
-        )
-        if status < 0:
-            number = int(self.api._ntdll.RtlNtStatusToDosError(status))
-            raise OSError(number, "relative publication open failed")
-        descriptor = int(handle.value)
-        try:
-            self.api._validate_handle(descriptor, directory=directory)
-        except Exception:
-            self.api.close_handle(descriptor)
-            raise
-        return descriptor
-
-    def ensure_no_staging(self) -> None:
-        for name in self.api.directory_entries(self.descriptor):
-            if _is_staging_name(name):
-                raise OSError(errno.EBUSY, "abandoned staging requires manual review")
-
-    def final_exists(self) -> bool:
-        descriptor: int | None = None
-        try:
-            descriptor = self._open_relative(
-                self.descriptor, "v1", directory=True, create=False
-            )
-        except OSError as error:
-            if getattr(error, "errno", None) in {2, 3}:
-                return False
-            raise
-        finally:
-            if descriptor is not None:
-                self.api.close_handle(descriptor)
-        return True
-
-    def create_staging(self) -> _BoundStagingDirectory:
-        name = f".v1.{secrets.token_hex(16)}.tmp"
-        root: int | None = None
-        sealed: int | None = None
-        manifests: int | None = None
-        try:
-            root = self._open_relative(
-                self.descriptor, name, directory=True, create=True
-            )
-            sealed = self._open_relative(
-                root, "sealed", directory=True, create=True
-            )
-            manifests = self._open_relative(
-                root, "manifests", directory=True, create=True
-            )
-            return _BoundStagingDirectory(
-                name=name,
-                path=self.parent / name,
-                root=root,
-                sealed=sealed,
-                manifests=manifests,
-            )
-        except BaseException:
-            for descriptor in (manifests, sealed, root):
-                if descriptor is not None:
-                    try:
-                        self.api.close_handle(descriptor)
-                    except Exception:
-                        pass
-            raise
-
-    def write_file(self, directory: object, name: str, content: bytes) -> None:
-        descriptor = self._open_relative(
-            directory, name, directory=False, create=True
-        )
-        try:
-            offset = 0
-            while offset < len(content):
-                chunk = content[offset : offset + 65536]
-                buffer = self.api._ctypes.create_string_buffer(chunk)
-                written = self.api._wintypes.DWORD()
-                if not self.api._kernel32.WriteFile(
-                    descriptor,
-                    buffer,
-                    len(chunk),
-                    self.api._ctypes.byref(written),
-                    None,
-                ):
-                    raise OSError(
-                        self.api._ctypes.get_last_error(),
-                        "publication member write failed",
-                    )
-                if written.value < 1:
-                    raise OSError(errno.EIO, "publication member write failed")
-                offset += written.value
-            self.flush_handle(descriptor)
-        finally:
-            self.api.close_handle(descriptor)
-
-    def flush_handle(self, descriptor: object) -> None:
-        if not self.api._kernel32.FlushFileBuffers(descriptor):
-            raise OSError(
-                self.api._ctypes.get_last_error(), "publication sync failed"
-            )
-
-    def sync_staging(self, staging: _BoundStagingDirectory) -> None:
-        for path, descriptor in (
-            (staging.path / "sealed", staging.sealed),
-            (staging.path / "manifests", staging.manifests),
-            (staging.path, staging.root),
-        ):
-            _sync_directory(
-                path,
-                descriptor=descriptor,
-                windows_api=self,
-            )
-
-    def publish(self, staging: _BoundStagingDirectory) -> None:
-        for attribute in ("manifests", "sealed"):
-            descriptor = getattr(staging, attribute)
-            if descriptor is not None:
-                self.api.close_handle(descriptor)
-                setattr(staging, attribute, None)
-
-        class FILE_RENAME_INFORMATION(self.api._ctypes.Structure):
-            _fields_ = (
-                ("ReplaceIfExists", self.api._wintypes.BOOLEAN),
-                ("RootDirectory", self.api._wintypes.HANDLE),
-                ("FileNameLength", self.api._wintypes.DWORD),
-                ("FileName", self.api._wintypes.WCHAR * 1),
-            )
-
-        encoded = "v1".encode("utf-16-le")
-        offset = FILE_RENAME_INFORMATION.FileName.offset
-        buffer = self.api._ctypes.create_string_buffer(offset + len(encoded))
-        information = self.api._ctypes.cast(
-            buffer, self.api._ctypes.POINTER(FILE_RENAME_INFORMATION)
-        ).contents
-        information.ReplaceIfExists = False
-        information.RootDirectory = self.descriptor
-        information.FileNameLength = len(encoded)
-        self.api._ctypes.memmove(
-            self.api._ctypes.addressof(buffer) + offset, encoded, len(encoded)
-        )
-        status_block = self.api._IO_STATUS_BLOCK()
-        status = self.api._ntdll.NtSetInformationFile(
-            staging.root,
-            self.api._ctypes.byref(status_block),
-            buffer,
-            len(buffer),
-            10,
-        )
-        if status < 0:
-            number = int(self.api._ntdll.RtlNtStatusToDosError(status))
-            raise OSError(number, "publication rename failed")
-
-    def sync_parent(self) -> None:
-        _sync_directory(
-            self.parent,
-            descriptor=self.descriptor,
-            windows_api=self,
-        )
-
-    def close_staging(self, staging: _BoundStagingDirectory) -> None:
-        error: BaseException | None = None
-        for descriptor in (staging.manifests, staging.sealed, staging.root):
-            if descriptor is None:
-                continue
-            try:
-                self.api.close_handle(descriptor)
-            except BaseException as close_error:
-                error = error or close_error
-        if error is not None:
-            raise error
-
-    def close(self) -> None:
-        self.api.close_handle(self.descriptor)
-
-
-def _publish_bound_staging(
-    publication: object, staging: _BoundStagingDirectory
-) -> None:
-    publication.publish(staging)
-
-
-def _publication_relative_path(
-    approved_private_root: Path, publication_parent: Path
-) -> tuple[Path, Path]:
-    root = approved_private_root.absolute()
-    parent = publication_parent.absolute()
-    relative = parent.relative_to(root)
-    if any(part in {"", ".", ".."} for part in relative.parts):
-        raise OSError(errno.EPERM, "publication parent is outside private root")
-    return root, relative
-
-
-def _windows_relative_directory_attributes(
-    api: object, parent: object, name: str
-) -> tuple[object, ...]:
-    if not name or name in {".", ".."} or "\\" in name or "/" in name:
-        raise OSError(errno.EINVAL, "unsafe publication path component")
-    name_buffer = api._ctypes.create_unicode_buffer(name)
-    name_length = len(name.encode("utf-16-le"))
-    unicode_name = api._UNICODE_STRING(
-        name_length,
-        name_length + 2,
-        api._ctypes.cast(name_buffer, api._wintypes.LPWSTR),
-    )
-    attributes = api._OBJECT_ATTRIBUTES(
-        api._ctypes.sizeof(api._OBJECT_ATTRIBUTES),
-        parent,
-        api._ctypes.pointer(unicode_name),
-        0x00000040,
-        None,
-        None,
-    )
-    return name_buffer, unicode_name, attributes
-
-
-def _windows_nt_open_directory(
-    api: object,
-    parent: object,
-    name: str,
-    *,
-    create_disposition: int,
-    writable: bool,
-) -> int:
-    buffers = _windows_relative_directory_attributes(api, parent, name)
-    status_block = api._IO_STATUS_BLOCK()
-    handle = api._wintypes.HANDLE()
-    status = api._ntdll.NtCreateFile(
-        api._ctypes.byref(handle),
-        0x001F01FF if writable else 0x00100081,
-        api._ctypes.byref(buffers[2]),
-        api._ctypes.byref(status_block),
-        None,
-        0x00000010,
-        0x00000007,
-        create_disposition,
-        0x00200021,
-        None,
-        0,
-    )
-    if status < 0:
-        number = int(api._ntdll.RtlNtStatusToDosError(status))
-        raise OSError(number, "relative private directory open failed")
-    descriptor = int(handle.value)
-    try:
-        api._validate_handle(descriptor, directory=True)
-    except Exception:
-        api.close_handle(descriptor)
-        raise
-    return descriptor
-
-
-def _windows_open_directory_component(
-    api: object,
-    parent: object,
-    name: str,
-    *,
-    create: bool,
-    writable: bool,
-) -> int:
-    try:
-        return _windows_nt_open_directory(
-            api,
-            parent,
-            name,
-            create_disposition=1,
-            writable=writable,
-        )
-    except OSError as error:
-        if not create or getattr(error, "errno", None) not in {2, 3}:
-            raise
-    try:
-        return _windows_nt_open_directory(
-            api,
-            parent,
-            name,
-            create_disposition=2,
-            writable=writable,
-        )
-    except OSError as error:
-        if getattr(error, "errno", None) not in {80, 183}:
-            raise
-    return _windows_nt_open_directory(
-        api,
-        parent,
-        name,
-        create_disposition=1,
-        writable=writable,
-    )
-
-
-def _acquire_windows_publication_parent(
-    approved_private_root: Path, publication_parent: Path
-) -> tuple[object, int]:
-    root, relative = _publication_relative_path(
-        approved_private_root, publication_parent
-    )
-    if (
-        not root.is_absolute()
-        or not root.drive
-        or root.drive.startswith("\\")
-        or root.anchor.casefold() != f"{root.drive}\\".casefold()
-    ):
-        raise OSError(errno.ENOTSUP, "safe Windows root anchor unavailable")
-    api = _mapping_application._windows_seal_reader_api()
-    anchor = Path(root.anchor)
-    descriptor = api.open_directory(anchor)
-    try:
-        root_components = root.relative_to(anchor).parts
-        if not root_components:
-            raise OSError(errno.EPERM, "private root cannot be a volume root")
-        for index, component in enumerate(root_components):
-            child = _windows_open_directory_component(
-                api,
-                descriptor,
-                component,
-                create=False,
-                writable=index == len(root_components) - 1,
-            )
-            api.close_handle(descriptor)
-            descriptor = child
-        for component in relative.parts:
-            child = _windows_open_directory_component(
-                api,
-                descriptor,
-                component,
-                create=True,
-                writable=True,
-            )
-            api.close_handle(descriptor)
-            descriptor = child
-        return api, descriptor
-    except BaseException:
-        api.close_handle(descriptor)
-        raise
-
-
-@contextmanager
-def _windows_publisher_lock(
-    parent: Path,
-    *,
-    publication: _WindowsPublicationDirectory | None = None,
-) -> Iterator[_WindowsPublicationDirectory]:
-    api = _windows_mutex_api()
-    handle: int | None = None
-    acquired = False
-    try:
-        if publication is None:
-            raise OSError(errno.ENOTSUP, "bound publication handle required")
-        policy = _windows_mutex_policy(api.owner_sid())
-        security = api.build_security_attributes(policy)
-        try:
-            handle = api.create_mutex(
-                _windows_mutex_name(parent),
-                security.attributes,
-            )
-        finally:
-            api.free_security_descriptor(security)
-        outcome = api.wait(handle, 0)
-        if outcome not in {_WAIT_OBJECT_0, _WAIT_ABANDONED}:
-            error_number = errno.EBUSY if outcome == _WAIT_TIMEOUT else errno.EIO
-            raise OSError(error_number, "publisher mutex unavailable")
-        acquired = True
-    except Exception as error:
-        if publication is not None:
-            try:
-                publication.close()
-            except Exception:
-                pass
-        if handle is not None:
-            try:
-                api.close_handle(handle)
-            except Exception:
-                pass
-        raise E1A4SamplingFrameError(
-            "E1A4_SAMPLING_FRAME_WRITE_FAILED"
-        ) from error
-
-    try:
-        assert publication is not None
-        yield publication
-    finally:
-        cleanup_error: Exception | None = None
-        try:
-            assert publication is not None
-            publication.close()
-        except Exception as error:
-            cleanup_error = error
-        if acquired:
-            try:
-                assert handle is not None
-                api.release_mutex(handle)
-            except Exception as error:
-                cleanup_error = error
-        try:
-            assert handle is not None
-            api.close_handle(handle)
-        except Exception as error:
-            cleanup_error = cleanup_error or error
-        if cleanup_error is not None:
-            raise E1A4SamplingFrameError(
-                "E1A4_SAMPLING_FRAME_WRITE_FAILED"
-            ) from cleanup_error
-
-
-def _validate_posix_lock_stat(observed: os.stat_result) -> None:
-    if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
-        raise OSError(errno.EPERM, "unsafe publisher lock")
-
-
-def _required_posix_flag(os_api: object, name: str) -> int:
-    value = getattr(os_api, name, None)
-    if type(value) is not int or value == 0:
-        raise OSError(errno.ENOTSUP, "publisher lock primitive unavailable")
-    return value
-
-
-def _posix_open_directory_component(
-    os_api: object,
-    parent_descriptor: int,
-    component: str,
-    *,
-    create: bool,
-) -> int:
-    if not component or component in {".", ".."} or "/" in component:
-        raise OSError(errno.EINVAL, "unsafe publication path component")
-    flags = (
-        os_api.O_RDONLY
-        | _required_posix_flag(os_api, "O_DIRECTORY")
-        | _required_posix_flag(os_api, "O_NOFOLLOW")
-        | getattr(os_api, "O_CLOEXEC", 0)
-    )
-    try:
-        descriptor = os_api.open(component, flags, dir_fd=parent_descriptor)
-    except FileNotFoundError:
-        if not create:
-            raise
-        try:
-            os_api.mkdir(component, 0o700, dir_fd=parent_descriptor)
-        except FileExistsError:
-            pass
-        else:
-            os_api.fsync(parent_descriptor)
-        descriptor = os_api.open(component, flags, dir_fd=parent_descriptor)
-    observed = os_api.fstat(descriptor)
-    if not stat.S_ISDIR(observed.st_mode):
-        os_api.close(descriptor)
-        raise OSError(errno.ENOTDIR, "unsafe private directory component")
-    return descriptor
-
-
-def _acquire_posix_publication_parent(
-    approved_private_root: Path,
-    publication_parent: Path,
-    *,
-    os_api: object,
-) -> int:
-    root, relative = _publication_relative_path(
-        approved_private_root, publication_parent
-    )
-    if not root.is_absolute() or root.anchor != os.path.sep:
-        raise OSError(errno.ENOTSUP, "safe POSIX root anchor unavailable")
-    flags = (
-        os_api.O_RDONLY
-        | _required_posix_flag(os_api, "O_DIRECTORY")
-        | _required_posix_flag(os_api, "O_NOFOLLOW")
-        | getattr(os_api, "O_CLOEXEC", 0)
-    )
-    descriptor = os_api.open(os.path.sep, flags)
-    try:
-        for component in root.parts[1:]:
-            child = _posix_open_directory_component(
-                os_api, descriptor, component, create=False
-            )
-            os_api.close(descriptor)
-            descriptor = child
-        for component in relative.parts:
-            child = _posix_open_directory_component(
-                os_api, descriptor, component, create=True
-            )
-            os_api.close(descriptor)
-            descriptor = child
-        return descriptor
-    except BaseException:
-        os_api.close(descriptor)
-        raise
-
-
-@contextmanager
-def _posix_publisher_lock(
-    parent: Path,
-    *,
-    os_api: object | None = None,
-    flock_api: object | None = None,
-    parent_descriptor: int | None = None,
-) -> Iterator[_PosixPublicationDirectory]:
-    if os_api is None:
-        os_api = os
-    if flock_api is None:
-        import fcntl
-
-        flock_api = fcntl
-    lock_descriptor: int | None = None
-    acquired = False
-    try:
-        directory_flag = _required_posix_flag(os_api, "O_DIRECTORY")
-        nofollow_flag = _required_posix_flag(os_api, "O_NOFOLLOW")
-        nonblock_flag = _required_posix_flag(os_api, "O_NONBLOCK")
-        if parent_descriptor is None:
-            resolved_parent = parent.resolve(strict=True)
-            initial_parent = os_api.lstat(resolved_parent)
-            if not stat.S_ISDIR(initial_parent.st_mode):
-                raise OSError(errno.ENOTDIR, "unsafe publisher parent")
-            parent_flags = (
-                os_api.O_RDONLY
-                | directory_flag
-                | nofollow_flag
-                | getattr(os_api, "O_CLOEXEC", 0)
-            )
-            parent_descriptor = os_api.open(resolved_parent, parent_flags)
-            opened_parent = os_api.fstat(parent_descriptor)
-            if not stat.S_ISDIR(opened_parent.st_mode) or not os.path.samestat(
-                initial_parent, opened_parent
-            ):
-                raise OSError(errno.EAGAIN, "publisher parent changed")
-        elif not stat.S_ISDIR(os_api.fstat(parent_descriptor).st_mode):
-            raise OSError(errno.ENOTDIR, "unsafe publisher parent")
-
-        lock_flags = (
-            os_api.O_RDWR
-            | nofollow_flag
-            | nonblock_flag
-            | getattr(os_api, "O_CLOEXEC", 0)
-        )
-        try:
-            initial_lock = os_api.stat(
-                _PUBLISH_LOCK_NAME,
-                dir_fd=parent_descriptor,
-                follow_symlinks=False,
-            )
-        except FileNotFoundError:
-            lock_descriptor = os_api.open(
-                _PUBLISH_LOCK_NAME,
-                lock_flags | os_api.O_CREAT | os_api.O_EXCL,
-                0o600,
-                dir_fd=parent_descriptor,
-            )
-        else:
-            _validate_posix_lock_stat(initial_lock)
-            lock_descriptor = os_api.open(
-                _PUBLISH_LOCK_NAME,
-                lock_flags,
-                dir_fd=parent_descriptor,
-            )
-            if not os.path.samestat(
-                initial_lock, os_api.fstat(lock_descriptor)
-            ):
-                raise OSError(errno.EAGAIN, "publisher lock changed")
-
-        opened_lock = os_api.fstat(lock_descriptor)
-        _validate_posix_lock_stat(opened_lock)
-        candidate = os_api.stat(
-            _PUBLISH_LOCK_NAME,
-            dir_fd=parent_descriptor,
-            follow_symlinks=False,
-        )
-        _validate_posix_lock_stat(candidate)
-        if not os.path.samestat(opened_lock, candidate):
-            raise OSError(errno.EAGAIN, "publisher lock changed")
-        flock_api.flock(
-            lock_descriptor,
-            flock_api.LOCK_EX | flock_api.LOCK_NB,
-        )
-        acquired = True
-        final_candidate = os_api.stat(
-            _PUBLISH_LOCK_NAME,
-            dir_fd=parent_descriptor,
-            follow_symlinks=False,
-        )
-        _validate_posix_lock_stat(final_candidate)
-        if not os.path.samestat(opened_lock, final_candidate):
-            raise OSError(errno.EAGAIN, "publisher lock changed")
-    except Exception as error:
-        for descriptor in (lock_descriptor, parent_descriptor):
-            if descriptor is not None:
-                try:
-                    os_api.close(descriptor)
-                except Exception:
-                    pass
-        raise E1A4SamplingFrameError(
-            "E1A4_SAMPLING_FRAME_WRITE_FAILED"
-        ) from error
-
-    try:
-        assert parent_descriptor is not None
-        yield _PosixPublicationDirectory(
-            parent,
-            parent_descriptor,
-            os_api=os_api,
-        )
-    finally:
-        cleanup_error: Exception | None = None
-        if acquired:
-            try:
-                assert lock_descriptor is not None
-                flock_api.flock(lock_descriptor, flock_api.LOCK_UN)
-            except Exception as error:
-                cleanup_error = error
-        for descriptor in (lock_descriptor, parent_descriptor):
-            if descriptor is not None:
-                try:
-                    os_api.close(descriptor)
-                except Exception as error:
-                    cleanup_error = cleanup_error or error
-        if cleanup_error is not None:
-            raise E1A4SamplingFrameError(
-                "E1A4_SAMPLING_FRAME_WRITE_FAILED"
-            ) from cleanup_error
-
-
-@contextmanager
-def _authenticated_windows_publisher_lock(
-    approved_private_root: Path, parent: Path
-) -> Iterator[_WindowsPublicationDirectory]:
-    api: object | None = None
-    descriptor: int | None = None
-    try:
-        api, descriptor = _acquire_windows_publication_parent(
-            approved_private_root, parent
-        )
-        publication = _WindowsPublicationDirectory(
-            parent,
-            descriptor=descriptor,
-            api=api,
-        )
-        descriptor = None
-        with _windows_publisher_lock(parent, publication=publication) as locked:
-            yield locked
-    except E1A4SamplingFrameError:
-        raise
-    except Exception as error:
-        raise E1A4SamplingFrameError(
-            "E1A4_SAMPLING_FRAME_WRITE_FAILED"
-        ) from error
-    finally:
-        if descriptor is not None and api is not None:
-            api.close_handle(descriptor)
-
-
-@contextmanager
-def _authenticated_posix_publisher_lock(
-    approved_private_root: Path, parent: Path
-) -> Iterator[_PosixPublicationDirectory]:
-    descriptor: int | None = None
-    try:
-        descriptor = _acquire_posix_publication_parent(
-            approved_private_root,
-            parent,
-            os_api=os,
-        )
-        acquired_descriptor = descriptor
-        descriptor = None
-        with _posix_publisher_lock(
-            parent,
-            os_api=os,
-            parent_descriptor=acquired_descriptor,
-        ) as publication:
-            yield publication
-    except E1A4SamplingFrameError:
-        raise
-    except Exception as error:
-        raise E1A4SamplingFrameError(
-            "E1A4_SAMPLING_FRAME_WRITE_FAILED"
-        ) from error
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
-
-
-@contextmanager
-def _publisher_lock(
-    parent: Path,
-    *,
-    approved_private_root: Path | None = None,
-) -> Iterator[object]:
-    """Hold an OS-released exclusive lock for the whole publication attempt."""
-    authentication_root = approved_private_root or parent
-    if os.name == "nt":
-        lock = _authenticated_windows_publisher_lock(
-            authentication_root, parent
-        )
-    elif os.name == "posix":
-        lock = _authenticated_posix_publisher_lock(
-            authentication_root, parent
-        )
-    else:
-        raise E1A4SamplingFrameError("E1A4_SAMPLING_FRAME_WRITE_FAILED")
-    with lock as publication:
-        yield publication
-
-
-def _is_staging_name(name: str) -> bool:
-    middle = name.removeprefix(".v1.").removesuffix(".tmp")
-    return name.startswith(".v1.") and name.endswith(".tmp") and bool(middle)
-
-
-def _remove_abandoned_staging(parent: Path) -> None:
-    for candidate in parent.iterdir():
-        if not _is_staging_name(candidate.name):
-            continue
-        raise OSError(errno.EBUSY, "abandoned staging requires manual review")
-
-
-def _read_posix_frame_members(
-    final: Path, *, os_api: object | None = None
+def _sampling_frame_layout() -> dict[str, frozenset[str]]:
+    return {
+        "sealed": frozenset({SOURCE_REGISTER_NAME, ALLOCATION_NAME}),
+        "manifests": frozenset(
+            {
+                _manifest_name(SOURCE_REGISTER_NAME),
+                _manifest_name(ALLOCATION_NAME),
+            }
+        ),
+    }
+
+
+def _read_sampling_frame_members(
+    publication: object, *, require_exists: bool = True
 ) -> dict[str, bytes]:
-    if os_api is None:
-        os_api = os
-    directory_flag = _mapping_application._required_posix_flag(
-        os_api, "O_DIRECTORY"
-    )
-    nofollow_flag = _mapping_application._required_posix_flag(
-        os_api, "O_NOFOLLOW"
-    )
-    nonblock_flag = _mapping_application._required_posix_flag(
-        os_api, "O_NONBLOCK"
-    )
-    root_fd: int | None = None
-    opened: list[int] = []
     try:
-        root_fd = os_api.open(
-            final,
-            os_api.O_RDONLY
-            | directory_flag
-            | nofollow_flag
-            | getattr(os_api, "O_CLOEXEC", 0),
-        )
-        root_before = os_api.fstat(root_fd)
-        if not stat.S_ISDIR(root_before.st_mode):
-            raise OSError(errno.ENOTDIR, "unsafe frame directory")
-        if set(os_api.listdir(root_fd)) != {"sealed", "manifests"}:
-            _fail("E1A4_SAMPLING_FRAME_PARTIAL")
-        captured: dict[str, bytes] = {}
-        for dirname, names in (
-            ("sealed", {SOURCE_REGISTER_NAME, ALLOCATION_NAME}),
-            (
-                "manifests",
-                {
-                    _manifest_name(SOURCE_REGISTER_NAME),
-                    _manifest_name(ALLOCATION_NAME),
-                },
-            ),
-        ):
-            child_fd = os_api.open(
-                dirname,
-                os_api.O_RDONLY
-                | directory_flag
-                | nofollow_flag
-                | getattr(os_api, "O_CLOEXEC", 0),
-                dir_fd=root_fd,
-            )
-            opened.append(child_fd)
-            child_before = os_api.fstat(child_fd)
-            if not stat.S_ISDIR(child_before.st_mode) or set(
-                os_api.listdir(child_fd)
-            ) != names:
-                _fail("E1A4_SAMPLING_FRAME_PARTIAL")
-            for name in sorted(names):
-                member_fd: int | None = None
-                current_fd: int | None = None
-                member_error: BaseException | None = None
-                close_error: BaseException | None = None
-                before = _mapping_application._posix_member_snapshot(
-                    os_api.stat(name, dir_fd=child_fd, follow_symlinks=False)
-                )
-                try:
-                    member_fd = os_api.open(
-                        name,
-                        os_api.O_RDONLY
-                        | nofollow_flag
-                        | nonblock_flag
-                        | getattr(os_api, "O_CLOEXEC", 0),
-                        dir_fd=child_fd,
-                    )
-                    if before != _mapping_application._posix_member_snapshot(
-                        os_api.fstat(member_fd)
-                    ):
-                        raise OSError(errno.EAGAIN, "frame member changed")
-                    captured[f"{dirname}/{name}"] = (
-                        _mapping_application._read_posix_member(
-                            member_fd, os_api=os_api
-                        )
-                    )
-                    if before != _mapping_application._posix_member_snapshot(
-                        os_api.fstat(member_fd)
-                    ):
-                        raise OSError(errno.EAGAIN, "frame member changed")
-                    current_preopen = _mapping_application._posix_member_snapshot(
-                        os_api.stat(
-                            name, dir_fd=child_fd, follow_symlinks=False
-                        )
-                    )
-                    current_fd = os_api.open(
-                        name,
-                        os_api.O_RDONLY
-                        | nofollow_flag
-                        | nonblock_flag
-                        | getattr(os_api, "O_CLOEXEC", 0),
-                        dir_fd=child_fd,
-                    )
-                    current = _mapping_application._posix_member_snapshot(
-                        os_api.fstat(current_fd)
-                    )
-                    if (
-                        before != current_preopen
-                        or before != current
-                    ):
-                        raise OSError(errno.EAGAIN, "frame member changed")
-                except BaseException as error:
-                    member_error = error
-                for descriptor in (current_fd, member_fd):
-                    if descriptor is None:
-                        continue
-                    try:
-                        os_api.close(descriptor)
-                    except BaseException as error:
-                        close_error = close_error or error
-                if member_error is not None:
-                    raise member_error
-                if close_error is not None:
-                    raise close_error
-            if not os.path.samestat(child_before, os_api.fstat(child_fd)):
-                raise OSError(errno.EAGAIN, "frame directory changed")
-            current_child: int | None = None
-            child_error: BaseException | None = None
-            close_error = None
-            try:
-                current_preopen = os_api.stat(
-                    dirname, dir_fd=root_fd, follow_symlinks=False
-                )
-                if not stat.S_ISDIR(current_preopen.st_mode):
-                    raise OSError(errno.ENOTDIR, "frame directory changed")
-                current_child = os_api.open(
-                    dirname,
-                    os_api.O_RDONLY
-                    | directory_flag
-                    | nofollow_flag
-                    | getattr(os_api, "O_CLOEXEC", 0),
-                    dir_fd=root_fd,
-                )
-                if (
-                    not os.path.samestat(child_before, current_preopen)
-                    or not os.path.samestat(
-                        child_before, os_api.fstat(current_child)
-                    )
-                ):
-                    raise OSError(errno.EAGAIN, "frame directory changed")
-            except BaseException as error:
-                child_error = error
-            if current_child is not None:
-                try:
-                    os_api.close(current_child)
-                except BaseException as error:
-                    close_error = error
-            if child_error is not None:
-                raise child_error
-            if close_error is not None:
-                raise close_error
-        if not os.path.samestat(root_before, os_api.fstat(root_fd)):
-            raise OSError(errno.EAGAIN, "frame directory changed")
-        current_root: int | None = None
-        root_error: BaseException | None = None
-        close_error = None
-        try:
-            current_root = os_api.open(
-                final,
-                os_api.O_RDONLY
-                | directory_flag
-                | nofollow_flag
-                | getattr(os_api, "O_CLOEXEC", 0),
-            )
-            if not os.path.samestat(root_before, os_api.fstat(current_root)):
-                raise OSError(errno.EAGAIN, "frame directory changed")
-        except BaseException as error:
-            root_error = error
-        if current_root is not None:
-            try:
-                os_api.close(current_root)
-            except BaseException as error:
-                close_error = error
-        if root_error is not None:
-            raise root_error
-        if close_error is not None:
-            raise close_error
-        return captured
-    finally:
-        close_error: BaseException | None = None
-        for descriptor in reversed(opened):
-            try:
-                os_api.close(descriptor)
-            except BaseException as error:
-                close_error = close_error or error
-        if root_fd is not None:
-            try:
-                os_api.close(root_fd)
-            except BaseException as error:
-                close_error = close_error or error
-        if close_error is not None:
-            raise close_error
+        if require_exists and not publication.final_exists("v1"):
+            _fail("E1A4_SAMPLING_FRAME_MISSING")
+        return publication.read_exact_tree("v1", _sampling_frame_layout())
+    except E1A4SamplingFrameError:
+        raise
+    except Exception as error:
+        raise E1A4SamplingFrameError(
+            "E1A4_SAMPLING_FRAME_VERIFY_FAILED"
+        ) from error
 
 
-def _read_windows_frame_members(final: Path) -> dict[str, bytes]:
-    api = _mapping_application._windows_seal_reader_api()
-    root: object | None = None
-    children: list[object] = []
-    try:
-        root = api.open_directory(final)
-        root_before = api._validate_handle(root, directory=True)
-        if api.directory_entries(root) != {"sealed", "manifests"}:
-            _fail("E1A4_SAMPLING_FRAME_PARTIAL")
-        captured: dict[str, bytes] = {}
-        for dirname, names in (
-            ("sealed", {SOURCE_REGISTER_NAME, ALLOCATION_NAME}),
-            (
-                "manifests",
-                {
-                    _manifest_name(SOURCE_REGISTER_NAME),
-                    _manifest_name(ALLOCATION_NAME),
-                },
-            ),
-        ):
-            child = _open_windows_child_directory(api, root, dirname)
-            children.append(child)
-            child_before = api._validate_handle(child, directory=True)
-            if api.directory_entries(child) != names:
-                _fail("E1A4_SAMPLING_FRAME_PARTIAL")
-            for name in sorted(names):
-                member: object | None = None
-                current: object | None = None
-                member_error: BaseException | None = None
-                try:
-                    member = api.open_member(child, name)
-                    before = api.member_snapshot(member)
-                    content = api.read_member(member)
-                    after = api.member_snapshot(member)
-                    current = api.open_member(child, name)
-                    if before != after or before != api.member_snapshot(current):
-                        raise OSError(errno.EAGAIN, "frame member changed")
-                    captured[f"{dirname}/{name}"] = content
-                except BaseException as error:
-                    member_error = error
-                close_error = _mapping_application._attempt_resource_closes(
-                    (current, member), close=api.close_handle
-                )
-                if member_error is not None:
-                    raise member_error
-                if close_error is not None:
-                    raise close_error
-            if child_before != api._validate_handle(child, directory=True):
-                raise OSError(errno.EAGAIN, "frame directory changed")
-            current_child: object | None = None
-            try:
-                current_child = _open_windows_child_directory(
-                    api, root, dirname
-                )
-                if child_before != api._validate_handle(
-                    current_child, directory=True
-                ):
-                    raise OSError(errno.EAGAIN, "frame directory changed")
-            finally:
-                if current_child is not None:
-                    api.close_handle(current_child)
-        if root_before != api._validate_handle(root, directory=True):
-            raise OSError(errno.EAGAIN, "frame directory changed")
-        current_root: object | None = None
-        try:
-            current_root = api.open_directory(final)
-            if root_before != api._validate_handle(
-                current_root, directory=True
-            ):
-                raise OSError(errno.EAGAIN, "frame directory changed")
-        finally:
-            if current_root is not None:
-                api.close_handle(current_root)
-        return captured
-    finally:
-        close_error: BaseException | None = None
-        for child in reversed(children):
-            try:
-                api.close_handle(child)
-            except BaseException as error:
-                close_error = close_error or error
-        if root is not None:
-            try:
-                api.close_handle(root)
-            except BaseException as error:
-                close_error = close_error or error
-        if close_error is not None:
-            raise close_error
-
-
-def _open_windows_child_directory(
-    api: object, parent: object, name: str
-) -> int:
-    """Open a child directory relative to a verified Windows handle."""
-    name_buffer = api._ctypes.create_unicode_buffer(name)
-    name_length = len(name.encode("utf-16-le"))
-    unicode_name = api._UNICODE_STRING(
-        name_length,
-        name_length + 2,
-        api._ctypes.cast(name_buffer, api._wintypes.LPWSTR),
-    )
-    attributes = api._OBJECT_ATTRIBUTES(
-        api._ctypes.sizeof(api._OBJECT_ATTRIBUTES),
-        parent,
-        api._ctypes.pointer(unicode_name),
-        0x00000040,
-        None,
-        None,
-    )
-    status_block = api._IO_STATUS_BLOCK()
-    handle = api._wintypes.HANDLE()
-    status = api._ntdll.NtCreateFile(
-        api._ctypes.byref(handle),
-        0x00100081,
-        api._ctypes.byref(attributes),
-        api._ctypes.byref(status_block),
-        None,
-        0,
-        0x00000007,
-        1,
-        0x00200021,
-        None,
-        0,
-    )
-    if status < 0:
-        number = int(api._ntdll.RtlNtStatusToDosError(status))
-        raise OSError(number, "frame child directory open failed")
-    return int(handle.value)
-
-
-def _read_frame_members(final: Path) -> dict[str, bytes]:
-    if os.name == "posix":
-        return _read_posix_frame_members(final)
-    if os.name == "nt":
-        return _read_windows_frame_members(final)
-    raise OSError(errno.ENOTSUP, "safe frame reader unavailable")
-
-
-def verify_sampling_frame(
+def _verify_sampling_frame_members(
     *,
     source_register: Mapping[str, object],
     allocation: Mapping[str, object],
-    output_root: Path,
+    members: Mapping[str, bytes],
     expected_source_register_sha256: str | None = None,
     expected_allocation_sha256: str | None = None,
 ) -> E1A4SamplingFrameSeal:
-    final = _frame_directory(output_root)
-    if not final.exists():
-        _fail("E1A4_SAMPLING_FRAME_MISSING")
     try:
-        members = _read_frame_members(final)
         prepared = (
             (SOURCE_REGISTER_NAME, _canonical(source_register)),
             (ALLOCATION_NAME, _canonical(allocation)),
@@ -2199,7 +661,7 @@ def verify_sampling_frame(
             digests.append(digest)
     except E1A4SamplingFrameError:
         raise
-    except (OSError, UnicodeError, ValueError):
+    except (KeyError, TypeError, UnicodeError, ValueError):
         _fail("E1A4_SAMPLING_FRAME_VERIFY_FAILED")
     anchors = (
         expected_source_register_sha256,
@@ -2222,6 +684,40 @@ def verify_sampling_frame(
     )
 
 
+def verify_sampling_frame(
+    *,
+    source_register: Mapping[str, object],
+    allocation: Mapping[str, object],
+    approved_private_root: Path,
+    output_root: Path,
+    expected_source_register_sha256: str | None = None,
+    expected_allocation_sha256: str | None = None,
+) -> E1A4SamplingFrameSeal:
+    try:
+        with authenticated_publication_directory(
+            approved_private_root=approved_private_root,
+            publication_parent=_frame_directory(output_root).parent,
+            lock_name=_PUBLISH_LOCK_NAME,
+        ) as publication:
+            publication.ensure_no_staging(".v1.", ".tmp")
+            members = _read_sampling_frame_members(publication)
+            return _verify_sampling_frame_members(
+                source_register=source_register,
+                allocation=allocation,
+                members=members,
+                expected_source_register_sha256=(
+                    expected_source_register_sha256
+                ),
+                expected_allocation_sha256=expected_allocation_sha256,
+            )
+    except E1A4SamplingFrameError:
+        raise
+    except Exception as error:
+        raise E1A4SamplingFrameError(
+            "E1A4_SAMPLING_FRAME_WRITE_FAILED"
+        ) from error
+
+
 def _publish_sampling_frame(
     *,
     source_register: Mapping[str, object],
@@ -2229,55 +725,41 @@ def _publish_sampling_frame(
     approved_private_root: Path,
     output_root: Path,
 ) -> E1A4SamplingFrameSeal:
-    final = _frame_directory(output_root)
-    parent = final.parent
-    staged: _BoundStagingDirectory | None = None
     try:
-        _reject_unsafe_directory_ancestors(output_root)
-        with _publisher_lock(
-            parent,
+        with authenticated_publication_directory(
             approved_private_root=approved_private_root,
+            publication_parent=_frame_directory(output_root).parent,
+            lock_name=_PUBLISH_LOCK_NAME,
         ) as publication:
-            try:
-                publication.ensure_no_staging()
-                if publication.final_exists():
-                    result = verify_sampling_frame(
-                        source_register=source_register,
-                        allocation=allocation,
-                        output_root=output_root,
+            publication.ensure_no_staging(".v1.", ".tmp")
+            if not publication.final_exists("v1"):
+                staging = publication.create_staging(".v1.", ".tmp")
+                staging.mkdir("sealed")
+                staging.mkdir("manifests")
+                for name, content in (
+                    (SOURCE_REGISTER_NAME, _canonical(source_register)),
+                    (ALLOCATION_NAME, _canonical(allocation)),
+                ):
+                    staging.write_exclusive(f"sealed/{name}", content)
+                    staging.write_exclusive(
+                        f"manifests/{_manifest_name(name)}",
+                        (hashlib.sha256(content).hexdigest() + "\n").encode(
+                            "ascii"
+                        ),
                     )
-                else:
-                    staged = publication.create_staging()
-                    try:
-                        for name, content in (
-                            (SOURCE_REGISTER_NAME, _canonical(source_register)),
-                            (ALLOCATION_NAME, _canonical(allocation)),
-                        ):
-                            publication.write_file(staged.sealed, name, content)
-                            publication.write_file(
-                                staged.manifests,
-                                _manifest_name(name),
-                                (hashlib.sha256(content).hexdigest() + "\n").encode(
-                                    "ascii"
-                                ),
-                            )
-                        publication.sync_staging(staged)
-                        _publish_bound_staging(publication, staged)
-                        publication.sync_parent()
-                    finally:
-                        publication.close_staging(staged)
-                    result = verify_sampling_frame(
-                        source_register=source_register,
-                        allocation=allocation,
-                        output_root=output_root,
-                    )
-            except E1A4SamplingFrameError:
-                raise
-            except Exception as error:
-                raise E1A4SamplingFrameError(
-                    "E1A4_SAMPLING_FRAME_WRITE_FAILED"
-                ) from error
-        return result
+                staging.sync_directory("sealed")
+                staging.sync_directory("manifests")
+                staging.sync_root()
+                publication.publish_no_replace(staging, "v1")
+                publication.sync_parent()
+            members = _read_sampling_frame_members(
+                publication, require_exists=False
+            )
+            return _verify_sampling_frame_members(
+                source_register=source_register,
+                allocation=allocation,
+                members=members,
+            )
     except E1A4SamplingFrameError:
         raise
     except Exception as error:
@@ -2300,20 +782,19 @@ def seal_sampling_frame(**values: object) -> E1A4SamplingFrameSeal:
 def verify_current_sampling_frame(**values: object) -> E1A4SamplingFrameSeal:
     _presence_preflight_values(values)
     output_root = Path(values["output_root"])
-    final = _frame_directory(output_root)
-    if not final.exists():
-        _fail("E1A4_SAMPLING_FRAME_MISSING")
     try:
-        with _publisher_lock(
-            final.parent,
+        with authenticated_publication_directory(
             approved_private_root=Path(values["approved_private_root"]),
-        ):
-            _remove_abandoned_staging(final.parent)
+            publication_parent=_frame_directory(output_root).parent,
+            lock_name=_PUBLISH_LOCK_NAME,
+        ) as publication:
+            publication.ensure_no_staging(".v1.", ".tmp")
             source_register, allocation = _expected_frame(**values)
-            return verify_sampling_frame(
+            members = _read_sampling_frame_members(publication)
+            return _verify_sampling_frame_members(
                 source_register=source_register,
                 allocation=allocation,
-                output_root=output_root,
+                members=members,
                 expected_source_register_sha256=values.get(
                     "expected_source_register_sha256"
                 ),
