@@ -225,6 +225,62 @@ def test_windows_constructor_failure_closes_each_handle_once(
     assert api.closed == [41]
 
 
+def test_windows_reparse_handle_is_rejected_before_publication() -> None:
+    api = object.__new__(publication._NativeWindowsSealReader)
+    api._kernel32 = SimpleNamespace(GetFileType=lambda _handle: 1)
+    api._FILE_ATTRIBUTE_TAG_INFO = lambda: SimpleNamespace(
+        FileAttributes=0x00000410,
+        ReparseTag=0xA000000C,
+    )
+    api._FILE_STANDARD_INFO = lambda: SimpleNamespace(
+        Directory=True,
+        NumberOfLinks=1,
+        EndOfFile=0,
+    )
+    api._FILE_BASIC_INFO = lambda: SimpleNamespace(LastWriteTime=0, ChangeTime=0)
+    api._FILE_ID_INFO = lambda: SimpleNamespace(
+        VolumeSerialNumber=1,
+        FileId=bytes(16),
+    )
+    api._query = lambda *_args, **_kwargs: None
+    api.validate_handle = lambda handle, *, directory: (
+        publication._NativeWindowsSealReader._validate_handle(
+            api, handle, directory=directory
+        )
+    )
+
+    with pytest.raises(OSError, match="unsafe publication object"):
+        publication._WindowsPublicationDirectory.take(
+            publication._WindowsAcquiredHandle(api=api, value=41)
+        )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows reparse traversal")
+def test_windows_native_reparse_component_is_rejected(
+    tmp_path: Path,
+) -> None:
+    approved = tmp_path / "private"
+    actual = tmp_path / "actual"
+    linked = approved / "linked"
+    approved.mkdir()
+    actual.mkdir()
+    try:
+        linked.symlink_to(actual, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"directory symlink unavailable: {error.__class__.__name__}")
+
+    with pytest.raises(
+        publication.PrivateArtifactPublicationError,
+        match="^PRIVATE_ARTIFACT_ACQUISITION_FAILED$",
+    ):
+        with publication.authenticated_publication_directory(
+            approved_private_root=approved,
+            publication_parent=linked / "output",
+            lock_name=".publish.lock",
+        ):
+            pytest.fail("reparse component unexpectedly acquired a capability")
+
+
 def test_posix_creation_is_component_relative_nofollow_and_parent_synced() -> None:
     calls: list[tuple[object, ...]] = []
 
@@ -265,6 +321,110 @@ def test_posix_creation_is_component_relative_nofollow_and_parent_synced() -> No
         ("open", "output", 0x0F, 11),
     ]
     assert calls[4] == ("fstat", 22)
+
+
+def test_posix_parent_close_failure_closes_each_acquired_descriptor_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    close_attempts: list[int] = []
+
+    class PosixOS:
+        O_RDONLY = 0x01
+        O_DIRECTORY = 0x02
+        O_NOFOLLOW = 0x04
+        O_CLOEXEC = 0x08
+
+        @staticmethod
+        def open(_name: str, _flags: int) -> int:
+            return 10
+
+        @staticmethod
+        def close(descriptor: int) -> None:
+            close_attempts.append(descriptor)
+            if descriptor == 10 and close_attempts.count(10) == 1:
+                raise OSError("parent close failed")
+
+    monkeypatch.setattr(
+        publication,
+        "_posix_open_directory_component",
+        lambda *_args, **_kwargs: 11,
+    )
+
+    with pytest.raises(OSError, match="parent close failed"):
+        publication._acquire_posix_publication_parent(
+            Path("C:/private"), (), os_api=PosixOS()
+        )
+
+    assert close_attempts == [10, 11]
+
+
+class _SyntheticPublication(publication.AuthenticatedPublicationDirectory):
+    def __init__(self, created_handle: int) -> None:
+        super().__init__(10)
+        self.created_handle = created_handle
+        self.closed: list[object] = []
+
+    def _create_directory(self, _parent: object, _name: str) -> object:
+        return self.created_handle
+
+    def _close_handle(self, descriptor: object) -> None:
+        self.closed.append(descriptor)
+
+
+def test_staging_constructor_failure_closes_new_root_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bound = _SyntheticPublication(51)
+    monkeypatch.setattr(
+        publication,
+        "BoundStagingDirectory",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("constructor failed")
+        ),
+    )
+
+    with pytest.raises(
+        publication.PrivateArtifactPublicationError,
+        match="^PRIVATE_ARTIFACT_OPERATION_FAILED$",
+    ):
+        bound.create_staging(".v1.", ".tmp")
+
+    assert bound.closed == [51]
+
+
+def test_staging_append_failure_closes_accepted_root_once() -> None:
+    class FailingAppend(list[object]):
+        def append(self, _item: object) -> None:
+            raise RuntimeError("append failed")
+
+    bound = _SyntheticPublication(52)
+    bound._staging = FailingAppend()
+
+    with pytest.raises(
+        publication.PrivateArtifactPublicationError,
+        match="^PRIVATE_ARTIFACT_OPERATION_FAILED$",
+    ):
+        bound.create_staging(".v1.", ".tmp")
+
+    assert bound.closed == [52]
+
+
+def test_staging_directory_insertion_failure_closes_new_child_once() -> None:
+    class FailingInsertion(dict[tuple[str, ...], object]):
+        def __setitem__(self, _key: tuple[str, ...], _value: object) -> None:
+            raise RuntimeError("insertion failed")
+
+    bound = _SyntheticPublication(53)
+    staging = publication.BoundStagingDirectory(bound, ".v1.synthetic.tmp", 50)
+    staging._directories = FailingInsertion({(): 50})
+
+    with pytest.raises(
+        publication.PrivateArtifactPublicationError,
+        match="^PRIVATE_ARTIFACT_OPERATION_FAILED$",
+    ):
+        staging.mkdir("sealed")
+
+    assert bound.closed == [53]
 
 
 def test_capability_preserves_residue_and_never_deletes_untrusted_entries(

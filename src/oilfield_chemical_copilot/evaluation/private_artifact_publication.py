@@ -170,14 +170,16 @@ def _acquire_posix_publication_parent(
             child = _posix_open_directory_component(
                 os_api, descriptor, component, create=False
             )
-            os_api.close(descriptor)
+            parent = descriptor
             descriptor = child
+            os_api.close(parent)
         for component in relative:
             child = _posix_open_directory_component(
                 os_api, descriptor, component, create=True
             )
-            os_api.close(descriptor)
+            parent = descriptor
             descriptor = child
+            os_api.close(parent)
         return _PosixAcquiredHandle(os_api=os_api, value=descriptor)
     except BaseException:
         os_api.close(descriptor)
@@ -928,9 +930,12 @@ class BoundStagingDirectory:
             parent = self._directories.get(parts[:-1])
             if parent is None or parts in self._directories:
                 raise OSError(errno.ENOENT, "staging parent unavailable")
-            self._directories[parts] = self._owner._create_directory(
-                parent, parts[-1]
-            )
+            child = self._owner._create_directory(parent, parts[-1])
+            try:
+                self._directories[parts] = child
+            except BaseException:
+                self._owner._close_handle(child)
+                raise
         except PrivateArtifactPublicationError:
             raise
         except BaseException as error:
@@ -1087,10 +1092,17 @@ class AuthenticatedPublicationDirectory:
             if type(prefix) is not str or type(suffix) is not str or not prefix or not suffix:
                 raise ValueError("invalid staging markers")
             name = _component(f"{prefix}{secrets.token_hex(16)}{suffix}")
-            staging = BoundStagingDirectory(
-                self, name, self._create_directory(self._descriptor, name)
-            )
-            self._staging.append(staging)
+            root = self._create_directory(self._descriptor, name)
+            try:
+                staging = BoundStagingDirectory(self, name, root)
+            except BaseException:
+                self._close_handle(root)
+                raise
+            try:
+                self._staging.append(staging)
+            except BaseException:
+                staging._close()
+                raise
             return staging
         except PrivateArtifactPublicationError:
             raise
