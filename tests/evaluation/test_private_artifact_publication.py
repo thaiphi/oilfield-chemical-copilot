@@ -331,21 +331,29 @@ def test_posix_member_read_is_nonblocking_and_rejects_fifo_before_read() -> None
         O_NOFOLLOW = 0x02
         O_NONBLOCK = 0x04
         O_CLOEXEC = 0x08
+        O_DIRECTORY = 0x10
 
         @staticmethod
         def open(
             name: str, flags: int, *, dir_fd: int
         ) -> int:
             events.append(("open", name, flags, dir_fd))
-            return 42
+            return {"v1": 20, "sealed": 21, "payload.bin": 42}[name]
 
         @staticmethod
         def fstat(descriptor: int) -> object:
             events.append(("fstat", descriptor))
+            if descriptor in {20, 21}:
+                return SimpleNamespace(st_mode=stat.S_IFDIR | 0o700)
             return SimpleNamespace(
                 st_mode=stat.S_IFIFO | 0o600,
                 st_nlink=1,
             )
+
+        @staticmethod
+        def listdir(descriptor: int) -> list[str]:
+            events.append(("listdir", descriptor))
+            return {20: ["sealed"], 21: ["payload.bin"]}[descriptor]
 
         @staticmethod
         def stat(
@@ -365,14 +373,34 @@ def test_posix_member_read_is_nonblocking_and_rejects_fifo_before_read() -> None
 
     bound = publication._PosixPublicationDirectory(10, os_api=PosixOS())
 
-    with pytest.raises(OSError, match="unsafe artifact member"):
-        bound._read_member(11, "payload.bin")
+    with pytest.raises(
+        publication.PrivateArtifactPublicationError,
+        match="^PRIVATE_ARTIFACT_TREE_INVALID$",
+    ):
+        bound.read_exact_tree(
+            "v1", {"sealed": frozenset({"payload.bin"})}
+        )
 
-    assert events == [
-        ("open", "payload.bin", 0x0F, 11),
+    member_events = [
+        event
+        for event in events
+        if event[0] in {"read", "stat"}
+        or event[:2] in {
+            ("open", "payload.bin"),
+            ("fstat", 42),
+            ("close", 42),
+        }
+    ]
+    assert member_events == [
+        ("open", "payload.bin", 0x0F, 21),
         ("fstat", 42),
-        ("stat", "payload.bin", 11, False),
+        ("stat", "payload.bin", 21, False),
         ("close", 42),
+    ]
+    assert [event for event in events if event[0] == "close"] == [
+        ("close", 42),
+        ("close", 21),
+        ("close", 20),
     ]
 
 
@@ -409,7 +437,7 @@ def test_posix_native_fifo_member_is_rejected_without_blocking(
     ) as bound:
         with pytest.raises(
             publication.PrivateArtifactPublicationError,
-            match="^PRIVATE_ARTIFACT_OPERATION_FAILED$",
+            match="^PRIVATE_ARTIFACT_TREE_INVALID$",
         ):
             bound.read_exact_tree(
                 "v1", {"sealed": frozenset({"payload.bin"})}
