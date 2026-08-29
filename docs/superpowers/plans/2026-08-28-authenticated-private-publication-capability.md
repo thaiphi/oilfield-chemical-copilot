@@ -317,7 +317,7 @@ git add docs/superpowers/plans/2026-08-28-authenticated-private-publication-capa
 git commit -m "docs: close authenticated publication correction"
 ```
 
-- [ ] **Step 5: Push and request Codex PR re-review**
+- [x] **Step 5: Push and request Codex PR re-review**
 
 Push the verified commits to `codex/corpus-reconciliation-review`, reply in each open PR #2 review thread with commit-specific evidence, and request `@codex review` on the exact head. Merge only when GitGuardian succeeds, Codex completes without unresolved findings, the PR is mergeable, and the user-approved integration sequence remains in force.
 
@@ -332,4 +332,5 @@ This plan authorizes synthetic code/test work and aggregate-only documentation o
 - Tracked private paths: zero.
 - Scoped independent review: APPROVE with no Critical or Important findings; one non-runtime unused-declaration Minor deferred.
 - First PR re-review found one post-read exact-layout race; the bounded correction and deterministic regression received independent APPROVE with no findings.
+- Focused Codex re-review of the corrected code head completed with no major issues; GitGuardian succeeded and the PR remained mergeable.
 - Artifact contracts and evaluation/retrieval/ingestion behavior: unchanged.
