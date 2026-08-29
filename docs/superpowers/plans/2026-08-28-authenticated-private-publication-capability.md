@@ -49,7 +49,7 @@
 - Produces: `AuthenticatedPublicationDirectory.sync_parent() -> None`
 - Produces: `authenticated_publication_directory(*, approved_private_root: Path, publication_parent: Path, lock_name: str) -> ContextManager[AuthenticatedPublicationDirectory]`
 
-- [ ] **Step 1: Write direct capability RED tests**
+- [x] **Step 1: Write direct capability RED tests**
 
 Add literal-behavior tests that prove:
 
@@ -66,7 +66,7 @@ def test_capability_fails_closed_without_safe_relative_rename(...): ...
 
 The acquisition-race fixture must invoke the real platform constructor seam, swap the requested output ancestor before the old pathname open would occur, and assert that no synthetic secret bytes appear in the replacement. The read test must make a pathname replacement after capability acquisition and prove the capability either reads the authenticated tree or fails closed; it must never accept the replacement.
 
-- [ ] **Step 2: Run Task 1 tests and verify RED**
+- [x] **Step 2: Run Task 1 tests and verify RED**
 
 Run:
 
@@ -76,7 +76,7 @@ uv run pytest -q tests/evaluation/test_private_artifact_publication.py
 
 Expected: collection/import failure because the shared module and interfaces do not exist. After test scaffolding imports, each behavioral test must fail for its named missing behavior, not from an invalid fixture.
 
-- [ ] **Step 3: Implement the minimal shared capability**
+- [x] **Step 3: Implement the minimal shared capability**
 
 Implement the interface above by extracting and consolidating the already reviewed platform primitives from the frame runner. The module must keep platform-specific internals private. Use this ownership rule:
 
@@ -95,7 +95,7 @@ POSIX acquisition opens the filesystem root once and walks relative components w
 
 Do not expose raw paths in exception strings. `PrivateArtifactPublicationError` contains fixed internal codes that consumers translate to their existing public-safe codes.
 
-- [ ] **Step 4: Run Task 1 GREEN verification**
+- [x] **Step 4: Run Task 1 GREEN verification**
 
 Run:
 
@@ -107,7 +107,7 @@ git diff --check
 
 Expected: all Task 1 tests pass; Ruff and diff checks are clean.
 
-- [ ] **Step 5: Commit Task 1**
+- [x] **Step 5: Commit Task 1**
 
 ```powershell
 git add src/oilfield_chemical_copilot/evaluation/private_artifact_publication.py tests/evaluation/test_private_artifact_publication.py
