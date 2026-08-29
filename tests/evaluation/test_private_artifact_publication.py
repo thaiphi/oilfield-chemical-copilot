@@ -420,6 +420,66 @@ def test_posix_member_read_fails_closed_without_nonblocking_flag() -> None:
         bound._read_member(11, "payload.bin")
 
 
+@pytest.mark.parametrize("mutated_directory", [20, 30])
+def test_exact_tree_rejects_membership_added_after_initial_enumeration(
+    mutated_directory: int,
+) -> None:
+    """Catch removal of the post-read layout check for root or child directories."""
+
+    class MembershipMutationPublication(publication.AuthenticatedPublicationDirectory):
+        def __init__(self) -> None:
+            super().__init__(10)
+            self.mutated = False
+
+        def _open_directory(self, parent: object, name: str) -> object:
+            return {(10, "v1"): 20, (20, "sealed"): 30}[parent, name]
+
+        def _list(self, directory: object) -> set[str]:
+            expected = {20: {"sealed"}, 30: {"payload.bin"}}[directory]
+            if self.mutated and directory == mutated_directory:
+                return expected | {"unexpected"}
+            return expected
+
+        def _read_member(self, _parent: object, _name: str) -> bytes:
+            self.mutated = True
+            return b"authenticated"
+
+        def _create_directory(self, _parent: object, _name: str) -> object:
+            raise AssertionError("tree reader must not create directories")
+
+        def _write_exclusive(
+            self, _parent: object, _name: str, _content: bytes
+        ) -> None:
+            raise AssertionError("tree reader must not write members")
+
+        def _sync(self, _descriptor: object) -> None:
+            raise AssertionError("tree reader must not synchronize")
+
+        def _close_handle(self, _descriptor: object) -> None:
+            pass
+
+        def _acquire_lock(self, _lock_name: str) -> object:
+            raise AssertionError("tree reader must not acquire locks")
+
+        def _release_lock(self, _lock: object) -> None:
+            raise AssertionError("tree reader must not release locks")
+
+        def _rename_no_replace(
+            self, _staging: publication.BoundStagingDirectory, _final_name: str
+        ) -> None:
+            raise AssertionError("tree reader must not rename artifacts")
+
+    bound = MembershipMutationPublication()
+
+    with pytest.raises(
+        publication.PrivateArtifactPublicationError,
+        match="^PRIVATE_ARTIFACT_TREE_INVALID$",
+    ):
+        bound.read_exact_tree(
+            "v1", {"sealed": frozenset({"payload.bin"})}
+        )
+
+
 @pytest.mark.skipif(os.name != "posix", reason="requires native POSIX FIFO")
 def test_posix_native_fifo_member_is_rejected_without_blocking(
     tmp_path: Path,

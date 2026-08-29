@@ -632,9 +632,14 @@ class _NativeWindowsSealReader:
 
     def directory_entries(self, handle: object) -> set[str]:
         names: set[str] = set()
+        restart = True
         while True:
             buffer = self._ctypes.create_string_buffer(65536)
-            if not self._kernel32.GetFileInformationByHandleEx(handle, 10, buffer, len(buffer)):
+            information_class = 11 if restart else 10
+            restart = False
+            if not self._kernel32.GetFileInformationByHandleEx(
+                handle, information_class, buffer, len(buffer)
+            ):
                 number = self._ctypes.get_last_error()
                 if number == 18:
                     return names
@@ -1132,7 +1137,7 @@ class AuthenticatedPublicationDirectory:
         self, final_name: str, layout: ArtifactLayout
     ) -> dict[str, bytes]:
         final: object | None = None
-        children: list[object] = []
+        children: list[tuple[object, frozenset[str]]] = []
         cleanup_error: BaseException | None = None
         try:
             final = self._open_directory(self._descriptor, _component(final_name))
@@ -1148,13 +1153,18 @@ class AuthenticatedPublicationDirectory:
             result: dict[str, bytes] = {}
             for directory_name, member_names in normalized.items():
                 child = self._open_directory(final, directory_name)
-                children.append(child)
+                children.append((child, member_names))
                 if self._list(child) != set(member_names):
                     raise OSError(errno.EINVAL, "artifact member layout mismatch")
                 for member_name in member_names:
                     result[f"{directory_name}/{member_name}"] = self._read_member(
                         child, member_name
                     )
+            if self._list(final) != set(normalized):
+                raise OSError(errno.EINVAL, "artifact root layout changed")
+            for child, member_names in children:
+                if self._list(child) != set(member_names):
+                    raise OSError(errno.EINVAL, "artifact member layout changed")
             return result
         except PrivateArtifactPublicationError:
             raise
@@ -1162,7 +1172,7 @@ class AuthenticatedPublicationDirectory:
             raise _publication_error(_TREE_INVALID, error)
         finally:
             active_error = sys.exc_info()[0] is not None
-            for handle in reversed(children):
+            for handle, _member_names in reversed(children):
                 try:
                     self._close_handle(handle)
                 except BaseException as error:
