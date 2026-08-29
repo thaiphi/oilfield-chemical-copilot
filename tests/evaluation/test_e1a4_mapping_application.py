@@ -551,21 +551,23 @@ def test_mapping_publisher_never_writes_through_retargeted_ancestor(
     mapping["sources"][0]["locators"] = ["synthetic-private-locator"]  # type: ignore[index]
     capability_called = False
     capability_yielded = False
-    retarget_attempted = False
+    retarget_succeeded = False
+    retarget_denied: OSError | None = None
 
     @contextmanager
     def retarget_after_public_acquisition(**kwargs: object) -> object:
-        nonlocal capability_called, capability_yielded, retarget_attempted
+        nonlocal capability_called, capability_yielded
+        nonlocal retarget_succeeded, retarget_denied
         capability_called = True
         with authenticated_publication_directory(**kwargs) as publication:  # type: ignore[arg-type]
             capability_yielded = True
-            retarget_attempted = True
             try:
                 output.rename(displaced)
-            except OSError:
-                pass
+            except OSError as error:
+                retarget_denied = error
             else:
                 output.mkdir()
+                retarget_succeeded = True
             yield publication
 
     monkeypatch.setattr(
@@ -585,23 +587,26 @@ def test_mapping_publisher_never_writes_through_retargeted_ancestor(
         except module.E1A4MappingApplicationError:
             pass
     finally:
-        if output.exists() and displaced.exists():
-            output.rename(replacement)
+        if displaced.exists():
+            if output.exists():
+                output.rename(replacement)
             displaced.rename(output)
 
-    leaked = (
-        tuple(
-            candidate
-            for candidate in replacement.rglob("*")
-            if candidate.is_file()
-            and b"synthetic-private-locator" in candidate.read_bytes()
-        )
-        if replacement.exists()
-        else ()
-    )
     assert capability_called
     assert capability_yielded
-    assert retarget_attempted
+    if retarget_denied is not None:
+        pytest.skip(
+            "native ancestor retarget denied while authenticated capability held: "
+            f"{retarget_denied.__class__.__name__}"
+        )
+    assert retarget_succeeded
+    assert replacement.exists()
+    leaked = tuple(
+        candidate
+        for candidate in replacement.rglob("*")
+        if candidate.is_file()
+        and b"synthetic-private-locator" in candidate.read_bytes()
+    )
     assert not leaked
 
 
