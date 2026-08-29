@@ -2228,6 +2228,8 @@ def _mapping_runner_args(
         str(chain.allocation_manifest_path),
         "--e1a3-private-root",
         str(chain.private_root),
+        "--approved-private-root",
+        str(chain.private_root),
         "--output-root",
         str(chain.output_root),
     ]
@@ -2236,6 +2238,153 @@ def _mapping_runner_args(
             ["--expected-mapping-binding-sha256", mapping_binding]
         )
     return arguments
+
+
+def _replace_cli_path(
+    arguments: list[str], option: str, value: Path
+) -> list[str]:
+    replaced = list(arguments)
+    replaced[replaced.index(option) + 1] = str(value)
+    return replaced
+
+
+@pytest.mark.parametrize("escape", ("public", "sibling-prefix"))
+def test_mapping_cli_rejects_output_outside_approved_private_root_before_inputs_open(
+    trust_chain: _TrustChain,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    escape: str,
+) -> None:
+    import eval.apply_e1a4_role_corrections as runner
+
+    output = (
+        tmp_path / "public-output"
+        if escape == "public"
+        else trust_chain.private_root.with_name(
+            trust_chain.private_root.name + "-sibling"
+        )
+    )
+    arguments = _replace_cli_path(
+        _mapping_runner_args(trust_chain, "apply"), "--output-root", output
+    )
+    monkeypatch.setattr(
+        runner.ReconciliationStore,
+        "open",
+        classmethod(
+            lambda _cls, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("input opened before private boundary validation")
+            )
+        ),
+    )
+
+    assert runner.cli(arguments) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert json.loads(captured.err) == {
+        "status": "E1A4_ROLE_MAPPING_BLOCKED",
+        "error_code": "E1A4_ROLE_MAPPING_PRIVATE_ROOT_INVALID",
+    }
+    assert str(output) not in captured.err
+
+
+def test_mapping_cli_rejects_symlinked_output_ancestor_before_inputs_open(
+    trust_chain: _TrustChain,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import eval.apply_e1a4_role_corrections as runner
+
+    target = trust_chain.private_root / "real-output"
+    target.mkdir()
+    linked = trust_chain.private_root / "linked-output"
+    try:
+        linked.symlink_to(target, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"symlink creation unavailable: {error.__class__.__name__}")
+    arguments = _replace_cli_path(
+        _mapping_runner_args(trust_chain, "apply"), "--output-root", linked
+    )
+    monkeypatch.setattr(
+        runner.ReconciliationStore,
+        "open",
+        classmethod(
+            lambda _cls, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("input opened before private boundary validation")
+            )
+        ),
+    )
+
+    assert runner.cli(arguments) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert json.loads(captured.err) == {
+        "status": "E1A4_ROLE_MAPPING_BLOCKED",
+        "error_code": "E1A4_ROLE_MAPPING_PRIVATE_ROOT_INVALID",
+    }
+
+
+def test_mapping_cli_rejects_public_worktree_as_approved_private_root(
+    trust_chain: _TrustChain,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import eval.apply_e1a4_role_corrections as runner
+
+    arguments = _replace_cli_path(
+        _mapping_runner_args(trust_chain, "apply"),
+        "--approved-private-root",
+        runner.PROJECT_ROOT,
+    )
+    arguments = _replace_cli_path(
+        arguments, "--output-root", runner.PROJECT_ROOT / "public-output"
+    )
+    monkeypatch.setattr(
+        runner.ReconciliationStore,
+        "open",
+        classmethod(
+            lambda _cls, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("input opened before private boundary validation")
+            )
+        ),
+    )
+
+    assert runner.cli(arguments) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert json.loads(captured.err) == {
+        "status": "E1A4_ROLE_MAPPING_BLOCKED",
+        "error_code": "E1A4_ROLE_MAPPING_PRIVATE_ROOT_INVALID",
+    }
+
+
+def test_mapping_private_boundary_rejects_windows_reparse_ancestor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import eval.apply_e1a4_role_corrections as runner
+
+    approved = tmp_path / "approved"
+    reparse = approved / "junction"
+    reparse.mkdir(parents=True)
+    real_lstat = Path.lstat
+
+    def mark_reparse(path: Path) -> object:
+        observed = real_lstat(path)
+        if path == reparse:
+            return SimpleNamespace(
+                st_mode=observed.st_mode,
+                st_file_attributes=0x400,
+            )
+        return observed
+
+    monkeypatch.setattr(Path, "lstat", mark_reparse)
+
+    with pytest.raises(
+        runner.E1A4MappingApplicationError,
+        match="^E1A4_ROLE_MAPPING_PRIVATE_ROOT_INVALID$",
+    ):
+        runner._validate_private_outputs(approved, (reparse / "output",))
 
 
 def test_mapping_cli_apply_and_verify_emit_exact_aggregate_json(

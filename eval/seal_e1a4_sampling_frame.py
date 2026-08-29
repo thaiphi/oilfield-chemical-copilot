@@ -90,6 +90,7 @@ _MAPPING_BINDING_FIELDS = frozenset(
 _SAFE_CODES = frozenset(
     {
         "E1A4_SAMPLING_FRAME_ARGUMENT_INVALID",
+        "E1A4_SAMPLING_FRAME_PRIVATE_ROOT_INVALID",
         "E1A4_SAMPLING_FRAME_PREFLIGHT_FAILED",
         "E1A4_SAMPLING_FRAME_MAPPING_UNTRUSTED",
         "E1A4_SAMPLING_FRAME_MAPPING_INVALID",
@@ -175,12 +176,99 @@ def _parser() -> argparse.ArgumentParser:
         "--e1a3-allocation-manifest-path", type=Path, required=True
     )
     parser.add_argument("--e1a3-private-root", type=Path, required=True)
+    parser.add_argument("--approved-private-root", type=Path, required=True)
     parser.add_argument("--database-url", required=True)
     parser.add_argument("--index-contract", dest="index_contract_path", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--expected-source-register-sha256")
     parser.add_argument("--expected-allocation-sha256")
     return parser
+
+
+def _is_reparse_point(observed: os.stat_result) -> bool:
+    attributes = getattr(observed, "st_file_attributes", 0)
+    return bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+
+
+def _require_safe_directory_component(path: Path) -> None:
+    observed = path.lstat()
+    if (
+        not stat.S_ISDIR(observed.st_mode)
+        or stat.S_ISLNK(observed.st_mode)
+        or _is_reparse_point(observed)
+    ):
+        raise OSError("unsafe private directory component")
+
+
+def _existing_directory_chain(path: Path) -> tuple[Path, ...]:
+    absolute = path.absolute()
+    lineage = tuple(reversed((absolute, *absolute.parents)))
+    existing: list[Path] = []
+    for component in lineage:
+        try:
+            component.lstat()
+        except FileNotFoundError:
+            break
+        existing.append(component)
+    return tuple(existing)
+
+
+def _repository_root(path: Path) -> Path | None:
+    for candidate in (path, *path.parents):
+        try:
+            (candidate / ".git").lstat()
+        except FileNotFoundError:
+            continue
+        return candidate
+    return None
+
+
+def _validate_private_paths(
+    approved_private_root: Path, paths: Sequence[Path]
+) -> None:
+    try:
+        raw_root = approved_private_root.absolute()
+        for component in _existing_directory_chain(raw_root):
+            _require_safe_directory_component(component)
+        root = raw_root.resolve(strict=True)
+        repository = _repository_root(root)
+        if repository is not None:
+            relative = root.relative_to(repository)
+            if not relative.parts or relative.parts[0] != ".private":
+                raise OSError("public worktree cannot be a private root")
+        for path in paths:
+            raw_path = path.absolute()
+            raw_path.relative_to(raw_root)
+            raw_path.resolve(strict=False).relative_to(root)
+            for component in _existing_directory_chain(raw_path):
+                _require_safe_directory_component(component)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise E1A4SamplingFrameError(
+            "E1A4_SAMPLING_FRAME_PRIVATE_ROOT_INVALID"
+        ) from error
+
+
+def _reject_unsafe_directory_ancestors(path: Path) -> None:
+    for component in _existing_directory_chain(path):
+        _require_safe_directory_component(component)
+
+
+def _directory_identity(path: Path) -> os.stat_result:
+    _reject_unsafe_directory_ancestors(path)
+    observed = path.lstat()
+    _require_safe_directory_component(path)
+    return observed
+
+
+def _require_directory_identity(path: Path, identity: os.stat_result) -> None:
+    _reject_unsafe_directory_ancestors(path)
+    current = path.lstat()
+    if not os.path.samestat(identity, current):
+        raise OSError(errno.EAGAIN, "publication directory changed")
+
+
+def _sync_directory(path: Path) -> None:
+    _mapping_application._fsync_directory(path)
 
 
 def _presence_paths(args: argparse.Namespace) -> tuple[Path, ...]:
@@ -1414,10 +1502,14 @@ def _publish_sampling_frame(
     parent = final.parent
     staged: Path | None = None
     try:
+        _reject_unsafe_directory_ancestors(output_root)
         parent.mkdir(parents=True, exist_ok=True)
+        parent_identity = _directory_identity(parent)
         with _publisher_lock(parent):
             try:
+                _require_directory_identity(parent, parent_identity)
                 _remove_abandoned_staging(parent)
+                _require_directory_identity(parent, parent_identity)
                 if final.exists():
                     result = verify_sampling_frame(
                         source_register=source_register,
@@ -1425,9 +1517,11 @@ def _publish_sampling_frame(
                         output_root=output_root,
                     )
                 else:
+                    _require_directory_identity(parent, parent_identity)
                     staged = Path(
                         mkdtemp(prefix=".v1.", suffix=".tmp", dir=parent)
                     )
+                    _require_directory_identity(parent, parent_identity)
                     (staged / "sealed").mkdir()
                     (staged / "manifests").mkdir()
                     for name, content in (
@@ -1451,8 +1545,14 @@ def _publish_sampling_frame(
                                 stream.write(value)
                                 stream.flush()
                                 os.fsync(stream.fileno())
+                    _sync_directory(staged / "sealed")
+                    _sync_directory(staged / "manifests")
+                    _sync_directory(staged)
+                    _require_directory_identity(parent, parent_identity)
                     _rename_no_replace(staged, final)
                     staged = None
+                    _require_directory_identity(parent, parent_identity)
+                    _sync_directory(parent)
                     result = verify_sampling_frame(
                         source_register=source_register,
                         allocation=allocation,
@@ -1534,6 +1634,7 @@ def _values(args: argparse.Namespace) -> dict[str, object]:
             args.e1a3_allocation_manifest_path
         ),
         "e1a3_private_root": args.e1a3_private_root,
+        "approved_private_root": args.approved_private_root,
         "database_url": args.database_url,
         "index_contract_path": args.index_contract_path,
         "output_root": args.output_root,
@@ -1554,6 +1655,10 @@ def _safe_code(error: Exception) -> str:
 def cli(argv: Sequence[str] | None = None) -> int:
     try:
         args = _parser().parse_args(argv)
+        _validate_private_paths(
+            args.approved_private_root,
+            (args.mapping_root, args.output_root),
+        )
         if args.preflight:
             if args.command is not None:
                 _fail("E1A4_SAMPLING_FRAME_ARGUMENT_INVALID")

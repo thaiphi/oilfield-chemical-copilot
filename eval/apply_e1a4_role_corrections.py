@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
+import stat
 import sys
 from typing import Sequence
 
@@ -78,9 +80,74 @@ def _parser() -> argparse.ArgumentParser:
         "--e1a3-allocation-manifest-path", type=Path, required=True
     )
     parser.add_argument("--e1a3-private-root", type=Path, required=True)
+    parser.add_argument("--approved-private-root", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--expected-mapping-binding-sha256")
     return parser
+
+
+def _is_reparse_point(observed: os.stat_result) -> bool:
+    attributes = getattr(observed, "st_file_attributes", 0)
+    return bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+
+
+def _require_safe_directory_component(path: Path) -> None:
+    observed = path.lstat()
+    if (
+        not stat.S_ISDIR(observed.st_mode)
+        or stat.S_ISLNK(observed.st_mode)
+        or _is_reparse_point(observed)
+    ):
+        raise OSError("unsafe private directory component")
+
+
+def _existing_directory_chain(path: Path) -> tuple[Path, ...]:
+    absolute = path.absolute()
+    lineage = tuple(reversed((absolute, *absolute.parents)))
+    existing: list[Path] = []
+    for component in lineage:
+        try:
+            component.lstat()
+        except FileNotFoundError:
+            break
+        existing.append(component)
+    return tuple(existing)
+
+
+def _repository_root(path: Path) -> Path | None:
+    for candidate in (path, *path.parents):
+        try:
+            (candidate / ".git").lstat()
+        except FileNotFoundError:
+            continue
+        return candidate
+    return None
+
+
+def _validate_private_outputs(
+    approved_private_root: Path, outputs: Sequence[Path]
+) -> None:
+    try:
+        raw_root = approved_private_root.absolute()
+        for component in _existing_directory_chain(raw_root):
+            _require_safe_directory_component(component)
+        root = raw_root.resolve(strict=True)
+        repository = _repository_root(root)
+        if repository is not None:
+            relative = root.relative_to(repository)
+            if not relative.parts or relative.parts[0] != ".private":
+                raise OSError("public worktree cannot be a private root")
+        for output in outputs:
+            raw_output = output.absolute()
+            raw_output.relative_to(raw_root)
+            resolved_output = raw_output.resolve(strict=False)
+            resolved_output.relative_to(root)
+            for component in _existing_directory_chain(raw_output):
+                _require_safe_directory_component(component)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise E1A4MappingApplicationError(
+            "E1A4_ROLE_MAPPING_PRIVATE_ROOT_INVALID"
+        ) from error
 
 
 def _source_record_count(seal: object) -> int:
@@ -117,6 +184,10 @@ def _close_stores(*connections: object | None) -> None:
 
 
 def _operate(args: argparse.Namespace) -> dict[str, object]:
+    _validate_private_outputs(
+        args.approved_private_root,
+        (args.output_root,),
+    )
     root = args.reconciliation_root.resolve()
     database_path = (root / "reconciliation.sqlite").resolve()
     store: ReconciliationStore | None = None
@@ -188,6 +259,7 @@ def _safe_code(error: Exception) -> str:
     if value in {
         "E1A4_ROLE_MAPPING_ARGUMENT_INVALID",
         "E1A4_ROLE_MAPPING_CLOSE_FAILED",
+        "E1A4_ROLE_MAPPING_PRIVATE_ROOT_INVALID",
     }:
         return value
     if isinstance(error, E1A4MappingApplicationError) and value in _MAPPING_CODES:

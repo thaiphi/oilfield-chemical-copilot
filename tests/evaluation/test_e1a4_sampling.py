@@ -378,6 +378,7 @@ def _frame_kwargs(tmp_path: Path) -> dict[str, object]:
         "e1a3_private_root": tmp_path / "e1a3",
         "database_url": "postgresql://private.invalid/evaluation",
         "index_contract_path": tmp_path / "index-contract.json",
+        "approved_private_root": tmp_path,
         "output_root": tmp_path / "output",
     }
 
@@ -409,6 +410,8 @@ def _frame_cli_args(tmp_path: Path) -> list[str]:
         str(kwargs["e1a3_allocation_manifest_path"]),
         "--e1a3-private-root",
         str(kwargs["e1a3_private_root"]),
+        "--approved-private-root",
+        str(kwargs["approved_private_root"]),
         "--database-url",
         str(kwargs["database_url"]),
         "--index-contract",
@@ -416,6 +419,157 @@ def _frame_cli_args(tmp_path: Path) -> list[str]:
         "--output-root",
         str(kwargs["output_root"]),
     ]
+
+
+def _replace_frame_cli_path(
+    arguments: list[str], option: str, value: Path
+) -> list[str]:
+    replaced = list(arguments)
+    replaced[replaced.index(option) + 1] = str(value)
+    return replaced
+
+
+@pytest.mark.parametrize(
+    ("option", "escape"),
+    (
+        ("--mapping-root", "public"),
+        ("--output-root", "public"),
+        ("--output-root", "sibling-prefix"),
+    ),
+)
+def test_sampling_cli_rejects_private_path_escape_before_presence_checks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    option: str,
+    escape: str,
+) -> None:
+    import eval.seal_e1a4_sampling_frame as runner
+
+    kwargs = _frame_kwargs(tmp_path)
+    approved = Path(kwargs["approved_private_root"])
+    escaped = (
+        tmp_path.parent / "public-output"
+        if escape == "public"
+        else approved.with_name(approved.name + "-sibling")
+    )
+    arguments = _replace_frame_cli_path(
+        _frame_cli_args(tmp_path), option, escaped
+    )
+    monkeypatch.setattr(
+        runner,
+        "_presence_preflight",
+        lambda _args: (_ for _ in ()).throw(
+            AssertionError("presence checked before private boundary validation")
+        ),
+    )
+
+    assert runner.cli(["seal"] + arguments) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert json.loads(captured.err) == {
+        "status": "E1A4_SAMPLING_FRAME_BLOCKED",
+        "error_code": "E1A4_SAMPLING_FRAME_PRIVATE_ROOT_INVALID",
+    }
+    assert str(escaped) not in captured.err
+
+
+def test_sampling_cli_rejects_symlinked_private_output_ancestor_before_presence_checks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import eval.seal_e1a4_sampling_frame as runner
+
+    approved = Path(_frame_kwargs(tmp_path)["approved_private_root"])
+    target = approved / "real-output"
+    target.mkdir()
+    linked = approved / "linked-output"
+    try:
+        linked.symlink_to(target, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"symlink creation unavailable: {error.__class__.__name__}")
+    arguments = _replace_frame_cli_path(
+        _frame_cli_args(tmp_path), "--output-root", linked
+    )
+    monkeypatch.setattr(
+        runner,
+        "_presence_preflight",
+        lambda _args: (_ for _ in ()).throw(
+            AssertionError("presence checked before private boundary validation")
+        ),
+    )
+
+    assert runner.cli(["seal"] + arguments) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert json.loads(captured.err) == {
+        "status": "E1A4_SAMPLING_FRAME_BLOCKED",
+        "error_code": "E1A4_SAMPLING_FRAME_PRIVATE_ROOT_INVALID",
+    }
+
+
+def test_sampling_cli_rejects_public_worktree_as_approved_private_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import eval.seal_e1a4_sampling_frame as runner
+
+    arguments = _replace_frame_cli_path(
+        _frame_cli_args(tmp_path),
+        "--approved-private-root",
+        runner.PROJECT_ROOT,
+    )
+    arguments = _replace_frame_cli_path(
+        arguments, "--mapping-root", runner.PROJECT_ROOT / "public-mapping"
+    )
+    arguments = _replace_frame_cli_path(
+        arguments, "--output-root", runner.PROJECT_ROOT / "public-output"
+    )
+    monkeypatch.setattr(
+        runner,
+        "_presence_preflight",
+        lambda _args: (_ for _ in ()).throw(
+            AssertionError("presence checked before private boundary validation")
+        ),
+    )
+
+    assert runner.cli(["seal"] + arguments) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert json.loads(captured.err) == {
+        "status": "E1A4_SAMPLING_FRAME_BLOCKED",
+        "error_code": "E1A4_SAMPLING_FRAME_PRIVATE_ROOT_INVALID",
+    }
+
+
+def test_sampling_private_boundary_rejects_windows_reparse_ancestor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import eval.seal_e1a4_sampling_frame as runner
+
+    approved = tmp_path / "approved"
+    reparse = approved / "junction"
+    reparse.mkdir(parents=True)
+    real_lstat = Path.lstat
+
+    def mark_reparse(path: Path) -> object:
+        observed = real_lstat(path)
+        if path == reparse:
+            return SimpleNamespace(
+                st_mode=observed.st_mode,
+                st_file_attributes=0x400,
+            )
+        return observed
+
+    monkeypatch.setattr(Path, "lstat", mark_reparse)
+
+    with pytest.raises(
+        runner.E1A4SamplingFrameError,
+        match="^E1A4_SAMPLING_FRAME_PRIVATE_ROOT_INVALID$",
+    ):
+        runner._validate_private_paths(approved, (reparse / "output",))
 
 
 def _patch_frame_trust(
@@ -1908,6 +2062,114 @@ def test_frame_publication_race_preserves_concurrent_destination(
         runner.seal_sampling_frame(**_frame_kwargs(tmp_path))
     assert (final / "concurrent-owner").read_text() == "preserve me"
     assert len(tuple(parent.glob(".v1.*.tmp"))) == 1
+
+
+def test_frame_publisher_rejects_symlinked_output_ancestor_without_mutation(
+    tmp_path: Path,
+) -> None:
+    import eval.seal_e1a4_sampling_frame as runner
+
+    approved = tmp_path / "approved"
+    actual = approved / "actual"
+    actual.mkdir(parents=True)
+    linked = approved / "linked"
+    try:
+        linked.symlink_to(actual, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"symlink creation unavailable: {error.__class__.__name__}")
+    sentinel = actual / "sentinel"
+    sentinel.write_text("preserve", encoding="utf-8")
+
+    with pytest.raises(
+        runner.E1A4SamplingFrameError,
+        match="^E1A4_SAMPLING_FRAME_WRITE_FAILED$",
+    ):
+        runner._publish_sampling_frame(
+            source_register={"schema_version": 1},
+            allocation={"schema_version": 1},
+            output_root=linked,
+        )
+
+    assert sentinel.read_text(encoding="utf-8") == "preserve"
+    assert not (actual / "e1a4").exists()
+
+
+def test_frame_publisher_syncs_directory_hierarchy_before_and_after_rename(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import eval.seal_e1a4_sampling_frame as runner
+
+    _patch_frame_trust(runner, tmp_path, monkeypatch)
+    events: list[tuple[str, str]] = []
+    real_rename = runner._rename_no_replace
+
+    def record_sync(directory: Path) -> None:
+        events.append(("sync", directory.name))
+
+    def record_rename(staged: Path, final: Path) -> None:
+        events.append(("rename", final.name))
+        real_rename(staged, final)
+
+    monkeypatch.setattr(runner, "_sync_directory", record_sync, raising=False)
+    monkeypatch.setattr(runner, "_rename_no_replace", record_rename)
+
+    sealed = runner.seal_sampling_frame(**_frame_kwargs(tmp_path))
+
+    assert sealed.slot_count == 96
+    parent = tmp_path / "output" / "e1a4" / "sampling-frame"
+    staging_name = next(
+        name for event, name in events if event == "sync" and name.startswith(".v1.")
+    )
+    assert events == [
+        ("sync", "sealed"),
+        ("sync", "manifests"),
+        ("sync", staging_name),
+        ("rename", "v1"),
+        ("sync", "sampling-frame"),
+    ]
+    assert (parent / "v1" / "sealed" / runner.SOURCE_REGISTER_NAME).is_file()
+
+
+@pytest.mark.parametrize("failed_sync", ("sealed", "manifests", "staging", "parent"))
+def test_frame_publisher_fails_closed_when_directory_sync_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failed_sync: str,
+) -> None:
+    import eval.seal_e1a4_sampling_frame as runner
+
+    _patch_frame_trust(runner, tmp_path, monkeypatch)
+    calls: list[str] = []
+
+    def fail_selected(directory: Path) -> None:
+        label = (
+            "staging"
+            if directory.name.startswith(".v1.")
+            else "parent"
+            if directory.name == "sampling-frame"
+            else directory.name
+        )
+        calls.append(label)
+        if label == failed_sync:
+            raise OSError("synthetic directory sync failure")
+
+    monkeypatch.setattr(runner, "_sync_directory", fail_selected, raising=False)
+
+    with pytest.raises(
+        runner.E1A4SamplingFrameError,
+        match="^E1A4_SAMPLING_FRAME_WRITE_FAILED$",
+    ):
+        runner.seal_sampling_frame(**_frame_kwargs(tmp_path))
+
+    parent = tmp_path / "output" / "e1a4" / "sampling-frame"
+    assert failed_sync in calls
+    if failed_sync == "parent":
+        assert (parent / "v1").is_dir()
+        assert not tuple(parent.glob(".v1.*.tmp"))
+    else:
+        assert not (parent / "v1").exists()
+        assert len(tuple(parent.glob(".v1.*.tmp"))) == 1
 
 
 def test_sampling_preflight_checks_presence_without_opening_payloads(
