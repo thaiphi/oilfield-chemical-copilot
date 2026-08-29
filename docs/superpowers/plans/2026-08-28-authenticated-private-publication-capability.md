@@ -205,7 +205,7 @@ git commit -m "fix: bind e1a4 mapping publication to private root"
 - Produces: `_verify_sampling_frame_members(*, source_register, allocation, members, expected_source_register_sha256, expected_allocation_sha256) -> E1A4SamplingFrameSeal`
 - Preserves: `seal_sampling_frame(**values)`, `verify_current_sampling_frame(**values)`, fixed CLI output, exact four-file frame layout, and aggregate seal fields
 
-- [ ] **Step 1: Write frame verification/publication RED tests**
+- [x] **Step 1: Write frame verification/publication RED tests**
 
 Add tests:
 
@@ -219,7 +219,7 @@ def test_frame_runner_has_no_duplicate_platform_publication_implementation(...):
 
 The first and third tests acquire the real capability, retarget the visible pathname, place a different but structurally valid synthetic frame in the replacement, and assert that verification uses the authenticated tree or fails closed.
 
-- [ ] **Step 2: Run Task 3 tests and verify RED**
+- [x] **Step 2: Run Task 3 tests and verify RED**
 
 Run:
 
@@ -229,7 +229,7 @@ uv run pytest -q tests/evaluation/test_e1a4_sampling.py -k "locked_frame_verific
 
 Expected: current path-based `verify_sampling_frame` accepts or opens the replacement, or the shared-capability hook is absent.
 
-- [ ] **Step 3: Split pure validation from capability-relative reading**
+- [x] **Step 3: Split pure validation from capability-relative reading**
 
 Create `_verify_sampling_frame_members(...)` as a pure validator over an exact member dictionary. Both seal and standalone verify must obtain members through:
 
@@ -248,7 +248,7 @@ members = publication.read_exact_tree(
 
 No locked call path may invoke `_read_frame_members(final_path)` or reopen `output_root`. Remove the runner's duplicated `_PosixPublicationDirectory`, `_WindowsPublicationDirectory`, acquisition, staging, rename, sync, and publisher-lock implementation after migration. Keep frame-specific payload construction and safe error translation in the runner.
 
-- [ ] **Step 4: Run frame GREEN and combined regressions**
+- [x] **Step 4: Run frame GREEN and combined regressions**
 
 Run:
 
@@ -260,7 +260,7 @@ git diff --check
 
 Expected: all capability/mapping/frame tests pass; no duplicate platform publisher remains in the frame runner; only documented privilege skips remain.
 
-- [ ] **Step 5: Commit Task 3**
+- [x] **Step 5: Commit Task 3**
 
 ```powershell
 git add eval/seal_e1a4_sampling_frame.py tests/evaluation/test_e1a4_sampling.py
