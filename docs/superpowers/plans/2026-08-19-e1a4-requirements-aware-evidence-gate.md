@@ -1,5 +1,7 @@
 # E1a-4 Requirements-Aware Evidence Gate Implementation Plan
 
+> **Completion-plan precedence — 2026-09-06:** Follow the [private chatbot completion plan](2026-09-06-private-document-chatbot-completion.md) for current product status and delivery sequence. The reviewed `0863f99` version records the mapping and 96-slot frame as sealed and verified, with question/canonical-claim authoring next. Do not repeat completed reconciliation or foundational audits from historical statuses below. Preserve the reviewed experiment contracts and acceptance rules. E1a-4 evaluates evidence states, while chatbot completion additionally requires full answer-path and restart acceptance.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Test whether a requirements-aware, provenance-bound evaluator can classify frozen C1 evidence as sufficient, partially sufficient, or insufficient more safely than a paired context-only control on a fresh private population.
@@ -31,7 +33,7 @@
 
 **Sampling-frame closure:** the seven-artifact reconciliation snapshot set plus both correction proposals were reverified before application. The authenticated role mapping is sealed and independently no-write verified with 170 source records and all eight topic/role strata sufficient. The deterministic metadata-only frame is also sealed and independently verified: exactly 96 slots, 96 unique slot identities, 96 unique source-locator assignments, all four topics, both roles, and zero E1a-3 locator reuse. Mutation-boundary checks are clean: Qdrant and application services were not run, and no retrieval, ingestion, reindexing, model, question, or claim artifact was created. The next checkpoint is private question and canonical-claim authoring only.
 
-**Audit alignment:** E1a-4 addresses the answer-evaluation and evidence-sufficiency gap recorded by the curriculum and Zoomcamp audits. It does not establish bulk-PDF ingestion scale, select chunk size/overlap, add section or authority metadata, or add Kestra recovery policy. Those are separate measured gaps in `docs/superpowers/reports/2026-08-16-project-vs-zoomcamp-audit.md` and must not be silently folded into this experiment.
+**Audit alignment:** E1a-4 addresses the answer-evaluation and evidence-sufficiency gap recorded in the maintained [curriculum and capstone backlog](../../CURRICULUM_REMEDIATION_BACKLOG.md). It does not establish bulk-PDF ingestion scale, select chunk size/overlap, add section or authority metadata, or add Kestra recovery policy. Those are separate measured gaps and must not be silently folded into this experiment.
 
 ## Global Constraints
 

@@ -2,6 +2,8 @@
 
 ## Product Thesis
 
+The delivery target is the user's approved private handout collection, with the core handout and its supplements used to answer document-grounded questions. The [private chatbot completion plan](superpowers/plans/2026-09-06-private-document-chatbot-completion.md) controls delivery and acceptance. Product acceptance remains open; a public sample demonstration alone does not close it.
+
 The Oilfield Chemical Troubleshooting Copilot is an evidence-grounded assistant for production-chemistry investigation. Its primary value is helping an engineer understand what to investigate, which evidence supports that direction, what information is missing, and when the available material cannot support a safe conclusion.
 
 It is not a field-treatment prescribing system and it is not a calculator product.
@@ -54,4 +56,4 @@ It is not a field-treatment prescribing system and it is not a calculator produc
 
 ## Next Product Decision
 
-Before changing the interface, define the first troubleshooting brief layout: the user context to collect, the evidence panel, the missing-inputs section, and the limitations/next-checks section. This is the highest-value capstone enhancement because it strengthens the primary workflow rather than adding another calculator.
+Follow the consolidated completion plan, beginning with the maintained evidence record and collection coverage. Use observed answer and citation failures to decide whether a troubleshooting brief layout or another application change is needed. Acceptance includes correct useful answers, verifiable evidence, appropriate abstention, and index persistence across restarts.
