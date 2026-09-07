@@ -8,6 +8,15 @@ class _StaticClient:
         return '{"evidence_state":"SUFFICIENT"}'
 
 
+class _CountingClient:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def chat(self, **_: object) -> str:
+        self.calls += 1
+        return '{"evidence_state":"SUFFICIENT"}'
+
+
 def _run_inputs():
     from oilfield_chemical_copilot.evaluation.evidence_state import DeliveredEvidence
 
@@ -85,3 +94,22 @@ def test_frozen_run_rejects_a_contract_with_different_delivered_context() -> Non
             classifier=LocalEvidenceStateClassifier(model="frozen-model", client=_StaticClient()),
             frozen_input_contract=frozen_input_contract,
         )
+
+
+def test_frozen_run_rejects_invalid_gold_state_before_classifier_inference() -> None:
+    from oilfield_chemical_copilot.evaluation.evidence_state import (
+        EvidenceStateError,
+        LocalEvidenceStateClassifier,
+        classify_frozen_c1_contexts,
+    )
+
+    client = _CountingClient()
+    with pytest.raises(EvidenceStateError, match="E1A_RUN_INPUT_INVALID"):
+        classify_frozen_c1_contexts(
+            contexts=_run_inputs()["contexts"],
+            gold_states={"case-1": "PARTIAL"},  # type: ignore[dict-item]
+            classifier=LocalEvidenceStateClassifier(model="frozen-model", client=client),
+            frozen_input_contract=_frozen_input_contract(),
+        )
+
+    assert client.calls == 0

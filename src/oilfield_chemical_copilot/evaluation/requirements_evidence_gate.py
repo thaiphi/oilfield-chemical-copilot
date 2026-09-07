@@ -99,6 +99,11 @@ class RequirementSupportResult:
 
     def __post_init__(self) -> None:
         _require_text(self.question_id, code="E1A4_SUPPORT_RESULT_INVALID")
+        if (
+            not isinstance(self.requirement_support, tuple)
+            or not all(isinstance(item, RequirementSupport) for item in self.requirement_support)
+        ):
+            _fail("E1A4_SUPPORT_RESULT_INVALID")
 
 
 @dataclass(frozen=True, init=False)

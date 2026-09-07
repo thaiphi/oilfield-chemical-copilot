@@ -200,7 +200,11 @@ def classify_frozen_c1_contexts(
     ):
         raise EvidenceStateError("E1A_RUN_INPUT_INVALID")
     ids = [question_id for question_id, _, _ in contexts]
-    if len(ids) != len(set(ids)) or set(ids) != set(gold_states):
+    if (
+        len(ids) != len(set(ids))
+        or set(ids) != set(gold_states)
+        or any(state not in _STATES for state in gold_states.values())
+    ):
         raise EvidenceStateError("E1A_RUN_INPUT_INVALID")
     try:
         input_contract_sha256 = canonical_input_contract_sha256(frozen_input_contract)

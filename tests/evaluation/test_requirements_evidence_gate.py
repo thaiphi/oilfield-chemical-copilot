@@ -283,3 +283,20 @@ def test_gate_observation_cannot_be_directly_constructed_with_forged_decisions()
             evidence_state="SUFFICIENT",
             answer_boundary="FULL_ANSWER_PERMITTED",
         )
+
+
+def test_support_result_rejects_a_mutable_support_sequence() -> None:
+    from oilfield_chemical_copilot.evaluation.requirements_evidence_gate import (
+        RequirementSupport,
+        RequirementSupportResult,
+        RequirementsEvidenceGateError,
+    )
+
+    with pytest.raises(RequirementsEvidenceGateError, match="E1A4_SUPPORT_RESULT_INVALID"):
+        RequirementSupportResult(
+            question_id="private-case",
+            requirement_support=[
+                RequirementSupport(requirement_id="r1", status="SUPPORTED", supporting_ranks=(1,)),
+                RequirementSupport(requirement_id="r2", status="UNCLEAR", supporting_ranks=()),
+            ],
+        )
