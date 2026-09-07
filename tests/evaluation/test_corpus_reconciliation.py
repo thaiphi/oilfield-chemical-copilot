@@ -1583,6 +1583,120 @@ def test_coverage_register_accepts_a_valid_successor_and_rejects_unbound_duplica
     store.close()
 
 
+def test_coverage_register_rejects_duplicate_cycle_and_nonusable_terminal(
+    tmp_path: Path,
+) -> None:
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        CorpusReconciliationError,
+        CoverageDecisionRecord,
+        initialize_coverage_register,
+        record_coverage_decision,
+        seal_reconciliation_snapshots,
+    )
+
+    store = _complete_snapshot_store(tmp_path)
+    seal_reconciliation_snapshots(store=store, root=store.root)
+    initialize_coverage_register(store=store, register_id="m2-coverage-register-v1")
+    usable = {
+        "decision_id": "coverage-1",
+        "drive_file_id": "drive-1",
+        "content_status": "SUBSTANTIVE",
+        "index_status": "INDEXED",
+        "disposition": "INDEXED_USABLE",
+        "representative_drive_file_id": None,
+        "reason_code": None,
+        "reviewer_id": "reviewer-1",
+        "decided_at": "2026-09-07T00:00:00Z",
+        "supersedes_decision_id": None,
+    }
+    record_coverage_decision(
+        store=store,
+        register_id="m2-coverage-register-v1",
+        record=CoverageDecisionRecord.from_mapping(usable),
+    )
+    record_coverage_decision(
+        store=store,
+        register_id="m2-coverage-register-v1",
+        record=CoverageDecisionRecord.from_mapping(
+            {
+                "decision_id": "coverage-2",
+                "drive_file_id": "drive-2",
+                "content_status": "NOT_ASSESSED",
+                "index_status": "NOT_ASSESSED",
+                "disposition": "DUPLICATE_ALIAS",
+                "representative_drive_file_id": "drive-1",
+                "reason_code": None,
+                "reviewer_id": "reviewer-1",
+                "decided_at": "2026-09-07T00:01:00Z",
+                "supersedes_decision_id": None,
+            }
+        ),
+    )
+
+    with pytest.raises(
+        CorpusReconciliationError,
+        match="CORPUS_RECONCILIATION_COVERAGE_DUPLICATE_RESOLUTION_INVALID",
+    ):
+        record_coverage_decision(
+            store=store,
+            register_id="m2-coverage-register-v1",
+            record=CoverageDecisionRecord.from_mapping(
+                {
+                    **usable,
+                    "decision_id": "coverage-3",
+                    "content_status": "NOT_ASSESSED",
+                    "index_status": "NOT_ASSESSED",
+                    "disposition": "DUPLICATE_ALIAS",
+                    "representative_drive_file_id": "drive-2",
+                    "supersedes_decision_id": "coverage-1",
+                }
+            ),
+        )
+    store.close()
+
+    second_root = tmp_path / "nonusable"
+    second_root.mkdir()
+    second = _complete_snapshot_store(second_root)
+    seal_reconciliation_snapshots(store=second, root=second.root)
+    initialize_coverage_register(store=second, register_id="m2-coverage-register-v1")
+    record_coverage_decision(
+        store=second,
+        register_id="m2-coverage-register-v1",
+        record=CoverageDecisionRecord.from_mapping(
+            {
+                **usable,
+                "content_status": "NONSUBSTANTIVE",
+                "index_status": "NOT_APPLICABLE",
+                "disposition": "INTENTIONALLY_EXCLUDED",
+                "reason_code": "NON_SUBSTANTIVE",
+            }
+        ),
+    )
+    with pytest.raises(
+        CorpusReconciliationError,
+        match="CORPUS_RECONCILIATION_COVERAGE_DUPLICATE_RESOLUTION_INVALID",
+    ):
+        record_coverage_decision(
+            store=second,
+            register_id="m2-coverage-register-v1",
+            record=CoverageDecisionRecord.from_mapping(
+                {
+                    "decision_id": "coverage-2",
+                    "drive_file_id": "drive-2",
+                    "content_status": "NOT_ASSESSED",
+                    "index_status": "NOT_ASSESSED",
+                    "disposition": "DUPLICATE_ALIAS",
+                    "representative_drive_file_id": "drive-1",
+                    "reason_code": None,
+                    "reviewer_id": "reviewer-1",
+                    "decided_at": "2026-09-07T00:01:00Z",
+                    "supersedes_decision_id": None,
+                }
+            ),
+        )
+    second.close()
+
+
 def test_snapshot_seal_accepts_closed_allocation_unavailable_outcome(
     tmp_path: Path,
 ) -> None:

@@ -2150,6 +2150,23 @@ def _coverage_status_from_identities(
     )
     if not set(current).issubset(identities):
         _fail("CORPUS_RECONCILIATION_COVERAGE_IDENTITY_INVALID")
+    for decision in current.values():
+        if decision.disposition != "DUPLICATE_ALIAS":
+            continue
+        visited: set[str] = set()
+        target = decision
+        while target.disposition == "DUPLICATE_ALIAS":
+            if target.drive_file_id in visited:
+                _fail("CORPUS_RECONCILIATION_COVERAGE_DUPLICATE_RESOLUTION_INVALID")
+            visited.add(target.drive_file_id)
+            representative = target.representative_drive_file_id
+            if representative is None:
+                _fail("CORPUS_RECONCILIATION_COVERAGE_DUPLICATE_RESOLUTION_INVALID")
+            target = current.get(representative)
+            if target is None:
+                _fail("CORPUS_RECONCILIATION_COVERAGE_DUPLICATE_RESOLUTION_INVALID")
+        if target.disposition != "INDEXED_USABLE":
+            _fail("CORPUS_RECONCILIATION_COVERAGE_DUPLICATE_RESOLUTION_INVALID")
     counts: dict[str, int] = {}
     for decision in current.values():
         counts[decision.disposition] = counts.get(decision.disposition, 0) + 1
