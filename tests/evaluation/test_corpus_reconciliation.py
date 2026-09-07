@@ -1204,6 +1204,499 @@ def test_snapshot_seal_requires_completed_e1a4_dry_run(tmp_path: Path) -> None:
     store.close()
 
 
+def test_coverage_register_binds_the_current_seal_and_exact_drive_identity_set(
+    tmp_path: Path,
+) -> None:
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        coverage_register_status,
+        initialize_coverage_register,
+        seal_reconciliation_snapshots,
+    )
+
+    store = _complete_snapshot_store(tmp_path)
+    seal_reconciliation_snapshots(store=store, root=store.root)
+
+    initialized = initialize_coverage_register(
+        store=store,
+        register_id="m2-coverage-register-v1",
+    )
+    status = coverage_register_status(
+        store=store,
+        register_id="m2-coverage-register-v1",
+    )
+
+    assert initialized.identity_count == 2
+    assert status.identity_count == 2
+    assert status.current_decision_count == 0
+    assert status.remaining_count == 2
+    assert status.complete is False
+    store.close()
+
+
+def test_coverage_register_requires_one_valid_final_decision_per_identity(
+    tmp_path: Path,
+) -> None:
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        CoverageDecisionRecord,
+        coverage_register_status,
+        initialize_coverage_register,
+        record_coverage_decision,
+        seal_reconciliation_snapshots,
+    )
+
+    store = _complete_snapshot_store(tmp_path)
+    seal_reconciliation_snapshots(store=store, root=store.root)
+    initialize_coverage_register(store=store, register_id="m2-coverage-register-v1")
+
+    record_coverage_decision(
+        store=store,
+        register_id="m2-coverage-register-v1",
+        record=CoverageDecisionRecord.from_mapping(
+            {
+                "decision_id": "coverage-1",
+                "drive_file_id": "drive-1",
+                "content_status": "SUBSTANTIVE",
+                "index_status": "INDEXED",
+                "disposition": "INDEXED_USABLE",
+                "representative_drive_file_id": None,
+                "reason_code": None,
+                "reviewer_id": "reviewer-1",
+                "decided_at": "2026-09-07T00:00:00Z",
+                "supersedes_decision_id": None,
+            }
+        ),
+    )
+    partial = coverage_register_status(
+        store=store,
+        register_id="m2-coverage-register-v1",
+    )
+    assert partial.current_decision_count == 1
+    assert partial.remaining_count == 1
+    assert partial.complete is False
+
+    record_coverage_decision(
+        store=store,
+        register_id="m2-coverage-register-v1",
+        record=CoverageDecisionRecord.from_mapping(
+            {
+                "decision_id": "coverage-2",
+                "drive_file_id": "drive-2",
+                "content_status": "UNREADABLE",
+                "index_status": "NOT_INDEXED",
+                "disposition": "BLOCKED",
+                "representative_drive_file_id": None,
+                "reason_code": "EXTRACTION_FAILED",
+                "reviewer_id": "reviewer-1",
+                "decided_at": "2026-09-07T00:01:00Z",
+                "supersedes_decision_id": None,
+            }
+        ),
+    )
+    complete = coverage_register_status(
+        store=store,
+        register_id="m2-coverage-register-v1",
+    )
+
+    assert complete.current_decision_count == 2
+    assert complete.remaining_count == 0
+    assert complete.complete is True
+    assert complete.disposition_counts == {"BLOCKED": 1, "INDEXED_USABLE": 1}
+    store.close()
+
+
+def test_coverage_register_rejects_self_representative_and_unbound_identity(
+    tmp_path: Path,
+) -> None:
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        CorpusReconciliationError,
+        CoverageDecisionRecord,
+        initialize_coverage_register,
+        record_coverage_decision,
+        seal_reconciliation_snapshots,
+    )
+
+    store = _complete_snapshot_store(tmp_path)
+    seal_reconciliation_snapshots(store=store, root=store.root)
+    initialize_coverage_register(store=store, register_id="m2-coverage-register-v1")
+
+    with pytest.raises(
+        CorpusReconciliationError,
+        match="CORPUS_RECONCILIATION_COVERAGE_DECISION_INVALID",
+    ):
+        CoverageDecisionRecord.from_mapping(
+            {
+                "decision_id": "coverage-1",
+                "drive_file_id": "drive-1",
+                "content_status": "NOT_ASSESSED",
+                "index_status": "NOT_ASSESSED",
+                "disposition": "DUPLICATE_ALIAS",
+                "representative_drive_file_id": "drive-1",
+                "reason_code": None,
+                "reviewer_id": "reviewer-1",
+                "decided_at": "2026-09-07T00:00:00Z",
+                "supersedes_decision_id": None,
+            }
+        )
+
+    with pytest.raises(
+        CorpusReconciliationError,
+        match="CORPUS_RECONCILIATION_COVERAGE_IDENTITY_INVALID",
+    ):
+        record_coverage_decision(
+            store=store,
+            register_id="m2-coverage-register-v1",
+            record=CoverageDecisionRecord.from_mapping(
+                {
+                    "decision_id": "coverage-2",
+                    "drive_file_id": "not-in-seal",
+                    "content_status": "SUBSTANTIVE",
+                    "index_status": "INDEXED",
+                    "disposition": "INDEXED_USABLE",
+                    "representative_drive_file_id": None,
+                    "reason_code": None,
+                    "reviewer_id": "reviewer-1",
+                    "decided_at": "2026-09-07T00:00:00Z",
+                    "supersedes_decision_id": None,
+                }
+            ),
+        )
+    store.close()
+
+
+def test_opening_a_legacy_reconciliation_store_does_not_create_coverage_tables(
+    tmp_path: Path,
+) -> None:
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        ReconciliationStore,
+    )
+
+    store = _create_store(tmp_path)
+    root = store.root
+    store.close()
+
+    resumed = ReconciliationStore.open(root=root, expected_root=root, run_id="run-001")
+    tables = {
+        str(row["name"])
+        for row in resumed._connection.execute(
+            "select name from sqlite_master where type = 'table'"
+        ).fetchall()
+    }
+
+    assert "coverage_registers" not in tables
+    assert "coverage_decisions" not in tables
+    resumed.close()
+
+
+def test_coverage_blocked_disposition_requires_a_compatible_failure_reason() -> None:
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        CorpusReconciliationError,
+        CoverageDecisionRecord,
+    )
+
+    with pytest.raises(
+        CorpusReconciliationError,
+        match="CORPUS_RECONCILIATION_COVERAGE_DECISION_INVALID",
+    ):
+        CoverageDecisionRecord.from_mapping(
+            {
+                "decision_id": "coverage-1",
+                "drive_file_id": "drive-1",
+                "content_status": "SUBSTANTIVE",
+                "index_status": "INDEXED",
+                "disposition": "BLOCKED",
+                "representative_drive_file_id": None,
+                "reason_code": "EXTRACTION_FAILED",
+                "reviewer_id": "reviewer-1",
+                "decided_at": "2026-09-07T00:00:00Z",
+                "supersedes_decision_id": None,
+            }
+        )
+
+
+def test_coverage_register_rejects_a_stale_second_current_decision(tmp_path: Path) -> None:
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        CorpusReconciliationError,
+        CoverageDecisionRecord,
+        initialize_coverage_register,
+        record_coverage_decision,
+        seal_reconciliation_snapshots,
+    )
+
+    store = _complete_snapshot_store(tmp_path)
+    seal_reconciliation_snapshots(store=store, root=store.root)
+    initialize_coverage_register(store=store, register_id="m2-coverage-register-v1")
+    first = {
+        "decision_id": "coverage-1",
+        "drive_file_id": "drive-1",
+        "content_status": "SUBSTANTIVE",
+        "index_status": "INDEXED",
+        "disposition": "INDEXED_USABLE",
+        "representative_drive_file_id": None,
+        "reason_code": None,
+        "reviewer_id": "reviewer-1",
+        "decided_at": "2026-09-07T00:00:00Z",
+        "supersedes_decision_id": None,
+    }
+    record_coverage_decision(
+        store=store,
+        register_id="m2-coverage-register-v1",
+        record=CoverageDecisionRecord.from_mapping(first),
+    )
+
+    with pytest.raises(
+        CorpusReconciliationError,
+        match="CORPUS_RECONCILIATION_COVERAGE_DECISION_INVALID",
+    ):
+        record_coverage_decision(
+            store=store,
+            register_id="m2-coverage-register-v1",
+            record=CoverageDecisionRecord.from_mapping(
+                {**first, "decision_id": "coverage-2"}
+            ),
+        )
+    store.close()
+
+
+def test_coverage_register_persists_current_decisions_across_reopen(
+    tmp_path: Path,
+) -> None:
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        CoverageDecisionRecord,
+        ReconciliationStore,
+        coverage_register_status,
+        initialize_coverage_register,
+        record_coverage_decision,
+        seal_reconciliation_snapshots,
+    )
+
+    store = _complete_snapshot_store(tmp_path)
+    root = store.root
+    seal_reconciliation_snapshots(store=store, root=root)
+    initialize_coverage_register(store=store, register_id="m2-coverage-register-v1")
+    record_coverage_decision(
+        store=store,
+        register_id="m2-coverage-register-v1",
+        record=CoverageDecisionRecord.from_mapping(
+            {
+                "decision_id": "coverage-1",
+                "drive_file_id": "drive-1",
+                "content_status": "SUBSTANTIVE",
+                "index_status": "INDEXED",
+                "disposition": "INDEXED_USABLE",
+                "representative_drive_file_id": None,
+                "reason_code": None,
+                "reviewer_id": "reviewer-1",
+                "decided_at": "2026-09-07T00:00:00Z",
+                "supersedes_decision_id": None,
+            }
+        ),
+    )
+    store.close()
+
+    resumed = ReconciliationStore.open(root=root, expected_root=root, run_id="run-001")
+    status = coverage_register_status(
+        store=resumed,
+        register_id="m2-coverage-register-v1",
+    )
+
+    assert status.current_decision_count == 1
+    assert status.remaining_count == 1
+    resumed.close()
+
+
+def test_coverage_register_accepts_a_valid_successor_and_rejects_unbound_duplicate(
+    tmp_path: Path,
+) -> None:
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        CorpusReconciliationError,
+        CoverageDecisionRecord,
+        coverage_register_status,
+        initialize_coverage_register,
+        record_coverage_decision,
+        seal_reconciliation_snapshots,
+    )
+
+    store = _complete_snapshot_store(tmp_path)
+    seal_reconciliation_snapshots(store=store, root=store.root)
+    initialize_coverage_register(store=store, register_id="m2-coverage-register-v1")
+    first = {
+        "decision_id": "coverage-1",
+        "drive_file_id": "drive-1",
+        "content_status": "SUBSTANTIVE",
+        "index_status": "INDEXED",
+        "disposition": "INDEXED_USABLE",
+        "representative_drive_file_id": None,
+        "reason_code": None,
+        "reviewer_id": "reviewer-1",
+        "decided_at": "2026-09-07T00:00:00Z",
+        "supersedes_decision_id": None,
+    }
+    record_coverage_decision(
+        store=store,
+        register_id="m2-coverage-register-v1",
+        record=CoverageDecisionRecord.from_mapping(first),
+    )
+    record_coverage_decision(
+        store=store,
+        register_id="m2-coverage-register-v1",
+        record=CoverageDecisionRecord.from_mapping(
+            {
+                **first,
+                "decision_id": "coverage-2",
+                "content_status": "NONSUBSTANTIVE",
+                "index_status": "NOT_APPLICABLE",
+                "disposition": "INTENTIONALLY_EXCLUDED",
+                "reason_code": "NON_SUBSTANTIVE",
+                "supersedes_decision_id": "coverage-1",
+            }
+        ),
+    )
+    status = coverage_register_status(
+        store=store,
+        register_id="m2-coverage-register-v1",
+    )
+    assert status.current_decision_count == 1
+    assert status.disposition_counts == {"INTENTIONALLY_EXCLUDED": 1}
+
+    with pytest.raises(
+        CorpusReconciliationError,
+        match="CORPUS_RECONCILIATION_COVERAGE_IDENTITY_INVALID",
+    ):
+        record_coverage_decision(
+            store=store,
+            register_id="m2-coverage-register-v1",
+            record=CoverageDecisionRecord.from_mapping(
+                {
+                    "decision_id": "coverage-3",
+                    "drive_file_id": "drive-2",
+                    "content_status": "NOT_ASSESSED",
+                    "index_status": "NOT_ASSESSED",
+                    "disposition": "DUPLICATE_ALIAS",
+                    "representative_drive_file_id": "not-in-seal",
+                    "reason_code": None,
+                    "reviewer_id": "reviewer-1",
+                    "decided_at": "2026-09-07T00:01:00Z",
+                    "supersedes_decision_id": None,
+                }
+            ),
+        )
+    store.close()
+
+
+def test_coverage_register_rejects_duplicate_cycle_and_nonusable_terminal(
+    tmp_path: Path,
+) -> None:
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        CorpusReconciliationError,
+        CoverageDecisionRecord,
+        initialize_coverage_register,
+        record_coverage_decision,
+        seal_reconciliation_snapshots,
+    )
+
+    store = _complete_snapshot_store(tmp_path)
+    seal_reconciliation_snapshots(store=store, root=store.root)
+    initialize_coverage_register(store=store, register_id="m2-coverage-register-v1")
+    usable = {
+        "decision_id": "coverage-1",
+        "drive_file_id": "drive-1",
+        "content_status": "SUBSTANTIVE",
+        "index_status": "INDEXED",
+        "disposition": "INDEXED_USABLE",
+        "representative_drive_file_id": None,
+        "reason_code": None,
+        "reviewer_id": "reviewer-1",
+        "decided_at": "2026-09-07T00:00:00Z",
+        "supersedes_decision_id": None,
+    }
+    record_coverage_decision(
+        store=store,
+        register_id="m2-coverage-register-v1",
+        record=CoverageDecisionRecord.from_mapping(usable),
+    )
+    record_coverage_decision(
+        store=store,
+        register_id="m2-coverage-register-v1",
+        record=CoverageDecisionRecord.from_mapping(
+            {
+                "decision_id": "coverage-2",
+                "drive_file_id": "drive-2",
+                "content_status": "NOT_ASSESSED",
+                "index_status": "NOT_ASSESSED",
+                "disposition": "DUPLICATE_ALIAS",
+                "representative_drive_file_id": "drive-1",
+                "reason_code": None,
+                "reviewer_id": "reviewer-1",
+                "decided_at": "2026-09-07T00:01:00Z",
+                "supersedes_decision_id": None,
+            }
+        ),
+    )
+
+    with pytest.raises(
+        CorpusReconciliationError,
+        match="CORPUS_RECONCILIATION_COVERAGE_DUPLICATE_RESOLUTION_INVALID",
+    ):
+        record_coverage_decision(
+            store=store,
+            register_id="m2-coverage-register-v1",
+            record=CoverageDecisionRecord.from_mapping(
+                {
+                    **usable,
+                    "decision_id": "coverage-3",
+                    "content_status": "NOT_ASSESSED",
+                    "index_status": "NOT_ASSESSED",
+                    "disposition": "DUPLICATE_ALIAS",
+                    "representative_drive_file_id": "drive-2",
+                    "supersedes_decision_id": "coverage-1",
+                }
+            ),
+        )
+    store.close()
+
+    second_root = tmp_path / "nonusable"
+    second_root.mkdir()
+    second = _complete_snapshot_store(second_root)
+    seal_reconciliation_snapshots(store=second, root=second.root)
+    initialize_coverage_register(store=second, register_id="m2-coverage-register-v1")
+    record_coverage_decision(
+        store=second,
+        register_id="m2-coverage-register-v1",
+        record=CoverageDecisionRecord.from_mapping(
+            {
+                **usable,
+                "content_status": "NONSUBSTANTIVE",
+                "index_status": "NOT_APPLICABLE",
+                "disposition": "INTENTIONALLY_EXCLUDED",
+                "reason_code": "NON_SUBSTANTIVE",
+            }
+        ),
+    )
+    with pytest.raises(
+        CorpusReconciliationError,
+        match="CORPUS_RECONCILIATION_COVERAGE_DUPLICATE_RESOLUTION_INVALID",
+    ):
+        record_coverage_decision(
+            store=second,
+            register_id="m2-coverage-register-v1",
+            record=CoverageDecisionRecord.from_mapping(
+                {
+                    "decision_id": "coverage-2",
+                    "drive_file_id": "drive-2",
+                    "content_status": "NOT_ASSESSED",
+                    "index_status": "NOT_ASSESSED",
+                    "disposition": "DUPLICATE_ALIAS",
+                    "representative_drive_file_id": "drive-1",
+                    "reason_code": None,
+                    "reviewer_id": "reviewer-1",
+                    "decided_at": "2026-09-07T00:01:00Z",
+                    "supersedes_decision_id": None,
+                }
+            ),
+        )
+    second.close()
+
+
 def test_snapshot_seal_accepts_closed_allocation_unavailable_outcome(
     tmp_path: Path,
 ) -> None:
@@ -2135,3 +2628,53 @@ def test_index_connection_verifies_contract_before_read_only_connect(
     assert connection is sentinel
     assert [event[0] for event in events] == ["verify", "connect"]
     assert events[1][2]["options"] == "-c default_transaction_read_only=on"
+
+
+def _coverage_register_runner_module() -> object:
+    path = Path(__file__).resolve().parents[2] / "eval" / "manage_coverage_register.py"
+    spec = importlib.util.spec_from_file_location("test_manage_coverage_register", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_coverage_register_cli_keeps_private_details_out_of_aggregate_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        seal_reconciliation_snapshots,
+    )
+
+    store = _complete_snapshot_store(tmp_path)
+    root = store.root
+    seal_reconciliation_snapshots(store=store, root=root)
+    store.close()
+    runner = _coverage_register_runner_module()
+    monkeypatch.setattr(runner, "DEFAULT_ROOT", root)
+    args = [
+        "init",
+        "--private-root",
+        str(root),
+        "--run-id",
+        "run-001",
+        "--register-id",
+        "m2-coverage-register-v1",
+    ]
+
+    assert runner.cli(args) == 0
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert captured.err == ""
+    assert payload == {
+        "status": "IN_PROGRESS",
+        "identity_count": 2,
+        "current_decision_count": 0,
+        "remaining_count": 2,
+        "disposition_counts": {},
+    }
+    assert str(root) not in captured.out
+    assert "drive-1" not in captured.out
