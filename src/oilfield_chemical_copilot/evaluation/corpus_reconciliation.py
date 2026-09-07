@@ -586,6 +586,8 @@ class CoverageDecisionRecord:
             or representative == drive_file_id
         ):
             _fail(code)
+        if reason == "MAPPING_UNVERIFIED" and disposition != "BLOCKED":
+            _fail(code)
         if disposition == "INDEXED_USABLE" and (
             content_status != "SUBSTANTIVE"
             or index_status != "INDEXED"
