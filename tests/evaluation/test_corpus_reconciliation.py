@@ -1413,6 +1413,29 @@ def test_coverage_blocked_disposition_requires_a_compatible_failure_reason() -> 
         )
 
 
+def test_coverage_blocked_disposition_preserves_unverified_mapping_state() -> None:
+    from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
+        CoverageDecisionRecord,
+    )
+
+    record = CoverageDecisionRecord.from_mapping(
+        {
+            "decision_id": "coverage-1",
+            "drive_file_id": "drive-1",
+            "content_status": "NOT_ASSESSED",
+            "index_status": "NOT_ASSESSED",
+            "disposition": "BLOCKED",
+            "representative_drive_file_id": None,
+            "reason_code": "MAPPING_UNVERIFIED",
+            "reviewer_id": "reviewer-1",
+            "decided_at": "2026-09-07T00:00:00Z",
+            "supersedes_decision_id": None,
+        }
+    )
+
+    assert record.reason_code == "MAPPING_UNVERIFIED"
+
+
 def test_coverage_register_rejects_a_stale_second_current_decision(tmp_path: Path) -> None:
     from oilfield_chemical_copilot.evaluation.corpus_reconciliation import (
         CorpusReconciliationError,
