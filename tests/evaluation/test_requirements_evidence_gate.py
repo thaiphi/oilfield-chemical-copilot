@@ -259,3 +259,27 @@ def test_gate_observation_preserves_the_validated_result_and_controller_decision
     assert observation.requirement_support_result == result
     assert observation.evidence_state == "PARTIALLY_SUFFICIENT"
     assert observation.answer_boundary == "SUPPORTED_ONLY_RESPONSE_REQUIRED"
+
+
+def test_gate_observation_cannot_be_directly_constructed_with_forged_decisions() -> None:
+    from oilfield_chemical_copilot.evaluation.requirements_evidence_gate import (
+        RequirementSupport,
+        RequirementSupportResult,
+        RequirementsGateObservation,
+    )
+
+    unsupported_result = RequirementSupportResult(
+        question_id="private-case",
+        requirement_support=(
+            RequirementSupport(requirement_id="r1", status="UNSUPPORTED", supporting_ranks=()),
+            RequirementSupport(requirement_id="r2", status="UNCLEAR", supporting_ranks=()),
+        ),
+    )
+
+    with pytest.raises(TypeError):
+        RequirementsGateObservation(
+            question_id="private-case",
+            requirement_support_result=unsupported_result,
+            evidence_state="SUFFICIENT",
+            answer_boundary="FULL_ANSWER_PERMITTED",
+        )

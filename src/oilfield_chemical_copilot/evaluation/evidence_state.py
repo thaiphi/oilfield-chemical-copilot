@@ -8,7 +8,6 @@ to score the private experiment.
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import asdict, dataclass
 from hashlib import sha256
 from pathlib import Path
@@ -28,7 +27,6 @@ _STATES: tuple[EvidenceState, ...] = (
     "INSUFFICIENT",
 )
 _PUBLIC_MINIMUM_COHORT_SIZE = 10
-_SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 
 E1A_SYSTEM_PROMPT = """Classify whether the supplied evidence context can support the user's question.
 Do not answer the question. Do not add facts. Do not infer missing technical details.
@@ -194,21 +192,20 @@ def classify_frozen_c1_contexts(
     contexts: Sequence[tuple[str, str, Sequence[DeliveredEvidence]]],
     gold_states: dict[str, EvidenceState],
     classifier: LocalEvidenceStateClassifier,
-    model: str,
-    input_contract_sha256: str,
+    frozen_input_contract: dict[str, object],
 ) -> EvidenceStateRun:
     """Run E1a without exposing evaluator-only gold labels to the classifier."""
-    if (
-        not contexts
-        or not isinstance(model, str)
-        or model != classifier.model
-        or not isinstance(input_contract_sha256, str)
-        or not _SHA256_HEX.fullmatch(input_contract_sha256)
+    if not contexts or not _frozen_contract_matches_execution(
+        contract=frozen_input_contract, contexts=contexts, model=classifier.model
     ):
         raise EvidenceStateError("E1A_RUN_INPUT_INVALID")
     ids = [question_id for question_id, _, _ in contexts]
     if len(ids) != len(set(ids)) or set(ids) != set(gold_states):
         raise EvidenceStateError("E1A_RUN_INPUT_INVALID")
+    try:
+        input_contract_sha256 = canonical_input_contract_sha256(frozen_input_contract)
+    except (TypeError, ValueError) as error:
+        raise EvidenceStateError("E1A_RUN_INPUT_INVALID") from error
     observations: list[EvidenceStateObservation] = []
     for question_id, question, evidence in contexts:
         predicted = classifier.classify(question=question, evidence=evidence)
@@ -221,7 +218,7 @@ def classify_frozen_c1_contexts(
         )
     return EvidenceStateRun(
         observations=tuple(observations),
-        model=model,
+        model=classifier.model,
         input_contract_sha256=input_contract_sha256,
     )
 
@@ -241,6 +238,27 @@ def canonical_input_contract_sha256(contract: dict[str, object]) -> str:
     return sha256(
         json.dumps(contract, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
+
+
+def _frozen_contract_matches_execution(
+    *,
+    contract: object,
+    contexts: Sequence[tuple[str, str, Sequence[DeliveredEvidence]]],
+    model: str,
+) -> bool:
+    if not isinstance(contract, dict) or contract.get("model") != model:
+        return False
+    return contract.get("contexts") == [
+        {
+            "question_id": question_id,
+            "question": question.strip(),
+            "evidence": [
+                {"rank": item.rank, "passage_text": item.passage_text.strip()}
+                for item in evidence
+            ],
+        }
+        for question_id, question, evidence in contexts
+    ]
 
 
 def _classifier_prompt(*, question: str, evidence: Sequence[DeliveredEvidence]) -> str:

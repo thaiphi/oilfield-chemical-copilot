@@ -55,14 +55,15 @@ Evidence sources: [E1a-4 plan](2026-08-19-e1a4-requirements-aware-evidence-gate.
 - [x] Correct stale historical statuses and links in the maintained documents. Record the selected application configuration separately from rejected experimental configurations.
 - [x] Run the existing documentation checks and affected tests after any retained implementation changes. Record revision and verification in this ledger.
 - [ ] Resolve normal code review and integrate the recovered revision. Keep deferred historical reports outside the maintained evidence set unless their individual provenance and disclosure review succeeds.
+- [ ] Verify the integrated revision from a clean checkout and record its active evidence map before closing M1.
 
-**Exit:** all active links resolve, necessary code is reproducible, and progress is not inferred from an untracked file or an old checkout. **Stop:** missing evidence is recorded as missing; completed private audits are not rerun to repair documentation.
+**Exit:** all active links resolve, necessary code is reproducible, the integrated revision has clean-checkout verification and an active evidence map, and progress is not inferred from an untracked file or an old checkout. M1 does not close on merge alone. **Stop:** missing evidence is recorded as missing; completed private audits are not rerun to repair documentation.
 
-**Recovery checkpoint completed — 2026-09-06:** An isolated branch based on `0863f99` recovered the local-only public E1a-4 dependency closure in `1cb45fe`: five evaluation modules, one CLI, and three test modules. The recovered focused suite passed 43 tests and Ruff was clean; the combined E1a-4 mapping, sampling, and reviewer-document suite passed 192 tests with 10 documented skips. The original checkout remains unchanged. Historical public-intended reports still require individual provenance and disclosure review before they may enter the maintained evidence set; the recovery status is recorded in [the maintained-record reconciliation report](../reports/2026-09-06-maintained-record-reconciliation.md). M1 remains in review until this reproducible revision is approved and integrated.
+**Recovery checkpoint completed — 2026-09-06:** An isolated branch based on `0863f99` recovered the local-only public E1a-4 dependency closure in `1cb45fe`: five evaluation modules, one CLI, and three test modules. The recovered focused suite passed 43 tests and Ruff was clean; the combined E1a-4 mapping, sampling, and reviewer-document suite passed 192 tests with 10 documented skips. The original checkout remains unchanged. Historical public-intended reports still require individual provenance and disclosure review before they may enter the maintained evidence set; the recovery status is recorded in [the maintained-record reconciliation report](../reports/2026-09-06-maintained-record-reconciliation.md). M1 remains in review until this reproducible revision is approved, integrated, and post-integration verified.
 
 ## Milestone 2: Establish Collection Coverage And A Baseline Contract
 
-**Status:** PENDING M1 INTEGRATION. **Deliverable:** a private coverage register and a frozen evaluation specification for the current application.
+**Status:** PENDING M1 COMPLETION. **Deliverable:** a private coverage register and a frozen evaluation specification for the current application.
 
 **Files/responsibility:** reuse reconciliation storage and inventory readers; publish only aggregate evidence in `docs/superpowers/reports/2026-09-06-private-chatbot-completion.md` when executed. Keep per-document dispositions and cases in approved private storage.
 

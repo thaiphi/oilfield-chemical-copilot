@@ -17,7 +17,20 @@ def _run_inputs():
     }
 
 
-def test_frozen_run_rejects_a_model_other_than_the_classifier_model() -> None:
+def _frozen_input_contract(*, model: str = "frozen-model") -> dict[str, object]:
+    return {
+        "model": model,
+        "contexts": [
+            {
+                "question_id": "case-1",
+                "question": "What is the condition?",
+                "evidence": [{"rank": 1, "passage_text": "Evidence."}],
+            }
+        ],
+    }
+
+
+def test_frozen_run_rejects_a_contract_with_a_different_model() -> None:
     from oilfield_chemical_copilot.evaluation.evidence_state import (
         EvidenceStateError,
         LocalEvidenceStateClassifier,
@@ -28,40 +41,47 @@ def test_frozen_run_rejects_a_model_other_than_the_classifier_model() -> None:
         classify_frozen_c1_contexts(
             **_run_inputs(),
             classifier=LocalEvidenceStateClassifier(model="frozen-model", client=_StaticClient()),
-            model="different-model",
-            input_contract_sha256="a" * 64,
+            frozen_input_contract=_frozen_input_contract(model="different-model"),
         )
 
 
-def test_frozen_run_records_the_classifier_model_with_a_valid_contract_digest() -> None:
+def test_frozen_run_records_the_digest_of_the_exact_model_and_context_contract() -> None:
     from oilfield_chemical_copilot.evaluation.evidence_state import (
         LocalEvidenceStateClassifier,
+        canonical_input_contract_sha256,
         classify_frozen_c1_contexts,
     )
 
+    frozen_input_contract = _frozen_input_contract()
     run = classify_frozen_c1_contexts(
         **_run_inputs(),
         classifier=LocalEvidenceStateClassifier(model="frozen-model", client=_StaticClient()),
-        model="frozen-model",
-        input_contract_sha256="a" * 64,
+        frozen_input_contract=frozen_input_contract,
     )
 
     assert run.model == "frozen-model"
-    assert run.input_contract_sha256 == "a" * 64
+    assert run.input_contract_sha256 == canonical_input_contract_sha256(frozen_input_contract)
 
 
-@pytest.mark.parametrize("digest", ["A" * 64, "g" * 64, "a" * 63])
-def test_frozen_run_requires_a_lowercase_hex_contract_digest(digest: str) -> None:
+def test_frozen_run_rejects_a_contract_with_different_delivered_context() -> None:
     from oilfield_chemical_copilot.evaluation.evidence_state import (
         EvidenceStateError,
         LocalEvidenceStateClassifier,
         classify_frozen_c1_contexts,
     )
 
+    frozen_input_contract = _frozen_input_contract()
+    frozen_input_contract["contexts"] = [
+        {
+            "question_id": "case-1",
+            "question": "A different question?",
+            "evidence": [{"rank": 1, "passage_text": "Evidence."}],
+        }
+    ]
+
     with pytest.raises(EvidenceStateError, match="E1A_RUN_INPUT_INVALID"):
         classify_frozen_c1_contexts(
             **_run_inputs(),
             classifier=LocalEvidenceStateClassifier(model="frozen-model", client=_StaticClient()),
-            model="frozen-model",
-            input_contract_sha256=digest,
+            frozen_input_contract=frozen_input_contract,
         )

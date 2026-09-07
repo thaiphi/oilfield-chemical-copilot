@@ -101,7 +101,7 @@ class RequirementSupportResult:
         _require_text(self.question_id, code="E1A4_SUPPORT_RESULT_INVALID")
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class RequirementsGateObservation:
     """Controller-owned record of validated support and its derived decisions."""
 
@@ -110,16 +110,22 @@ class RequirementsGateObservation:
     evidence_state: EvidenceState
     answer_boundary: AnswerBoundary
 
-    def __post_init__(self) -> None:
-        _require_text(self.question_id, code="E1A4_GATE_OBSERVATION_INVALID")
-        if (
-            not isinstance(self.requirement_support_result, RequirementSupportResult)
-            or self.requirement_support_result.question_id != self.question_id
-            or self.evidence_state
-            not in ("SUFFICIENT", "PARTIALLY_SUFFICIENT", "INSUFFICIENT")
-            or self.answer_boundary != derive_answer_boundary(self.evidence_state)
-        ):
-            _fail("E1A4_GATE_OBSERVATION_INVALID")
+    @classmethod
+    def _from_validated(
+        cls,
+        *,
+        fixture: RequirementFixture,
+        result: RequirementSupportResult,
+        evidence_state: EvidenceState,
+        answer_boundary: AnswerBoundary,
+    ) -> RequirementsGateObservation:
+        """Construct only after the controller has validated support provenance."""
+        observation = object.__new__(cls)
+        object.__setattr__(observation, "question_id", fixture.question_id)
+        object.__setattr__(observation, "requirement_support_result", result)
+        object.__setattr__(observation, "evidence_state", evidence_state)
+        object.__setattr__(observation, "answer_boundary", answer_boundary)
+        return observation
 
 
 class RequirementExtractor(Protocol):
@@ -193,9 +199,9 @@ def derive_gate_observation(
 ) -> RequirementsGateObservation:
     """Validate support provenance and preserve the controller-derived decisions."""
     state = derive_evidence_state(fixture=fixture, evidence=evidence, result=result)
-    return RequirementsGateObservation(
-        question_id=fixture.question_id,
-        requirement_support_result=result,
+    return RequirementsGateObservation._from_validated(
+        fixture=fixture,
+        result=result,
         evidence_state=state,
         answer_boundary=derive_answer_boundary(state),
     )
