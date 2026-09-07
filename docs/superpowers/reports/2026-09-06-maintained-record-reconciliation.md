@@ -36,11 +36,29 @@ This checkpoint establishes code availability for review. It does not claim that
 | Historical public-intended reports present only in the original checkout | Deferred pending individual provenance, privacy, and relevance review. They are not cited as maintained evidence. |
 | Missing historical report reference from the active E1a-4 plan | Replaced with the maintained curriculum and capstone backlog. |
 
-## Remaining Milestone 1 Integration Work
+## Integrated Revision Verification — 2026-09-07
 
-1. Resolve normal code review for the recovered dependency closure and integrate the reviewed revision.
-2. Record the clean-checkout verification and active evidence map at the integrated revision.
+The reviewed recovery branch was merged as `726f9df90d6220fb782ed421d5f83c8b3c675612` (PR #3). A new isolated worktree checked out that exact revision with no working-tree changes before this record was written.
 
-Deferred historical reports remain quarantined, are not cited as maintained evidence, and do not block the reproducibility exit. Review an individual report only if a later milestone proposes to add it to the maintained evidence set.
+- the reviewer-document suite passed: `4 passed`;
+- the full Python suite passed in bounded groups: `897 passed, 14 skipped`;
+- Ruff passed and `git diff --check` was clean; and
+- all active plan and evidence-map paths below were present and tracked at the verified revision.
 
-The completion plan remains open. No completed private reconciliation or locator audit needs to be repeated.
+No private artifact, Drive content, runtime service, model, index, retrieval call, or holdout was opened or run for this verification.
+
+## Active Public Evidence Map
+
+| Purpose | Tracked public evidence at `726f9df` |
+| --- | --- |
+| Product scope and acceptance boundary | `docs/CAPSTONE_FOCUS.md`, `docs/LEARNING_ROADMAP.md`, `docs/CURRICULUM_REMEDIATION_BACKLOG.md`, and the consolidated completion plan. |
+| Reconciliation provenance and privacy boundary | This report and `docs/CAPSTONE_EVIDENCE.md`. |
+| E1a-4 experiment contract | `docs/superpowers/plans/2026-08-19-e1a4-requirements-aware-evidence-gate.md`. |
+| Recovered evaluation dependencies | claim-support, evidence-state, requirements-gate, E1a-4 population and selection modules; E1a-4 population sealer; and their focused tests. |
+| Verification entry point | `tests/capstone/test_reviewer_docs.py` plus the full tracked test suite. |
+
+Deferred historical reports remain quarantined, are not cited as maintained evidence, and do not block M1. Review an individual report only if a later milestone proposes to add it to the maintained evidence set.
+
+## Milestone 1 Closeout
+
+M1 is complete: the recovered public dependency closure received normal review, was integrated, and has a clean-checkout verification and active evidence map. The completion plan remains open; the next gate is M2 private coverage review under the applicable authority. No completed private reconciliation or locator audit needs to be repeated.
