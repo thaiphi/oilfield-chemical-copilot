@@ -232,3 +232,30 @@ def test_controller_derives_evidence_state_and_answer_boundary(
 
     assert state == expected_state
     assert derive_answer_boundary(state) == expected_boundary
+
+
+def test_gate_observation_preserves_the_validated_result_and_controller_decisions() -> None:
+    from oilfield_chemical_copilot.evaluation.requirements_evidence_gate import (
+        RequirementSupport,
+        RequirementSupportResult,
+        RequirementsGateObservation,
+        derive_gate_observation,
+    )
+
+    result = RequirementSupportResult(
+        question_id="private-case",
+        requirement_support=(
+            RequirementSupport(requirement_id="r1", status="SUPPORTED", supporting_ranks=(1,)),
+            RequirementSupport(requirement_id="r2", status="UNCLEAR", supporting_ranks=()),
+        ),
+    )
+
+    observation = derive_gate_observation(
+        fixture=_requirements(), evidence=_evidence(), result=result
+    )
+
+    assert isinstance(observation, RequirementsGateObservation)
+    assert observation.question_id == "private-case"
+    assert observation.requirement_support_result == result
+    assert observation.evidence_state == "PARTIALLY_SUFFICIENT"
+    assert observation.answer_boundary == "SUPPORTED_ONLY_RESPONSE_REQUIRED"

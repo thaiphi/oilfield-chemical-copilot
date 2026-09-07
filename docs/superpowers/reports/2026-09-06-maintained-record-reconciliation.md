@@ -36,10 +36,11 @@ This checkpoint establishes code availability for review. It does not claim that
 | Historical public-intended reports present only in the original checkout | Deferred pending individual provenance, privacy, and relevance review. They are not cited as maintained evidence. |
 | Missing historical report reference from the active E1a-4 plan | Replaced with the maintained curriculum and capstone backlog. |
 
-## Remaining Milestone 1 Work
+## Remaining Milestone 1 Integration Work
 
-1. Review the deferred historical reports individually before adding any to the maintained record.
-2. Obtain normal code review for the recovered dependency closure before integration.
-3. Verify the maintained revision from a clean checkout and record the resulting evidence map.
+1. Resolve normal code review for the recovered dependency closure and integrate the reviewed revision.
+2. Record the clean-checkout verification and active evidence map at the integrated revision.
+
+Deferred historical reports remain quarantined, are not cited as maintained evidence, and do not block the reproducibility exit. Review an individual report only if a later milestone proposes to add it to the maintained evidence set.
 
 The completion plan remains open. No completed private reconciliation or locator audit needs to be repeated.

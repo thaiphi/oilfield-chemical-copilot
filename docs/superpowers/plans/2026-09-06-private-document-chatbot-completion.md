@@ -43,7 +43,7 @@ Evidence sources: [E1a-4 plan](2026-08-19-e1a4-requirements-aware-evidence-gate.
 
 ## Milestone 1: Reconcile The Maintained Project Record
 
-**Status:** NEXT. **Deliverable:** one reproducible code revision with an accurate public evidence index.
+**Status:** IN_REVIEW. **Deliverable:** one reproducible code revision with an accurate public evidence index.
 
 **Files:** `docs/LEARNING_ROADMAP.md`, `docs/CURRICULUM_REMEDIATION_BACKLOG.md`, `docs/CAPSTONE_FOCUS.md`, `docs/CAPSTONE_EVIDENCE.md`, `README.md`, and this plan. Inspect untracked public-intended reports/code individually before deciding whether to retain them; do not bulk-stage them.
 
@@ -54,14 +54,15 @@ Evidence sources: [E1a-4 plan](2026-08-19-e1a4-requirements-aware-evidence-gate.
 - [x] Verify every report/code dependency cited by the active plans exists at the chosen revision. Mark unavailable evidence explicitly; inspect public-intended documents for disclosure before adding them.
 - [x] Correct stale historical statuses and links in the maintained documents. Record the selected application configuration separately from rejected experimental configurations.
 - [x] Run the existing documentation checks and affected tests after any retained implementation changes. Record revision and verification in this ledger.
+- [ ] Resolve normal code review and integrate the recovered revision. Keep deferred historical reports outside the maintained evidence set unless their individual provenance and disclosure review succeeds.
 
 **Exit:** all active links resolve, necessary code is reproducible, and progress is not inferred from an untracked file or an old checkout. **Stop:** missing evidence is recorded as missing; completed private audits are not rerun to repair documentation.
 
-**Completed — 2026-09-06:** An isolated branch based on `0863f99` recovered the local-only public E1a-4 dependency closure in `1cb45fe`: five evaluation modules, one CLI, and three test modules. The recovered focused suite passed 43 tests and Ruff was clean; the combined E1a-4 mapping, sampling, and reviewer-document suite passed 192 tests with 10 documented skips. The original checkout remains unchanged. Historical public-intended reports still require individual provenance and disclosure review before they may enter the maintained evidence set; the recovery status is recorded in [the maintained-record reconciliation report](../reports/2026-09-06-maintained-record-reconciliation.md).
+**Recovery checkpoint completed — 2026-09-06:** An isolated branch based on `0863f99` recovered the local-only public E1a-4 dependency closure in `1cb45fe`: five evaluation modules, one CLI, and three test modules. The recovered focused suite passed 43 tests and Ruff was clean; the combined E1a-4 mapping, sampling, and reviewer-document suite passed 192 tests with 10 documented skips. The original checkout remains unchanged. Historical public-intended reports still require individual provenance and disclosure review before they may enter the maintained evidence set; the recovery status is recorded in [the maintained-record reconciliation report](../reports/2026-09-06-maintained-record-reconciliation.md). M1 remains in review until this reproducible revision is approved and integrated.
 
 ## Milestone 2: Establish Collection Coverage And A Baseline Contract
 
-**Status:** PENDING M1. **Deliverable:** a private coverage register and a frozen evaluation specification for the current application.
+**Status:** PENDING M1 INTEGRATION. **Deliverable:** a private coverage register and a frozen evaluation specification for the current application.
 
 **Files/responsibility:** reuse reconciliation storage and inventory readers; publish only aggregate evidence in `docs/superpowers/reports/2026-09-06-private-chatbot-completion.md` when executed. Keep per-document dispositions and cases in approved private storage.
 
@@ -135,4 +136,4 @@ These numbers are explicit planning proposals, not achieved scores, historical E
 - One correction addresses one measured failure. After a failed candidate, make a recorded continue, narrow-scope, or stop decision before further experimentation.
 - Reuse the existing seals, validators, checkpoints, and evaluators. Add infrastructure only when its absence demonstrably blocks a milestone.
 - Do not repeat completed private reviews to compensate for stale documentation. Do not equate metadata allocation, retrieval hit rate, or classifier accuracy with answer correctness.
-- Immediate execution checkpoint: M1 project/evidence reconciliation. Next private checkpoint: M2 coverage evidence review and the existing E1a-4 question/claim authoring gate, preserving their distinct purposes and permissions.
+- Immediate execution checkpoint: resolve M1 review and integrate the reproducible revision. Next private checkpoint after M1 closes: M2 coverage evidence review and the existing E1a-4 question/claim authoring gate, preserving their distinct purposes and permissions.

@@ -101,6 +101,27 @@ class RequirementSupportResult:
         _require_text(self.question_id, code="E1A4_SUPPORT_RESULT_INVALID")
 
 
+@dataclass(frozen=True)
+class RequirementsGateObservation:
+    """Controller-owned record of validated support and its derived decisions."""
+
+    question_id: str
+    requirement_support_result: RequirementSupportResult
+    evidence_state: EvidenceState
+    answer_boundary: AnswerBoundary
+
+    def __post_init__(self) -> None:
+        _require_text(self.question_id, code="E1A4_GATE_OBSERVATION_INVALID")
+        if (
+            not isinstance(self.requirement_support_result, RequirementSupportResult)
+            or self.requirement_support_result.question_id != self.question_id
+            or self.evidence_state
+            not in ("SUFFICIENT", "PARTIALLY_SUFFICIENT", "INSUFFICIENT")
+            or self.answer_boundary != derive_answer_boundary(self.evidence_state)
+        ):
+            _fail("E1A4_GATE_OBSERVATION_INVALID")
+
+
 class RequirementExtractor(Protocol):
     """Model-swappable question-only requirement extraction boundary."""
 
@@ -162,6 +183,22 @@ def derive_evidence_state(
     if any(status == "SUPPORTED" for status in statuses):
         return "PARTIALLY_SUFFICIENT"
     return "INSUFFICIENT"
+
+
+def derive_gate_observation(
+    *,
+    fixture: RequirementFixture,
+    evidence: Sequence[DeliveredEvidence],
+    result: RequirementSupportResult,
+) -> RequirementsGateObservation:
+    """Validate support provenance and preserve the controller-derived decisions."""
+    state = derive_evidence_state(fixture=fixture, evidence=evidence, result=result)
+    return RequirementsGateObservation(
+        question_id=fixture.question_id,
+        requirement_support_result=result,
+        evidence_state=state,
+        answer_boundary=derive_answer_boundary(state),
+    )
 
 
 def derive_answer_boundary(state: EvidenceState) -> AnswerBoundary:

@@ -8,6 +8,7 @@ to score the private experiment.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict, dataclass
 from hashlib import sha256
 from pathlib import Path
@@ -27,6 +28,7 @@ _STATES: tuple[EvidenceState, ...] = (
     "INSUFFICIENT",
 )
 _PUBLIC_MINIMUM_COHORT_SIZE = 10
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 
 E1A_SYSTEM_PROMPT = """Classify whether the supplied evidence context can support the user's question.
 Do not answer the question. Do not add facts. Do not infer missing technical details.
@@ -127,10 +129,15 @@ class LocalEvidenceStateClassifier:
     """Fail-closed local classifier with a narrow structured-output contract."""
 
     def __init__(self, *, model: str, client: EvidenceStateClient) -> None:
-        if not model.strip():
+        if not isinstance(model, str) or not model.strip():
             raise EvidenceStateError("E1A_MODEL_REQUIRED")
         self._model = model
         self._client = client
+
+    @property
+    def model(self) -> str:
+        """Return the exact model identifier used for classifier calls."""
+        return self._model
 
     def classify(self, *, question: str, evidence: Sequence[DeliveredEvidence]) -> EvidenceState:
         if not question.strip():
@@ -191,7 +198,13 @@ def classify_frozen_c1_contexts(
     input_contract_sha256: str,
 ) -> EvidenceStateRun:
     """Run E1a without exposing evaluator-only gold labels to the classifier."""
-    if not contexts or len(input_contract_sha256) != 64:
+    if (
+        not contexts
+        or not isinstance(model, str)
+        or model != classifier.model
+        or not isinstance(input_contract_sha256, str)
+        or not _SHA256_HEX.fullmatch(input_contract_sha256)
+    ):
         raise EvidenceStateError("E1A_RUN_INPUT_INVALID")
     ids = [question_id for question_id, _, _ in contexts]
     if len(ids) != len(set(ids)) or set(ids) != set(gold_states):
