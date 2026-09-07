@@ -65,9 +65,11 @@ Evidence sources: [E1a-4 plan](2026-08-19-e1a4-requirements-aware-evidence-gate.
 
 ## Milestone 2: Establish Collection Coverage And A Baseline Contract
 
-**Status:** NEXT — applicable private-review authority required. **Deliverable:** a private coverage register and a frozen evaluation specification for the current application.
+**Status:** IN PROGRESS. **Deliverable:** a private coverage register and a frozen evaluation specification for the current application.
 
 **Files/responsibility:** reuse reconciliation storage and inventory readers; publish only aggregate evidence in `docs/superpowers/reports/2026-09-06-private-chatbot-completion.md` when executed. Keep per-document dispositions and cases in approved private storage.
+
+**Execution update — 2026-09-07:** the verified private coverage register now binds 385 sealed document identities. The first bounded review recorded 117 identities as blocked solely because their mapping to the runtime index is not yet verified; it did not infer exclusion, extraction failure, or usable coverage. 268 identities remain. No corpus, index, retrieval, model, or private payload changed.
 
 - [ ] Read the existing sealed inventory/decisions under the applicable private-review authority. Give every approved document one recorded disposition: indexed and usable, duplicate linked to its representative, intentionally excluded with reason, or blocked by a specific extraction/indexing failure.
 - [ ] Confirm the full core handout and approved supplemental groups are represented; distinguish document identity, readable substantive content, and runtime index membership. Account for tables/charts and image-only pages. Use existing extraction evidence first and inspect only unresolved coverage gaps.
