@@ -66,6 +66,7 @@ COVERAGE_BLOCKED_CONTRACTS = frozenset(
         ("EXTRACTION_FAILED", "UNREADABLE", "NOT_ASSESSED"),
         ("EXTRACTION_FAILED", "UNREADABLE", "NOT_INDEXED"),
         ("INDEXING_FAILED", "SUBSTANTIVE", "NOT_INDEXED"),
+        ("MAPPING_UNVERIFIED", "NOT_ASSESSED", "NOT_ASSESSED"),
     }
 )
 SNAPSHOT_NAMES = (
@@ -584,6 +585,8 @@ class CoverageDecisionRecord:
             or decision_id == supersedes
             or representative == drive_file_id
         ):
+            _fail(code)
+        if reason == "MAPPING_UNVERIFIED" and disposition != "BLOCKED":
             _fail(code)
         if disposition == "INDEXED_USABLE" and (
             content_status != "SUBSTANTIVE"
