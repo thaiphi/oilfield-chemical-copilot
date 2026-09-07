@@ -3,6 +3,12 @@
 **Project:** Oilfield Chemical Troubleshooting Copilot
 **Purpose:** Keep the learning sequence explicit while preserving work that was implemented ahead of its lesson.
 
+## Private Chatbot Completion — 2026-09-06
+
+**Product acceptance: OPEN.** The module locks below record learning and public implementation milestones. Completion of the user's private-document chatbot follows the [consolidated completion plan](superpowers/plans/2026-09-06-private-document-chatbot-completion.md): maintained evidence, collection coverage, measured answer-path failures, unseen answer validation, and reliable daily operation.
+
+Reconciliation, foundational audits, and the 96-slot sampling frame are already recorded as complete in the later reviewed branch. The remaining E1a-4 authoring/evaluation work supports the product milestone; it does not establish final-answer quality. Read the consolidated ledger before relying on older checkout statuses.
+
 ## Status Vocabulary
 
 - **Active lesson:** the module currently being studied, explained, tested, and locked.
