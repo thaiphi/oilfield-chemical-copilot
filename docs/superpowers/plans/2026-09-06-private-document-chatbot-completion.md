@@ -71,6 +71,8 @@ Evidence sources: [E1a-4 plan](2026-08-19-e1a4-requirements-aware-evidence-gate.
 
 **Execution update — 2026-09-07:** the verified private coverage register now binds and accounts for all 385 sealed document identities. All 385 are currently blocked solely because their mapping to the runtime index is not verified; none is inferred excluded, unreadable, or usable. This closes coverage accounting but demonstrates no usable collection coverage. No corpus, index, retrieval, model, or private payload changed.
 
+**Foundational-locator recheck — 2026-09-07:** the existing private audit is complete (133 candidate pages and 133 decisions), but only 7 strata are sufficient and allocation remains unavailable. This does not repair the collection-to-index mapping gap or authorize E1a-4, ingestion, or reindexing.
+
 - [x] Read the existing sealed inventory/decisions under the applicable private-review authority. Every approved document has a durable disposition; the current aggregate is 385 blocked for unverified index mapping and zero usable, duplicate, or excluded records.
 - [ ] Confirm the full core handout and approved supplemental groups are represented; distinguish document identity, readable substantive content, and runtime index membership. Account for tables/charts and image-only pages. Use existing extraction evidence first and inspect only unresolved coverage gaps.
 - [ ] Confirm what the application actually queries and how its citations identify document/page. Record index freshness and whether Drive updates are manual; do not claim live synchronization without evidence.
