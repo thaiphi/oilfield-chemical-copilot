@@ -51,6 +51,23 @@ REVIEW_DECISION_CONTRACTS = frozenset(
         ("NEEDS_SOURCE_OWNER_REVIEW", "SOURCE_OWNER_REVIEW_REQUIRED"),
     }
 )
+COVERAGE_CONTENT_STATUSES = frozenset(
+    {"SUBSTANTIVE", "NONSUBSTANTIVE", "UNREADABLE", "NOT_ASSESSED"}
+)
+COVERAGE_INDEX_STATUSES = frozenset(
+    {"INDEXED", "NOT_INDEXED", "NOT_APPLICABLE", "NOT_ASSESSED"}
+)
+COVERAGE_DISPOSITIONS = frozenset(
+    {"INDEXED_USABLE", "DUPLICATE_ALIAS", "INTENTIONALLY_EXCLUDED", "BLOCKED"}
+)
+COVERAGE_REGISTER_SCHEMA_VERSION = 1
+COVERAGE_BLOCKED_CONTRACTS = frozenset(
+    {
+        ("EXTRACTION_FAILED", "UNREADABLE", "NOT_ASSESSED"),
+        ("EXTRACTION_FAILED", "UNREADABLE", "NOT_INDEXED"),
+        ("INDEXING_FAILED", "SUBSTANTIVE", "NOT_INDEXED"),
+    }
+)
 SNAPSHOT_NAMES = (
     "drive-inventory.jsonl",
     "local-inventory.jsonl",
@@ -516,6 +533,121 @@ class SnapshotSet:
     artifacts: tuple[SnapshotArtifact, ...]
 
 
+@dataclass(frozen=True)
+class CoverageDecisionRecord:
+    """One append-only private coverage decision for a sealed Drive identity."""
+
+    decision_id: str
+    drive_file_id: str
+    content_status: str
+    index_status: str
+    disposition: str
+    representative_drive_file_id: str | None
+    reason_code: str | None
+    reviewer_id: str
+    decided_at: str
+    supersedes_decision_id: str | None
+
+    @classmethod
+    def from_mapping(cls, mapping: Mapping[str, object]) -> CoverageDecisionRecord:
+        code = "CORPUS_RECONCILIATION_COVERAGE_DECISION_INVALID"
+        _exact_keys(
+            mapping,
+            frozenset(
+                {
+                    "decision_id",
+                    "drive_file_id",
+                    "content_status",
+                    "index_status",
+                    "disposition",
+                    "representative_drive_file_id",
+                    "reason_code",
+                    "reviewer_id",
+                    "decided_at",
+                    "supersedes_decision_id",
+                }
+            ),
+            code,
+        )
+        decision_id = _string(mapping["decision_id"], code)
+        drive_file_id = _string(mapping["drive_file_id"], code)
+        content_status = _string(mapping["content_status"], code)
+        index_status = _string(mapping["index_status"], code)
+        disposition = _string(mapping["disposition"], code)
+        representative = _optional_string(mapping["representative_drive_file_id"], code)
+        reason = _optional_string(mapping["reason_code"], code)
+        supersedes = _optional_string(mapping["supersedes_decision_id"], code)
+        if (
+            content_status not in COVERAGE_CONTENT_STATUSES
+            or index_status not in COVERAGE_INDEX_STATUSES
+            or disposition not in COVERAGE_DISPOSITIONS
+            or decision_id == supersedes
+            or representative == drive_file_id
+        ):
+            _fail(code)
+        if disposition == "INDEXED_USABLE" and (
+            content_status != "SUBSTANTIVE"
+            or index_status != "INDEXED"
+            or representative is not None
+            or reason is not None
+        ):
+            _fail(code)
+        if disposition == "DUPLICATE_ALIAS" and (
+            representative is None
+            or reason is not None
+            or content_status != "NOT_ASSESSED"
+            or index_status != "NOT_ASSESSED"
+        ):
+            _fail(code)
+        if disposition == "INTENTIONALLY_EXCLUDED" and (
+            representative is not None or reason is None
+        ):
+            _fail(code)
+        if disposition == "BLOCKED" and (
+            representative is not None
+            or (reason, content_status, index_status) not in COVERAGE_BLOCKED_CONTRACTS
+        ):
+            _fail(code)
+        return cls(
+            decision_id=decision_id,
+            drive_file_id=drive_file_id,
+            content_status=content_status,
+            index_status=index_status,
+            disposition=disposition,
+            representative_drive_file_id=representative,
+            reason_code=reason,
+            reviewer_id=_string(mapping["reviewer_id"], code),
+            decided_at=_string(mapping["decided_at"], code),
+            supersedes_decision_id=supersedes,
+        )
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "decision_id": self.decision_id,
+            "drive_file_id": self.drive_file_id,
+            "content_status": self.content_status,
+            "index_status": self.index_status,
+            "disposition": self.disposition,
+            "representative_drive_file_id": self.representative_drive_file_id,
+            "reason_code": self.reason_code,
+            "reviewer_id": self.reviewer_id,
+            "decided_at": self.decided_at,
+            "supersedes_decision_id": self.supersedes_decision_id,
+        }
+
+
+@dataclass(frozen=True)
+class CoverageRegisterStatus:
+    identity_count: int
+    current_decision_count: int
+    remaining_count: int
+    disposition_counts: dict[str, int]
+
+    @property
+    def complete(self) -> bool:
+        return self.remaining_count == 0
+
+
 class ReconciliationStore:
     """Transactional controller-owned state for one reconciliation run."""
 
@@ -630,6 +762,58 @@ class ReconciliationStore:
                 decided_at text not null,
                 primary key(run_id, decision_id)
             );
+            """
+        )
+
+    @staticmethod
+    def _create_coverage_schema(connection: sqlite3.Connection) -> None:
+        """Create the versioned M2 tables only after a seal-verified init."""
+        connection.execute(
+            """
+            create table if not exists coverage_registers (
+                run_id text not null references runs(run_id),
+                register_id text not null,
+                schema_version integer not null,
+                snapshot_binding_sha256 text not null,
+                drive_inventory_sha256 text not null,
+                identity_count integer not null,
+                primary key(run_id, register_id)
+            )
+            """
+        )
+        connection.execute(
+            """
+            create table if not exists coverage_register_identities (
+                run_id text not null,
+                register_id text not null,
+                drive_file_id text not null,
+                primary key(run_id, register_id, drive_file_id),
+                foreign key(run_id, register_id)
+                    references coverage_registers(run_id, register_id)
+            )
+            """
+        )
+        connection.execute(
+            """
+            create table if not exists coverage_decisions (
+                run_id text not null,
+                register_id text not null,
+                decision_id text not null,
+                drive_file_id text not null,
+                content_status text not null,
+                index_status text not null,
+                disposition text not null,
+                representative_drive_file_id text,
+                reason_code text,
+                reviewer_id text not null,
+                decided_at text not null,
+                supersedes_decision_id text,
+                primary key(run_id, register_id, decision_id),
+                foreign key(run_id, register_id, drive_file_id)
+                    references coverage_register_identities(run_id, register_id, drive_file_id),
+                foreign key(run_id, register_id, representative_drive_file_id)
+                    references coverage_register_identities(run_id, register_id, drive_file_id)
+            )
             """
         )
 
@@ -1699,6 +1883,297 @@ def record_review_decision(
                 "CORPUS_RECONCILIATION_REVIEW_DECISION_INVALID"
             ) from error
         return _set_document_matching_checkpoint(store)
+
+
+def _coverage_decisions(
+    store: ReconciliationStore, *, register_id: str
+) -> tuple[CoverageDecisionRecord, ...]:
+    rows = store._connection.execute(
+        """
+        select decision_id, drive_file_id, content_status, index_status, disposition,
+               representative_drive_file_id, reason_code, reviewer_id, decided_at,
+               supersedes_decision_id
+        from coverage_decisions
+        where run_id = ? and register_id = ?
+        """,
+        (store.run_id, register_id),
+    ).fetchall()
+    return tuple(CoverageDecisionRecord.from_mapping(dict(row)) for row in rows)
+
+
+def _current_coverage_decisions(
+    decisions: tuple[CoverageDecisionRecord, ...],
+) -> dict[str, CoverageDecisionRecord]:
+    by_id = {decision.decision_id: decision for decision in decisions}
+    if len(by_id) != len(decisions):
+        _fail("CORPUS_RECONCILIATION_COVERAGE_DECISION_INVALID")
+    superseded: set[str] = set()
+    for decision in decisions:
+        if decision.supersedes_decision_id is None:
+            continue
+        prior = by_id.get(decision.supersedes_decision_id)
+        if prior is None or prior.drive_file_id != decision.drive_file_id:
+            _fail("CORPUS_RECONCILIATION_COVERAGE_DECISION_INVALID")
+        superseded.add(prior.decision_id)
+    current: dict[str, CoverageDecisionRecord] = {}
+    for decision in decisions:
+        if decision.decision_id in superseded:
+            continue
+        if decision.drive_file_id in current:
+            _fail("CORPUS_RECONCILIATION_COVERAGE_DECISION_INVALID")
+        current[decision.drive_file_id] = decision
+    return current
+
+
+def _coverage_register_header(
+    store: ReconciliationStore, *, register_id: str
+) -> sqlite3.Row:
+    tables = {
+        str(row["name"])
+        for row in store._connection.execute(
+            """
+            select name from sqlite_master
+            where type = 'table' and name in (
+                'coverage_registers', 'coverage_register_identities', 'coverage_decisions'
+            )
+            """
+        ).fetchall()
+    }
+    if tables != {
+        "coverage_registers",
+        "coverage_register_identities",
+        "coverage_decisions",
+    }:
+        _fail("CORPUS_RECONCILIATION_COVERAGE_REGISTER_MISSING")
+    row = store._connection.execute(
+        """
+        select schema_version, snapshot_binding_sha256, drive_inventory_sha256,
+               identity_count
+        from coverage_registers where run_id = ? and register_id = ?
+        """,
+        (store.run_id, register_id),
+    ).fetchone()
+    if row is None:
+        _fail("CORPUS_RECONCILIATION_COVERAGE_REGISTER_MISSING")
+    if int(row["schema_version"]) != COVERAGE_REGISTER_SCHEMA_VERSION:
+        _fail("CORPUS_RECONCILIATION_COVERAGE_BINDING_INVALID")
+    return row
+
+
+def _verified_coverage_register_identities(
+    *, store: ReconciliationStore, register_id: str
+) -> tuple[str, ...]:
+    sealed = verify_reconciliation_snapshots(root=store.root, store=store)
+    artifacts = {artifact.name: artifact for artifact in sealed.artifacts}
+    binding = artifacts.get(SNAPSHOT_BINDING_NAME)
+    inventory = artifacts.get("drive-inventory.jsonl")
+    if binding is None or inventory is None or len(artifacts) != len(SEALED_SNAPSHOT_NAMES):
+        _fail("CORPUS_RECONCILIATION_COVERAGE_BINDING_INVALID")
+    header = _coverage_register_header(store, register_id=register_id)
+    if (
+        str(header["snapshot_binding_sha256"]) != binding.sha256
+        or str(header["drive_inventory_sha256"]) != inventory.sha256
+    ):
+        _fail("CORPUS_RECONCILIATION_COVERAGE_BINDING_INVALID")
+    registered = tuple(
+        str(row["drive_file_id"])
+        for row in store._connection.execute(
+            """
+            select drive_file_id from coverage_register_identities
+            where run_id = ? and register_id = ? order by drive_file_id
+            """,
+            (store.run_id, register_id),
+        ).fetchall()
+    )
+    current = tuple(
+        str(row["drive_file_id"])
+        for row in store._connection.execute(
+            "select drive_file_id from drive_files where run_id = ? order by drive_file_id",
+            (store.run_id,),
+        ).fetchall()
+    )
+    if (
+        not registered
+        or registered != current
+        or int(header["identity_count"]) != len(registered)
+    ):
+        _fail("CORPUS_RECONCILIATION_COVERAGE_BINDING_INVALID")
+    return registered
+
+
+def initialize_coverage_register(
+    *, store: ReconciliationStore, register_id: str
+) -> CoverageRegisterStatus:
+    """Bind a versioned M2 register to the currently verified reconciliation seal."""
+    safe_register_id = _string(register_id, "CORPUS_RECONCILIATION_COVERAGE_REGISTER_INVALID")
+    try:
+        store._connection.execute("begin immediate")
+        sealed = verify_reconciliation_snapshots(root=store.root, store=store)
+        artifacts = {artifact.name: artifact for artifact in sealed.artifacts}
+        binding = artifacts.get(SNAPSHOT_BINDING_NAME)
+        inventory = artifacts.get("drive-inventory.jsonl")
+        identities = tuple(
+            str(row["drive_file_id"])
+            for row in store._connection.execute(
+                "select drive_file_id from drive_files where run_id = ? order by drive_file_id",
+                (store.run_id,),
+            ).fetchall()
+        )
+        if (
+            binding is None
+            or inventory is None
+            or len(artifacts) != len(SEALED_SNAPSHOT_NAMES)
+            or not identities
+        ):
+            _fail("CORPUS_RECONCILIATION_COVERAGE_BINDING_INVALID")
+        ReconciliationStore._create_coverage_schema(store._connection)
+        existing = store._connection.execute(
+            """
+            select schema_version, snapshot_binding_sha256, drive_inventory_sha256,
+                   identity_count
+            from coverage_registers where run_id = ? and register_id = ?
+            """,
+            (store.run_id, safe_register_id),
+        ).fetchone()
+        if existing is None:
+            store._connection.execute(
+                """
+                insert into coverage_registers(
+                    run_id, register_id, schema_version, snapshot_binding_sha256,
+                    drive_inventory_sha256, identity_count
+                ) values (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    store.run_id,
+                    safe_register_id,
+                    COVERAGE_REGISTER_SCHEMA_VERSION,
+                    binding.sha256,
+                    inventory.sha256,
+                    len(identities),
+                ),
+            )
+            store._connection.executemany(
+                """
+                insert into coverage_register_identities(run_id, register_id, drive_file_id)
+                values (?, ?, ?)
+                """,
+                ((store.run_id, safe_register_id, identity) for identity in identities),
+            )
+        elif (
+            int(existing["schema_version"]) != COVERAGE_REGISTER_SCHEMA_VERSION
+            or str(existing["snapshot_binding_sha256"]) != binding.sha256
+            or str(existing["drive_inventory_sha256"]) != inventory.sha256
+            or int(existing["identity_count"]) != len(identities)
+        ):
+            _fail("CORPUS_RECONCILIATION_COVERAGE_BINDING_INVALID")
+        result = _coverage_status_from_identities(
+            store=store,
+            register_id=safe_register_id,
+            identities=identities,
+        )
+        store._connection.commit()
+        return result
+    except Exception:
+        store._connection.rollback()
+        raise
+
+
+def record_coverage_decision(
+    *, store: ReconciliationStore, register_id: str, record: CoverageDecisionRecord
+) -> CoverageRegisterStatus:
+    """Atomically append one validated decision for an exact sealed identity."""
+    safe_register_id = _string(register_id, "CORPUS_RECONCILIATION_COVERAGE_REGISTER_INVALID")
+    safe = CoverageDecisionRecord.from_mapping(record.to_mapping())
+    try:
+        store._connection.execute("begin immediate")
+        identities = _verified_coverage_register_identities(
+            store=store, register_id=safe_register_id
+        )
+        identity_set = set(identities)
+        if safe.drive_file_id not in identity_set or (
+            safe.representative_drive_file_id is not None
+            and safe.representative_drive_file_id not in identity_set
+        ):
+            _fail("CORPUS_RECONCILIATION_COVERAGE_IDENTITY_INVALID")
+        prior = _current_coverage_decisions(
+            _coverage_decisions(store, register_id=safe_register_id)
+        ).get(safe.drive_file_id)
+        if (prior is None) != (safe.supersedes_decision_id is None) or (
+            prior is not None and safe.supersedes_decision_id != prior.decision_id
+        ):
+            _fail("CORPUS_RECONCILIATION_COVERAGE_DECISION_INVALID")
+        try:
+            store._connection.execute(
+                """
+                insert into coverage_decisions(
+                    run_id, register_id, decision_id, drive_file_id, content_status,
+                    index_status, disposition, representative_drive_file_id, reason_code,
+                    reviewer_id, decided_at, supersedes_decision_id
+                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    store.run_id,
+                    safe_register_id,
+                    safe.decision_id,
+                    safe.drive_file_id,
+                    safe.content_status,
+                    safe.index_status,
+                    safe.disposition,
+                    safe.representative_drive_file_id,
+                    safe.reason_code,
+                    safe.reviewer_id,
+                    safe.decided_at,
+                    safe.supersedes_decision_id,
+                ),
+            )
+        except sqlite3.IntegrityError as error:
+            raise CorpusReconciliationError(
+                "CORPUS_RECONCILIATION_COVERAGE_DECISION_INVALID"
+            ) from error
+        result = _coverage_status_from_identities(
+            store=store,
+            register_id=safe_register_id,
+            identities=identities,
+        )
+        store._connection.commit()
+        return result
+    except Exception:
+        store._connection.rollback()
+        raise
+
+
+def _coverage_status_from_identities(
+    *, store: ReconciliationStore, register_id: str, identities: tuple[str, ...]
+) -> CoverageRegisterStatus:
+    current = _current_coverage_decisions(
+        _coverage_decisions(store, register_id=register_id)
+    )
+    if not set(current).issubset(identities):
+        _fail("CORPUS_RECONCILIATION_COVERAGE_IDENTITY_INVALID")
+    counts: dict[str, int] = {}
+    for decision in current.values():
+        counts[decision.disposition] = counts.get(decision.disposition, 0) + 1
+    return CoverageRegisterStatus(
+        identity_count=len(identities),
+        current_decision_count=len(current),
+        remaining_count=len(identities) - len(current),
+        disposition_counts=dict(sorted(counts.items())),
+    )
+
+
+def coverage_register_status(
+    *, store: ReconciliationStore, register_id: str
+) -> CoverageRegisterStatus:
+    """Return deterministic aggregate-only M2 coverage status after binding checks."""
+    safe_register_id = _string(register_id, "CORPUS_RECONCILIATION_COVERAGE_REGISTER_INVALID")
+    identities = _verified_coverage_register_identities(
+        store=store, register_id=safe_register_id
+    )
+    return _coverage_status_from_identities(
+        store=store,
+        register_id=safe_register_id,
+        identities=identities,
+    )
 
 
 def _locator_inventory_rows(store: ReconciliationStore) -> tuple[sqlite3.Row, ...]:
