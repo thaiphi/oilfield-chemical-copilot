@@ -8,6 +8,8 @@ only typed rows through an injected in-memory/read-only boundary.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import json
 import math
 import re
 from typing import Iterable, Protocol, Sequence, TypeVar
@@ -29,6 +31,7 @@ class CorpusV2StoreError(ValueError):
 
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+VECTOR_DIMENSIONS = 384
 
 
 def _require_sha256(value: object) -> str:
@@ -38,9 +41,27 @@ def _require_sha256(value: object) -> str:
 
 
 def _require_dimension(value: object) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+    if isinstance(value, bool) or not isinstance(value, int) or value != VECTOR_DIMENSIONS:
         raise CorpusV2StoreError("C2_INDEX_METADATA_INVALID")
     return value
+
+
+def _require_finite_vector(vector: object) -> tuple[float, ...]:
+    if not isinstance(vector, tuple) or len(vector) != VECTOR_DIMENSIONS:
+        raise CorpusV2StoreError("C2_EMBEDDING_INVALID")
+    if any(
+        isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+        for value in vector
+    ):
+        raise CorpusV2StoreError("C2_EMBEDDING_INVALID")
+    return vector
+
+
+def vector_sha256(vector: tuple[float, ...]) -> str:
+    """Create the sealed identity for one validated candidate embedding vector."""
+    finite_vector = _require_finite_vector(vector)
+    payload = json.dumps(finite_vector, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def database_name_from_url(database_url: object) -> str:
@@ -66,6 +87,7 @@ class V2ChunkManifestEntry:
     location: str
     embedding_model: str
     vector_dimensions: int
+    content: str
 
     def __post_init__(self) -> None:
         if not isinstance(self.chunk, CorpusV2Chunk):
@@ -81,6 +103,10 @@ class V2ChunkManifestEntry:
         if not is_valid_embedding_model(self.embedding_model):
             raise CorpusV2StoreError("C2_INDEX_METADATA_INVALID")
         _require_dimension(self.vector_dimensions)
+        if not isinstance(self.content, str) or not self.content:
+            raise CorpusV2StoreError("C2_INDEX_METADATA_INVALID")
+        if hashlib.sha256(self.content.encode("utf-8")).hexdigest() != self.chunk.text_sha256:
+            raise CorpusV2StoreError("C2_INDEX_METADATA_INVALID")
 
     @property
     def chunk_id(self) -> str:
@@ -95,12 +121,14 @@ class V2ChunkManifestEntry:
 class V2Embedding:
     chunk_id: str
     embedding_model: str
+    embedding_sha256: str
     vector: tuple[float, ...]
 
     def __post_init__(self) -> None:
         if not is_valid_public_chunk_id(self.chunk_id) or not is_valid_embedding_model(self.embedding_model):
             raise CorpusV2StoreError("C2_EMBEDDING_INVALID")
-        if not isinstance(self.vector, tuple):
+        _require_sha256(self.embedding_sha256)
+        if vector_sha256(self.vector) != self.embedding_sha256:
             raise CorpusV2StoreError("C2_EMBEDDING_INVALID")
 
 
@@ -110,10 +138,13 @@ class V2StoredChunk:
     release_id: str
     source_id: str
     source_sha256: str
+    content_sha256: str
     manifest_sha256: str
     location: str
     embedding_model: str
     vector_dimensions: int
+    embedding_sha256: str
+    content: str
     vector: tuple[float, ...]
 
 
@@ -150,9 +181,13 @@ class CorpusV2Store:
         rows: list[V2StoredChunk] = []
         for chunk_id, entry in expected.items():
             embedding = observed[chunk_id]
-            if embedding.embedding_model != entry.embedding_model or len(embedding.vector) != entry.vector_dimensions:
+            if embedding.embedding_model != entry.embedding_model or entry.vector_dimensions != VECTOR_DIMENSIONS:
                 raise CorpusV2StoreError("C2_EMBEDDING_INVALID")
-            if any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) for value in embedding.vector):
+            try:
+                _require_finite_vector(embedding.vector)
+            except CorpusV2StoreError as error:
+                raise CorpusV2StoreError("C2_EMBEDDING_INVALID") from error
+            if vector_sha256(embedding.vector) != embedding.embedding_sha256:
                 raise CorpusV2StoreError("C2_EMBEDDING_INVALID")
             rows.append(
                 V2StoredChunk(
@@ -160,10 +195,13 @@ class CorpusV2Store:
                     release_id=self._release_config.release_id,
                     source_id=entry.source_id,
                     source_sha256=entry.source_sha256,
+                    content_sha256=entry.chunk.text_sha256,
                     manifest_sha256=entry.manifest_sha256,
                     location=entry.location,
                     embedding_model=entry.embedding_model,
                     vector_dimensions=entry.vector_dimensions,
+                    embedding_sha256=embedding.embedding_sha256,
+                    content=entry.content,
                     vector=embedding.vector,
                 )
             )
@@ -202,12 +240,14 @@ def validate_v2_index(
             row.release_id != release_binding.release_id
             or row.source_id != entry.source_id
             or row.source_sha256 != entry.source_sha256
+            or row.content_sha256 != entry.chunk.text_sha256
+            or hashlib.sha256(row.content.encode("utf-8")).hexdigest() != entry.chunk.text_sha256
             or row.manifest_sha256 != release_binding.index_manifest_sha256
             or row.location != entry.location
             or row.embedding_model != entry.embedding_model
             or row.vector_dimensions != entry.vector_dimensions
-            or len(row.vector) != entry.vector_dimensions
-            or any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) for value in row.vector)
+            or row.vector_dimensions != VECTOR_DIMENSIONS
+            or row.embedding_sha256 != vector_sha256(row.vector)
         ):
             raise CorpusV2StoreError("C2_INDEX_EXACT_SET_MISMATCH")
 

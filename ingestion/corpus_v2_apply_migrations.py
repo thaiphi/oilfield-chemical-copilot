@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Sequence
@@ -52,20 +53,39 @@ def validate_v2_schema(schema_path: Path) -> None:
         schema = schema_path.read_text(encoding="utf-8")
     except OSError as error:
         raise CorpusV2MigrationError("C2_MIGRATION_SCHEMA_INVALID") from error
-    required = (
-        "create table corpus_release",
-        "create table chunks",
+    uncommented = re.sub(r"--[^\r\n]*", "", schema).lower()
+    release_table = re.search(r"create table corpus_release\s*\((.*?)\n\);", uncommented, re.DOTALL)
+    chunks_table = re.search(r"create table chunks\s*\((.*?)\n\);", uncommented, re.DOTALL)
+    required_release_fragments = (
+        "release_id text not null unique",
+        "index_manifest_sha256 char(64) not null",
+        "unique (release_id, index_manifest_sha256)",
+    )
+    required_chunk_fragments = (
+        "chunk_id text not null",
         "release_id text not null",
         "source_id text not null",
         "source_sha256 char(64) not null",
+        "text_sha256 char(64) not null",
         "manifest_sha256 char(64) not null",
+        "embedding vector(384) not null",
+        "embedding_sha256 char(64) not null",
         "foreign key (release_id, manifest_sha256)",
-        "unique (release_id, chunk_id)",
-        "create trigger corpus_release_immutable",
-        "using hnsw (embedding vector_cosine_ops)",
+        "references corpus_release (release_id, index_manifest_sha256)",
     )
-    normalized = " ".join(schema.lower().split())
-    if not all(fragment in normalized for fragment in required):
+    if (
+        release_table is None
+        or chunks_table is None
+        or not all(fragment in release_table.group(1) for fragment in required_release_fragments)
+        or not all(fragment in chunks_table.group(1) for fragment in required_chunk_fragments)
+        or re.search(
+            r"create trigger corpus_release_immutable\s+before update or delete on corpus_release",
+            uncommented,
+        )
+        is None
+        or "create index v2_chunks_embedding_hnsw_idx on chunks using hnsw (embedding vector_cosine_ops);"
+        not in uncommented
+    ):
         raise CorpusV2MigrationError("C2_MIGRATION_SCHEMA_INVALID")
 
 
