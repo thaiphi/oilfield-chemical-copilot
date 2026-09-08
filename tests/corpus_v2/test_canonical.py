@@ -22,6 +22,11 @@ def test_canonical_jsonl_is_stable_and_newline_terminated() -> None:
     "record",
     [
         {"source_id": "doc-1", "source_sha256": "a" * 64},
+        {"source_id": "doc-385", "source_sha256": "a" * 64},
+        {
+            "chunk_id": "doc-385/chunk-12", "source_id": "doc-385", "ordinal": 12,
+            "text_sha256": "a" * 64, "character_count": 10,
+        },
         {
             "source_id": "doc-1", "acquired_at": "2026-09-07T00:00:00Z",
             "content_sha256": "a" * 64, "byte_count": 10,
@@ -41,11 +46,11 @@ def test_canonical_jsonl_is_stable_and_newline_terminated() -> None:
             "outcome": "EMPTY",
         },
         {
-            "chunk_id": "doc-1:0", "embedding_model": "local-model",
+            "chunk_id": "doc-1/chunk-0", "embedding_model": "local-model",
             "embedding_sha256": "a" * 64, "vector_dimensions": 384,
         },
         {
-            "chunk_id": "doc-1:0", "embedding_model": "sentence-transformers/all-MiniLM-L6-v2",
+            "chunk_id": "doc-1/chunk-0", "embedding_model": "sentence-transformers/all-MiniLM-L6-v2",
             "embedding_sha256": "a" * 64, "vector_dimensions": 384,
         },
     ],
@@ -72,12 +77,20 @@ def test_canonical_jsonl_round_trips_valid_public_task_record_mappings(
         {"source_id": "raw private content", "source_sha256": "a" * 64},
         {"source_id": "sk-proj-opaque123", "source_sha256": "a" * 64},
         {"source_id": "drive:sk-proj-opaque123456789", "source_sha256": "a" * 64},
+        {"source_id": "drive:1sk-proj-opaque123456789", "source_sha256": "a" * 64},
+        {"source_id": "drive:1abcdefghij1234567890", "source_sha256": "a" * 64},
+        {"source_id": "doc-0", "source_sha256": "a" * 64},
+        {"source_id": "doc-01", "source_sha256": "a" * 64},
         {
-            "chunk_id": "doc-1:0", "embedding_model": "password=secret",
+            "chunk_id": "drive:1sk-proj-opaque123456789:0", "embedding_model": "local-model",
             "embedding_sha256": "a" * 64, "vector_dimensions": 384,
         },
         {
-            "chunk_id": "doc-1:0", "embedding_model": "sentence-transformers/sk-proj-opaque123",
+            "chunk_id": "doc-1/chunk-0", "embedding_model": "password=secret",
+            "embedding_sha256": "a" * 64, "vector_dimensions": 384,
+        },
+        {
+            "chunk_id": "doc-1/chunk-0", "embedding_model": "sentence-transformers/sk-proj-opaque123",
             "embedding_sha256": "a" * 64, "vector_dimensions": 384,
         },
     ],

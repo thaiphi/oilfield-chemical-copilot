@@ -8,7 +8,12 @@ from collections.abc import Iterable, Mapping
 import re
 from typing import Any
 
-from .models import is_valid_embedding_model, is_valid_timestamp
+from .models import (
+    is_valid_embedding_model,
+    is_valid_public_chunk_id,
+    is_valid_public_source_id,
+    is_valid_timestamp,
+)
 
 
 class CorpusV2CanonicalError(ValueError):
@@ -41,8 +46,6 @@ _RECORD_SCHEMAS = {
         "index_manifest_sha256": "sha256", "chunk_count": "count",
     },
 }
-_SOURCE_ID = re.compile(r"^(?:doc-\d+|drive:1[A-Za-z0-9_-]{19,127})$")
-_CHUNK_ID = re.compile(r"^(?:doc-\d+|drive:1[A-Za-z0-9_-]{19,127}):\d+$")
 _RELEASE_ID = re.compile(r"^corpus-v2-\d{4}-\d{2}-\d{2}$")
 _EXTRACTOR = re.compile(r"^(?:pypdf|python-docx|synthetic)$")
 
@@ -66,10 +69,10 @@ def _validate(record: Mapping[str, Any]) -> None:
             if not isinstance(value, str) or len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
                 raise CorpusV2CanonicalError("C2_CANONICAL_INVALID")
         elif field_type == "source_id":
-            if not isinstance(value, str) or not _SOURCE_ID.fullmatch(value):
+            if not is_valid_public_source_id(value):
                 raise CorpusV2CanonicalError("C2_CANONICAL_INVALID")
         elif field_type == "chunk_id":
-            if not isinstance(value, str) or not _CHUNK_ID.fullmatch(value):
+            if not is_valid_public_chunk_id(value):
                 raise CorpusV2CanonicalError("C2_CANONICAL_INVALID")
         elif field_type == "release_id":
             if not isinstance(value, str) or not _RELEASE_ID.fullmatch(value):

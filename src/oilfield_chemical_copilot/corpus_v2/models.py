@@ -71,6 +71,27 @@ class StageArtifactKind(str, Enum):
 
 
 _EMBEDDING_MODELS = frozenset({"local-model", "sentence-transformers/all-MiniLM-L6-v2"})
+_PUBLIC_SOURCE_ID = re.compile(r"doc-[1-9][0-9]*")
+_PUBLIC_CHUNK_ID = re.compile(r"doc-[1-9][0-9]*/chunk-(?:0|[1-9][0-9]*)")
+
+
+def is_valid_public_source_id(value: object) -> bool:
+    """Accept a stable document pseudonym, never an upstream source identifier."""
+    return isinstance(value, str) and _PUBLIC_SOURCE_ID.fullmatch(value) is not None
+
+
+def is_valid_public_chunk_id(value: object) -> bool:
+    return isinstance(value, str) and _PUBLIC_CHUNK_ID.fullmatch(value) is not None
+
+
+def _public_source_id(value: object) -> None:
+    if not is_valid_public_source_id(value):
+        raise CorpusV2ContractError("C2_SOURCE_ID_INVALID")
+
+
+def _public_chunk_id(value: object) -> None:
+    if not is_valid_public_chunk_id(value):
+        raise CorpusV2ContractError("C2_CHUNK_ID_INVALID")
 
 
 def _invalid_config() -> None:
@@ -188,7 +209,7 @@ class ApprovedSource:
     source_sha256: str
 
     def __post_init__(self) -> None:
-        _non_empty(self.source_id)
+        _public_source_id(self.source_id)
         _sha256(self.source_sha256)
 
 
@@ -200,7 +221,7 @@ class AcquisitionRecord:
     byte_count: int
 
     def __post_init__(self) -> None:
-        _non_empty(self.source_id)
+        _public_source_id(self.source_id)
         if not is_valid_timestamp(self.acquired_at):
             raise CorpusV2ContractError("C2_TIMESTAMP_INVALID")
         _sha256(self.content_sha256)
@@ -217,7 +238,7 @@ class ExtractionRecord:
     outcome: ExtractionOutcome = ExtractionOutcome.SUCCESS
 
     def __post_init__(self) -> None:
-        _non_empty(self.source_id)
+        _public_source_id(self.source_id)
         if not is_valid_timestamp(self.extracted_at):
             raise CorpusV2ContractError("C2_TIMESTAMP_INVALID")
         _non_empty(self.extractor)
@@ -239,8 +260,8 @@ class CorpusV2Chunk:
     character_count: int
 
     def __post_init__(self) -> None:
-        _non_empty(self.chunk_id)
-        _non_empty(self.source_id)
+        _public_chunk_id(self.chunk_id)
+        _public_source_id(self.source_id)
         _count(self.ordinal)
         _sha256(self.text_sha256)
         _count(self.character_count)
@@ -254,7 +275,7 @@ class EmbeddingRecord:
     vector_dimensions: int
 
     def __post_init__(self) -> None:
-        _non_empty(self.chunk_id)
+        _public_chunk_id(self.chunk_id)
         if not is_valid_embedding_model(self.embedding_model):
             raise CorpusV2ContractError("C2_EMBEDDING_MODEL_INVALID")
         _sha256(self.embedding_sha256)

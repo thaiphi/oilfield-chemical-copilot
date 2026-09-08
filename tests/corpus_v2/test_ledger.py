@@ -75,7 +75,7 @@ def test_ledger_enforces_foreign_keys_and_survives_restart(tmp_path: Path) -> No
     ledger = CorpusV2Ledger.create(database_path, release_config=config())
     with pytest.raises(CorpusV2LedgerError, match="C2_SOURCE_UNKNOWN"):
         ledger.record_acquisition(
-            AcquisitionRecord("missing", "2026-09-07T00:00:00Z", SHA, 10)
+            AcquisitionRecord("doc-999", "2026-09-07T00:00:00Z", SHA, 10)
         )
     ledger.record_source(ApprovedSource(source_id="doc-1", source_sha256=SHA))
     ledger.complete_stage(Stage.REGISTERED)
