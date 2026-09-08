@@ -58,6 +58,12 @@ def test_release_config_requires_exact_non_boolean_source_count() -> None:
         ReleaseConfig.from_mapping(valid_release_config(expected_source_count=True))
 
 
+@pytest.mark.parametrize("release_id", ("sk-proj-secret", "C:/private/release", "corpus-v2-"))
+def test_release_config_rejects_nonpublic_release_identifier(release_id: str) -> None:
+    with pytest.raises(CorpusV2ContractError, match="C2_CONFIG_INVALID"):
+        ReleaseConfig.from_mapping(valid_release_config(release_id=release_id))
+
+
 def test_release_config_requires_a_critical_register_digest() -> None:
     payload = valid_release_config()
     del payload["critical_source_register_sha256"]

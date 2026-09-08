@@ -298,11 +298,13 @@ def _write_atomic_snapshot(
         raise CorpusV2AcquisitionError(error_code) from None
 
 
-def _safe_unlink(path: Path) -> None:
+def _safe_unlink(path: Path) -> bool:
+    """Attempt removal and report whether the path is definitely absent afterward."""
     try:
         path.unlink(missing_ok=True)
     except OSError:
-        pass
+        return not path.exists()
+    return not path.exists()
 
 
 def _marker_has_owner(pending: Path, owner_nonce: str) -> bool:
@@ -416,8 +418,8 @@ def acquire_source(
             revision_token=entry.pinned_revision_token,
         )
     except CorpusV2AcquisitionError:
-        _safe_unlink(target)
-        _remove_owned_pending(_pending_path(target), owner_nonce)
+        if _safe_unlink(target):
+            _remove_owned_pending(_pending_path(target), owner_nonce)
         raise
     except Exception:
         raise CorpusV2AcquisitionError("C2_ACQUISITION_RECORD_FAILED") from None

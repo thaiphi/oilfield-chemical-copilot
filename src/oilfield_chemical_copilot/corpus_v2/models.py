@@ -75,6 +75,7 @@ class StageArtifactKind(str, Enum):
 _EMBEDDING_MODELS = frozenset({"local-model", "sentence-transformers/all-MiniLM-L6-v2"})
 _PUBLIC_SOURCE_ID = re.compile(r"doc-[1-9][0-9]*")
 _PUBLIC_CHUNK_ID = re.compile(r"doc-[1-9][0-9]*/chunk-(?:0|[1-9][0-9]*)")
+_PUBLIC_RELEASE_ID = re.compile(r"corpus-v2-[a-z0-9]+(?:-[a-z0-9]+)*")
 
 
 def is_valid_public_source_id(value: object) -> bool:
@@ -110,6 +111,11 @@ def _public_chunk_id(value: object) -> None:
 
 def _invalid_config() -> None:
     raise CorpusV2ContractError("C2_CONFIG_INVALID")
+
+
+def is_valid_public_release_id(value: object) -> bool:
+    """Accept a release label suitable for public aggregates and marker binding."""
+    return isinstance(value, str) and _PUBLIC_RELEASE_ID.fullmatch(value) is not None
 
 
 def _non_empty(value: object, *, code: str = "C2_CONTRACT_INVALID") -> str:
@@ -161,7 +167,8 @@ class ReleaseConfig:
 
     def __post_init__(self) -> None:
         try:
-            _non_empty(self.release_id, code="C2_CONFIG_INVALID")
+            if not is_valid_public_release_id(self.release_id):
+                _invalid_config()
             if not isinstance(self.release_root, Path):
                 _invalid_config()
             candidate = _non_empty(self.candidate_database_name, code="C2_CONFIG_INVALID")
@@ -195,6 +202,8 @@ class ReleaseConfig:
             _invalid_config()
         try:
             release_id = _non_empty(payload["release_id"], code="C2_CONFIG_INVALID")
+            if not is_valid_public_release_id(release_id):
+                _invalid_config()
             release_root_value = _non_empty(payload["release_root"], code="C2_CONFIG_INVALID")
             candidate = _non_empty(payload["candidate_database_name"], code="C2_CONFIG_INVALID")
             configured = _non_empty(payload["configured_database_name"], code="C2_CONFIG_INVALID")
@@ -311,7 +320,8 @@ class ReleaseBinding:
     chunk_count: int
 
     def __post_init__(self) -> None:
-        _non_empty(self.release_id)
+        if not is_valid_public_release_id(self.release_id):
+            raise CorpusV2ContractError("C2_CONTRACT_INVALID")
         _sha256(self.source_register_sha256)
         _sha256(self.index_manifest_sha256)
         _count(self.chunk_count)

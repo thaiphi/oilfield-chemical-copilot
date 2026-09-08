@@ -403,3 +403,35 @@ def test_temp_cleanup_failure_after_publish_preserves_marker_for_recovery(
     recovered = acquire_source(_entry(), FakeDriveClient(), release_root=tmp_path, snapshot_root=target.parent, ledger=ledger)
     assert recovered.source_id == "doc-1"
     ledger.close()
+
+
+def test_post_download_validation_keeps_owner_marker_when_target_cleanup_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class RevisionChangingClient(FakeDriveClient):
+        def metadata(self, file_id: str) -> DriveFileMetadata:
+            self.metadata_calls.append(file_id)
+            revision = "revision-1" if len(self.metadata_calls) == 1 else "revision-2"
+            return DriveFileMetadata(file_id, "application/pdf", revision)
+
+    ledger = _ledger(tmp_path)
+    original_unlink = drive.os.unlink
+
+    def fail_target_unlink(path: str | bytes, *args: object, **kwargs: object) -> None:
+        if str(path).endswith("doc-1.blob"):
+            raise OSError("injected target cleanup failure")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(drive.os, "unlink", fail_target_unlink)
+    with pytest.raises(CorpusV2AcquisitionError, match="C2_DRIVE_REVISION_CHANGED"):
+        acquire_source(
+            _entry(),
+            RevisionChangingClient(),
+            release_root=tmp_path,
+            snapshot_root=tmp_path / "snapshots",
+            ledger=ledger,
+        )
+    target = tmp_path / "snapshots" / "doc-1.blob"
+    assert target.is_file()
+    assert drive._pending_path(target).is_file()  # noqa: SLF001
+    ledger.close()

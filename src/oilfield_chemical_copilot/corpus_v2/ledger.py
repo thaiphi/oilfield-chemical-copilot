@@ -19,6 +19,7 @@ from .models import (
     StageArtifactKind,
     Stage,
     is_valid_public_source_id,
+    is_valid_public_release_id,
 )
 
 
@@ -210,6 +211,8 @@ class CorpusV2Ledger:
         release = rows[0]
         legacy_names = json.loads(release["legacy_database_names_json"])
         if (
+            not is_valid_public_release_id(release["release_id"])
+            or
             not isinstance(legacy_names, list)
             or not all(isinstance(name, str) and name for name in legacy_names)
             or not isinstance(release["candidate_database_name"], str)
@@ -344,7 +347,7 @@ class CorpusV2Ledger:
     def release_id(self) -> str:
         """Return the sealed release identifier without exposing private source facts."""
         row = self._connection.execute("SELECT release_id FROM release").fetchone()
-        if row is None or not isinstance(row["release_id"], str) or not row["release_id"]:
+        if row is None or not is_valid_public_release_id(row["release_id"]):
             raise CorpusV2LedgerError("C2_LEDGER_INVALID")
         return row["release_id"]
 
