@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -17,6 +18,7 @@ from .models import (
     SourceDisposition,
     StageArtifactKind,
     Stage,
+    is_valid_public_source_id,
 )
 
 
@@ -54,6 +56,8 @@ class SnapshotAcquisitionFacts:
 
 
 _STAGE_ORDER = tuple(Stage)
+_MIME_TYPE = re.compile(r"^[a-z0-9][a-z0-9.+-]*/[a-z0-9][a-z0-9.+-]*$")
+_REVISION_TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 _REQUIRED_TABLES = {
     "release": {"release_id", "candidate_database_name", "configured_database_name", "legacy_database_names_json", "expected_source_count", "source_register_sha256", "critical_source_register_sha256"},
     "source_register": {"source_id", "source_sha256"},
@@ -71,6 +75,19 @@ _REQUIRED_TABLES = {
 
 def _timestamp() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _is_canonical_snapshot_path(path: object, source_id: object) -> bool:
+    """Allow only the fixed portable route for one public source pseudonym."""
+    return (
+        isinstance(path, str)
+        and isinstance(source_id, str)
+        and is_valid_public_source_id(source_id)
+        and path == f"snapshots/{source_id}.blob"
+        and "\\" not in path
+        and not path.startswith(("/", "//"))
+        and ":" not in path
+    )
 
 
 class CorpusV2Ledger:
@@ -334,17 +351,11 @@ class CorpusV2Ledger:
     ) -> None:
         """Atomically bind an acquisition to its opaque private snapshot facts."""
         self._ensure_mutable()
-        if (
-            not isinstance(snapshot_relative_path, str)
-            or not snapshot_relative_path
-            or "/" not in snapshot_relative_path
-            or snapshot_relative_path.startswith("/")
-            or ".." in snapshot_relative_path.split("/")
-            or not isinstance(mime_type, str)
-            or not mime_type
-            or not isinstance(revision_token, str)
-            or not revision_token
-        ):
+        if not _is_canonical_snapshot_path(snapshot_relative_path, acquisition.source_id):
+            raise CorpusV2LedgerError("C2_ACQUISITION_INVALID")
+        if not isinstance(mime_type, str) or not _MIME_TYPE.fullmatch(mime_type):
+            raise CorpusV2LedgerError("C2_ACQUISITION_INVALID")
+        if not isinstance(revision_token, str) or not _REVISION_TOKEN.fullmatch(revision_token):
             raise CorpusV2LedgerError("C2_ACQUISITION_INVALID")
         if not self._source_exists(acquisition.source_id):
             raise CorpusV2LedgerError("C2_SOURCE_UNKNOWN")
@@ -412,7 +423,7 @@ class CorpusV2Ledger:
     ) -> None:
         self._ensure_mutable()
         if not isinstance(stage, Stage) or stage.value not in {
-            "CHUNKED", "EMBEDDED", "INDEX_VALIDATED", "EVALUATED", "PROMOTION_READY", "PROMOTED",
+            "ACQUIRED", "CHUNKED", "EMBEDDED", "INDEX_VALIDATED", "EVALUATED", "PROMOTION_READY", "PROMOTED",
         }:
             raise CorpusV2LedgerError("C2_STAGE_ARTIFACT_INVALID")
         stage_index = _STAGE_ORDER.index(stage)
@@ -526,7 +537,10 @@ class CorpusV2Ledger:
             raise CorpusV2LedgerError("C2_STAGE_STATE")
         if stage is Stage.ACQUIRED:
             acquisition_count = self._connection.execute("SELECT COUNT(*) FROM acquisitions").fetchone()[0]
-            if acquisition_count != source_count:
+            snapshot_count = self._connection.execute(
+                "SELECT COUNT(*) FROM snapshot_acquisitions"
+            ).fetchone()[0]
+            if acquisition_count != source_count or snapshot_count != source_count:
                 raise CorpusV2LedgerError("C2_STAGE_STATE")
         if stage is Stage.PARSED:
             extraction_count = self._connection.execute("SELECT COUNT(*) FROM extractions").fetchone()[0]
@@ -538,7 +552,7 @@ class CorpusV2Ledger:
             ).fetchone()[0]
             if reviewed_count != source_count:
                 raise CorpusV2LedgerError("C2_STAGE_STATE")
-        if stage.value in {"CHUNKED", "EMBEDDED", "INDEX_VALIDATED", "EVALUATED", "PROMOTION_READY", "PROMOTED"}:
+        if stage.value in {"ACQUIRED", "CHUNKED", "EMBEDDED", "INDEX_VALIDATED", "EVALUATED", "PROMOTION_READY", "PROMOTED"}:
             artifact = self._connection.execute(
                 "SELECT artifact_sha256 FROM stage_artifacts WHERE stage = ?", (stage.value,)
             ).fetchone()

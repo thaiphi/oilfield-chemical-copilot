@@ -36,14 +36,26 @@ def config(*, expected_source_count: int = 1) -> ReleaseConfig:
     )
 
 
+def complete_single_source_acquisition(ledger: CorpusV2Ledger) -> None:
+    ledger.record_snapshot_acquisition(
+        AcquisitionRecord("doc-1", "2026-09-07T00:00:00Z", SHA, 10),
+        snapshot_relative_path="snapshots/doc-1.blob",
+        mime_type="application/pdf",
+        revision_token="revision-1",
+    )
+    ledger.record_stage_artifact(
+        Stage.ACQUIRED, artifact_kind=StageArtifactKind.ACQUISITION_MANIFEST, artifact_sha256=SHA
+    )
+    ledger.complete_stage(Stage.ACQUIRED)
+
+
 def test_ledger_rejects_stage_skip_and_preserves_decision_history(tmp_path: Path) -> None:
     ledger = CorpusV2Ledger.create(tmp_path / "ledger.sqlite", release_config=config())
     with pytest.raises(CorpusV2LedgerError, match="C2_STAGE_PREREQUISITE"):
         ledger.complete_stage(Stage.CHUNKED)
     ledger.record_source(ApprovedSource(source_id="doc-1", source_sha256=SHA))
     ledger.complete_stage(Stage.REGISTERED)
-    ledger.record_acquisition(AcquisitionRecord("doc-1", "2026-09-07T00:00:00Z", SHA, 10))
-    ledger.complete_stage(Stage.ACQUIRED)
+    complete_single_source_acquisition(ledger)
     ledger.record_extraction(ExtractionRecord("doc-1", "2026-09-07T00:00:00Z", "synthetic", SHA, 10))
     ledger.complete_stage(Stage.PARSED)
     ledger.record_disposition(
@@ -92,8 +104,7 @@ def test_ledger_rejects_mutations_after_promotion(tmp_path: Path) -> None:
     source = ApprovedSource(source_id="doc-1", source_sha256=SHA)
     ledger.record_source(source)
     ledger.complete_stage(Stage.REGISTERED)
-    ledger.record_acquisition(AcquisitionRecord("doc-1", "2026-09-07T00:00:00Z", SHA, 10))
-    ledger.complete_stage(Stage.ACQUIRED)
+    complete_single_source_acquisition(ledger)
     ledger.record_extraction(ExtractionRecord("doc-1", "2026-09-07T00:00:00Z", "synthetic", SHA, 10))
     ledger.complete_stage(Stage.PARSED)
     ledger.record_disposition(
@@ -127,8 +138,7 @@ def test_ledger_requires_durable_artifacts_for_chunked_through_promoted_stages(t
     ledger = CorpusV2Ledger.create(tmp_path / "ledger.sqlite", release_config=config())
     ledger.record_source(ApprovedSource(source_id="doc-1", source_sha256=SHA))
     ledger.complete_stage(Stage.REGISTERED)
-    ledger.record_acquisition(AcquisitionRecord("doc-1", "2026-09-07T00:00:00Z", SHA, 10))
-    ledger.complete_stage(Stage.ACQUIRED)
+    complete_single_source_acquisition(ledger)
     ledger.record_extraction(ExtractionRecord("doc-1", "2026-09-07T00:00:00Z", "synthetic", SHA, 10))
     ledger.complete_stage(Stage.PARSED)
     ledger.record_disposition(
@@ -149,8 +159,7 @@ def test_terminal_disposition_accepts_matching_mechanical_extraction_outcome(tmp
     ledger = CorpusV2Ledger.create(tmp_path / "ledger.sqlite", release_config=config())
     ledger.record_source(ApprovedSource(source_id="doc-1", source_sha256=SHA))
     ledger.complete_stage(Stage.REGISTERED)
-    ledger.record_acquisition(AcquisitionRecord("doc-1", "2026-09-07T00:00:00Z", SHA, 10))
-    ledger.complete_stage(Stage.ACQUIRED)
+    complete_single_source_acquisition(ledger)
     ledger.record_extraction(
         ExtractionRecord(
             "doc-1", "2026-09-07T00:00:00Z", "synthetic", None, 0, ExtractionOutcome.EMPTY
@@ -168,8 +177,7 @@ def test_terminal_extraction_outcome_cannot_be_marked_indexed(tmp_path: Path) ->
     ledger = CorpusV2Ledger.create(tmp_path / "ledger.sqlite", release_config=config())
     ledger.record_source(ApprovedSource(source_id="doc-1", source_sha256=SHA))
     ledger.complete_stage(Stage.REGISTERED)
-    ledger.record_acquisition(AcquisitionRecord("doc-1", "2026-09-07T00:00:00Z", SHA, 10))
-    ledger.complete_stage(Stage.ACQUIRED)
+    complete_single_source_acquisition(ledger)
     ledger.record_extraction(
         ExtractionRecord("doc-1", "2026-09-07T00:00:00Z", "synthetic", None, 0, ExtractionOutcome.EMPTY)
     )
@@ -185,8 +193,7 @@ def test_ledger_rejects_secret_or_wrong_stage_artifact_kind(tmp_path: Path) -> N
     ledger = CorpusV2Ledger.create(tmp_path / "ledger.sqlite", release_config=config())
     ledger.record_source(ApprovedSource(source_id="doc-1", source_sha256=SHA))
     ledger.complete_stage(Stage.REGISTERED)
-    ledger.record_acquisition(AcquisitionRecord("doc-1", "2026-09-07T00:00:00Z", SHA, 10))
-    ledger.complete_stage(Stage.ACQUIRED)
+    complete_single_source_acquisition(ledger)
     ledger.record_extraction(ExtractionRecord("doc-1", "2026-09-07T00:00:00Z", "synthetic", SHA, 10))
     ledger.complete_stage(Stage.PARSED)
     ledger.record_disposition(

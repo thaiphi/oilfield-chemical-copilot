@@ -13,8 +13,8 @@ from oilfield_chemical_copilot.corpus_v2.drive import (
     acquire_registered_sources,
     acquire_source,
 )
-from oilfield_chemical_copilot.corpus_v2.ledger import CorpusV2Ledger
-from oilfield_chemical_copilot.corpus_v2.models import ApprovedSource, ReleaseConfig, Stage
+from oilfield_chemical_copilot.corpus_v2.ledger import CorpusV2Ledger, CorpusV2LedgerError
+from oilfield_chemical_copilot.corpus_v2.models import AcquisitionRecord, ApprovedSource, ReleaseConfig, Stage
 from oilfield_chemical_copilot.corpus_v2.registers import ApprovedSourceRegisterEntry
 
 
@@ -89,7 +89,7 @@ def test_acquire_blocks_when_drive_revision_changes(tmp_path: Path) -> None:
     client = FakeDriveClient(metadata=DriveFileMetadata("drive-1", "application/pdf", "new-revision"))
 
     with pytest.raises(CorpusV2AcquisitionError, match="C2_DRIVE_REVISION_CHANGED"):
-        acquire_source(_entry(), client, snapshot_root=tmp_path / "snapshots", ledger=ledger)
+        acquire_source(_entry(), client, release_root=tmp_path, snapshot_root=tmp_path / "snapshots", ledger=ledger)
 
     assert not (tmp_path / "snapshots").exists()
     ledger.close()
@@ -99,7 +99,7 @@ def test_acquisition_hashes_downloaded_bytes_and_uses_only_registered_identity(t
     ledger = _ledger(tmp_path)
     client = FakeDriveClient(payload=b"approved")
 
-    record = acquire_source(_entry(), client, snapshot_root=tmp_path / "snapshots", ledger=ledger)
+    record = acquire_source(_entry(), client, release_root=tmp_path, snapshot_root=tmp_path / "snapshots", ledger=ledger)
 
     assert record.byte_sha256 == hashlib.sha256(b"approved").hexdigest()
     assert record.source_id == "doc-1"
@@ -116,10 +116,10 @@ def test_native_export_requires_explicit_approved_export_mime(tmp_path: Path) ->
     client = FakeDriveClient(metadata=DriveFileMetadata("drive-1", native, "revision-1"))
 
     with pytest.raises(CorpusV2AcquisitionError, match="C2_DRIVE_EXPORT_POLICY_INVALID"):
-        acquire_source(_entry(mime_type=native), client, snapshot_root=tmp_path / "snapshots", ledger=ledger)
+        acquire_source(_entry(mime_type=native), client, release_root=tmp_path, snapshot_root=tmp_path / "snapshots", ledger=ledger)
 
     allowed = _entry(mime_type=native, export_mime="application/pdf")
-    record = acquire_source(allowed, client, snapshot_root=tmp_path / "snapshots", ledger=ledger)
+    record = acquire_source(allowed, client, release_root=tmp_path, snapshot_root=tmp_path / "snapshots", ledger=ledger)
     assert record.mime_type == "application/pdf"
     assert client.download_calls == [("drive-1", "application/pdf")]
     ledger.close()
@@ -128,15 +128,15 @@ def test_native_export_requires_explicit_approved_export_mime(tmp_path: Path) ->
 def test_resume_is_idempotent_and_rejects_mismatched_observed_facts(tmp_path: Path) -> None:
     ledger = _ledger(tmp_path)
     first_client = FakeDriveClient(payload=b"approved")
-    first = acquire_source(_entry(), first_client, snapshot_root=tmp_path / "snapshots", ledger=ledger)
+    first = acquire_source(_entry(), first_client, release_root=tmp_path, snapshot_root=tmp_path / "snapshots", ledger=ledger)
 
-    resumed = acquire_source(_entry(), FakeDriveClient(payload=b"different"), snapshot_root=tmp_path / "snapshots", ledger=ledger)
+    resumed = acquire_source(_entry(), FakeDriveClient(payload=b"different"), release_root=tmp_path, snapshot_root=tmp_path / "snapshots", ledger=ledger)
     assert resumed == first
     assert (tmp_path / first.relative_snapshot_path).read_bytes() == b"approved"
 
     changed = FakeDriveClient(metadata=DriveFileMetadata("drive-1", "application/pdf", "revision-2"))
     with pytest.raises(CorpusV2AcquisitionError, match="C2_ACQUISITION_RESUME_MISMATCH"):
-        acquire_source(_entry(), changed, snapshot_root=tmp_path / "snapshots", ledger=ledger)
+        acquire_source(_entry(), changed, release_root=tmp_path, snapshot_root=tmp_path / "snapshots", ledger=ledger)
     ledger.close()
 
 
@@ -150,21 +150,25 @@ def test_acquire_registered_sources_requires_exact_register_acquisition_identity
         "drive-2": FakeDriveClient(metadata=DriveFileMetadata("drive-2", "application/pdf", "revision-1")),
     }
 
+    with pytest.raises(CorpusV2AcquisitionError, match="C2_ACQUISITION_REGISTER_MISMATCH"):
+        acquire_registered_sources(
+            entries[:1],
+            client_for_source=lambda entry: clients[entry.drive_file_id],
+            release_root=tmp_path,
+            snapshot_root=tmp_path / "snapshots",
+            ledger=ledger,
+        )
+    assert ledger.completed_stages() == (Stage.REGISTERED,)
+
     records = acquire_registered_sources(
         entries,
         client_for_source=lambda entry: clients[entry.drive_file_id],
+        release_root=tmp_path,
         snapshot_root=tmp_path / "snapshots",
         ledger=ledger,
     )
     assert {record.source_id for record in records} == {"doc-1", "doc-2"}
 
-    with pytest.raises(CorpusV2AcquisitionError, match="C2_ACQUISITION_REGISTER_MISMATCH"):
-        acquire_registered_sources(
-            entries[:1],
-            client_for_source=lambda entry: clients[entry.drive_file_id],
-            snapshot_root=tmp_path / "snapshots",
-            ledger=ledger,
-        )
     ledger.close()
 
 
@@ -173,9 +177,158 @@ def test_failure_cleans_staging_and_errors_never_disclose_credentials(tmp_path: 
     client = FakeDriveClient(download_error=RuntimeError("token=secret-value"))
 
     with pytest.raises(CorpusV2AcquisitionError, match="C2_DRIVE_DOWNLOAD_FAILED") as error:
-        acquire_source(_entry(), client, snapshot_root=tmp_path / "snapshots", ledger=ledger)
+        acquire_source(_entry(), client, release_root=tmp_path, snapshot_root=tmp_path / "snapshots", ledger=ledger)
 
     assert "secret-value" not in str(error.value)
     snapshots = tmp_path / "snapshots"
     assert not snapshots.exists() or not list(snapshots.iterdir())
+    ledger.close()
+
+
+def test_acquisition_rejects_snapshot_root_outside_trusted_release(tmp_path: Path) -> None:
+    ledger = _ledger(tmp_path)
+
+    with pytest.raises(CorpusV2AcquisitionError, match="C2_SNAPSHOT_PATH_INVALID"):
+        acquire_source(
+            _entry(),
+            FakeDriveClient(),
+            release_root=tmp_path,
+            snapshot_root=tmp_path.parent / "outside-snapshots",
+            ledger=ledger,
+        )
+    ledger.close()
+
+
+def test_acquisition_collision_never_overwrites_existing_snapshot(tmp_path: Path) -> None:
+    ledger = _ledger(tmp_path)
+    target = tmp_path / "snapshots" / "doc-1.blob"
+    target.parent.mkdir()
+    target.write_bytes(b"existing")
+
+    with pytest.raises(CorpusV2AcquisitionError, match="C2_SNAPSHOT_DUPLICATE"):
+        acquire_source(_entry(), FakeDriveClient(), release_root=tmp_path, snapshot_root=target.parent, ledger=ledger)
+
+    assert target.read_bytes() == b"existing"
+    ledger.close()
+
+
+def test_crash_after_publish_resumes_without_duplicate_download(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    ledger = _ledger(tmp_path)
+    client = FakeDriveClient()
+
+    def fail_record(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("injected")
+
+    monkeypatch.setattr(ledger, "record_snapshot_acquisition", fail_record)
+    with pytest.raises(CorpusV2AcquisitionError, match="C2_ACQUISITION_RECORD_FAILED"):
+        acquire_source(_entry(), client, release_root=tmp_path, snapshot_root=tmp_path / "snapshots", ledger=ledger)
+    assert (tmp_path / "snapshots" / "doc-1.blob").is_file()
+    assert len(client.download_calls) == 1
+
+    monkeypatch.undo()
+    recovered = acquire_source(_entry(), client, release_root=tmp_path, snapshot_root=tmp_path / "snapshots", ledger=ledger)
+    assert recovered.byte_count == len(b"approved")
+    assert len(client.download_calls) == 1
+    ledger.close()
+
+
+def test_post_download_revision_change_and_nonbytes_output_fail_closed(tmp_path: Path) -> None:
+    class RevisionChangingClient(FakeDriveClient):
+        def metadata(self, file_id: str) -> DriveFileMetadata:
+            self.metadata_calls.append(file_id)
+            revision = "revision-1" if len(self.metadata_calls) == 1 else "revision-2"
+            return DriveFileMetadata(file_id, "application/pdf", revision)
+
+    ledger = _ledger(tmp_path)
+    with pytest.raises(CorpusV2AcquisitionError, match="C2_DRIVE_REVISION_CHANGED"):
+        acquire_source(_entry(), RevisionChangingClient(), release_root=tmp_path, snapshot_root=tmp_path / "snapshots", ledger=ledger)
+    assert not (tmp_path / "snapshots" / "doc-1.blob").exists()
+    ledger.close()
+
+    second_root = tmp_path / "second"
+    second_root.mkdir()
+    second = _ledger(second_root)
+    class NonBytesClient(FakeDriveClient):
+        def download(self, file_id: str, export_mime_type: str | None) -> bytes:
+            del file_id, export_mime_type
+            return "not-bytes"  # type: ignore[return-value]
+
+    with pytest.raises(CorpusV2AcquisitionError, match="C2_SNAPSHOT_PARTIAL_OUTPUT"):
+        acquire_source(_entry(), NonBytesClient(), release_root=second_root, snapshot_root=second_root / "snapshots", ledger=second)
+    second.close()
+
+
+def test_client_factory_error_is_sanitized(tmp_path: Path) -> None:
+    ledger = _ledger(tmp_path)
+
+    with pytest.raises(CorpusV2AcquisitionError, match="C2_DRIVE_CLIENT_INVALID") as error:
+        acquire_registered_sources(
+            (_entry(),),
+            client_for_source=lambda entry: (_ for _ in ()).throw(RuntimeError("token=secret-value")),
+            release_root=tmp_path,
+            snapshot_root=tmp_path / "snapshots",
+            ledger=ledger,
+        )
+    assert "secret-value" not in str(error.value)
+    ledger.close()
+
+
+def test_full_register_acquisition_records_artifact_then_completes_acquired_stage(tmp_path: Path) -> None:
+    source_ids = tuple(f"doc-{index}" for index in range(1, 386))
+    ledger = _ledger(tmp_path, source_ids=source_ids)
+    entries = tuple(_entry(source_id=source_id, file_id=f"drive-{index}") for index, source_id in enumerate(source_ids, 1))
+
+    def client_for_source(entry: ApprovedSourceRegisterEntry) -> FakeDriveClient:
+        return FakeDriveClient(metadata=DriveFileMetadata(entry.drive_file_id, "application/pdf", "revision-1"))
+
+    records = acquire_registered_sources(
+        entries,
+        client_for_source=client_for_source,
+        release_root=tmp_path,
+        snapshot_root=tmp_path / "snapshots",
+        ledger=ledger,
+    )
+
+    assert len(records) == 385
+    assert ledger.completed_stages() == (Stage.REGISTERED, Stage.ACQUIRED)
+    assert any(event.event_type == "stage_artifact_recorded" for event in ledger.event_history())
+    ledger.close()
+
+
+def test_nonregular_target_is_rejected_and_never_replaced(tmp_path: Path) -> None:
+    ledger = _ledger(tmp_path)
+    target = tmp_path / "snapshots" / "doc-1.blob"
+    target.mkdir(parents=True)
+
+    with pytest.raises(CorpusV2AcquisitionError, match="C2_SNAPSHOT_NONREGULAR"):
+        acquire_source(_entry(), FakeDriveClient(), release_root=tmp_path, snapshot_root=target.parent, ledger=ledger)
+    assert target.is_dir()
+    ledger.close()
+
+
+def test_ledger_rejects_mixed_separator_or_noncanonical_snapshot_routes(tmp_path: Path) -> None:
+    ledger = _ledger(tmp_path)
+    acquisition = AcquisitionRecord("doc-1", "2026-09-07T00:00:00Z", SHA, 1)
+    for path in ("snapshots\\doc-1.blob", "C:/snapshots/doc-1.blob", "../snapshots/doc-1.blob"):
+        with pytest.raises(CorpusV2LedgerError, match="C2_ACQUISITION_INVALID"):
+            ledger.record_snapshot_acquisition(
+                acquisition,
+                snapshot_relative_path=path,
+                mime_type="application/pdf",
+                revision_token="revision-1",
+            )
+    ledger.close()
+
+
+def test_snapshot_root_symlink_escape_is_rejected_when_supported(tmp_path: Path) -> None:
+    outside = tmp_path.parent / "outside-snapshots"
+    outside.mkdir(exist_ok=True)
+    alias = tmp_path / "snapshots"
+    try:
+        alias.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlink creation unavailable on this platform")
+    ledger = _ledger(tmp_path)
+    with pytest.raises(CorpusV2AcquisitionError, match="C2_SNAPSHOT_PATH_INVALID"):
+        acquire_source(_entry(), FakeDriveClient(), release_root=tmp_path, snapshot_root=alias, ledger=ledger)
     ledger.close()

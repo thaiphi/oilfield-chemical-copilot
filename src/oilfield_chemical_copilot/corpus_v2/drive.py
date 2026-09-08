@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
+import json
 import hashlib
 import os
 from pathlib import Path
@@ -85,10 +86,38 @@ def _validate_metadata(
 
 
 def _relative_snapshot_path(snapshot_root: Path, source_id: str) -> str:
-    root_name = snapshot_root.name
-    if not root_name or root_name in {".", ".."}:
-        raise CorpusV2AcquisitionError("C2_SNAPSHOT_PATH_INVALID")
-    return f"{root_name}/{source_id}.blob"
+    del snapshot_root
+    return f"snapshots/{source_id}.blob"
+
+
+def _is_reparse_or_symlink(path: Path) -> bool:
+    try:
+        attributes = path.lstat().st_file_attributes  # type: ignore[attr-defined]
+    except (AttributeError, OSError):
+        return path.is_symlink()
+    return path.is_symlink() or bool(attributes & 0x400)
+
+
+def _validate_snapshot_root(*, release_root: Path, snapshot_root: Path) -> Path:
+    """Accept only a real release-root/snapshots directory, never an alias or escape."""
+    try:
+        trusted_root = release_root.resolve(strict=True)
+        if not trusted_root.is_dir() or _is_reparse_or_symlink(release_root):
+            raise ValueError
+        candidate = snapshot_root.resolve(strict=False)
+        if candidate != trusted_root / "snapshots":
+            raise ValueError
+        relative = snapshot_root.absolute().relative_to(release_root.absolute())
+        if relative.as_posix() != "snapshots":
+            raise ValueError
+        current = release_root.absolute()
+        for component in relative.parts:
+            current /= component
+            if current.exists() and _is_reparse_or_symlink(current):
+                raise ValueError
+    except (OSError, ValueError):
+        raise CorpusV2AcquisitionError("C2_SNAPSHOT_PATH_INVALID") from None
+    return candidate
 
 
 def _snapshot_record(facts: SnapshotAcquisitionFacts) -> SnapshotAcquisitionRecord:
@@ -118,6 +147,7 @@ def _validate_existing_snapshot(
         or facts.mime_type != observed_mime_type
         or not target.is_file()
         or target.is_symlink()
+        or _is_reparse_or_symlink(target)
     ):
         raise CorpusV2AcquisitionError("C2_ACQUISITION_RESUME_MISMATCH")
     try:
@@ -129,9 +159,74 @@ def _validate_existing_snapshot(
     return _snapshot_record(facts)
 
 
-def _write_atomic_snapshot(target: Path, payload: bytes) -> tuple[str, int]:
-    """Write, fsync, hash, then rename a private byte snapshot without replacement."""
+def _load_pending_recovery(
+    *,
+    target: Path,
+    entry: ApprovedSourceRegisterEntry,
+    output_mime_type: str,
+) -> tuple[str, int]:
+    """Validate a controller-owned publish marker before recovering a crash gap."""
+    pending = _pending_path(target)
+    if not target.exists():
+        raise CorpusV2AcquisitionError("C2_SNAPSHOT_DUPLICATE")
+    if not target.is_file() or target.is_symlink() or _is_reparse_or_symlink(target):
+        raise CorpusV2AcquisitionError("C2_SNAPSHOT_NONREGULAR")
+    if not pending.is_file() or pending.is_symlink() or _is_reparse_or_symlink(pending):
+        raise CorpusV2AcquisitionError("C2_SNAPSHOT_DUPLICATE")
+    try:
+        marker = json.loads(pending.read_text(encoding="utf-8"))
+        payload = target.read_bytes()
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        raise CorpusV2AcquisitionError("C2_ACQUISITION_RESUME_MISMATCH") from None
+    digest = hashlib.sha256(payload).hexdigest()
+    if (
+        not isinstance(marker, dict)
+        or set(marker) != {"byte_count", "content_sha256", "mime_type", "revision_token"}
+        or marker.get("content_sha256") != digest
+        or marker.get("byte_count") != len(payload)
+        or marker.get("mime_type") != output_mime_type
+        or marker.get("revision_token") != entry.pinned_revision_token
+    ):
+        raise CorpusV2AcquisitionError("C2_ACQUISITION_RESUME_MISMATCH")
+    return digest, len(payload)
+
+
+def _fsync_directory(directory: Path) -> None:
+    """Best-effort directory durability; directory handles are not portable on Windows."""
+    try:
+        descriptor = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    except OSError:
+        pass
+    finally:
+        os.close(descriptor)
+
+
+def _pending_path(target: Path) -> Path:
+    return target.with_name(f".{target.stem}.pending.json")
+
+
+def _pending_payload(*, digest: str, byte_count: int, mime_type: str, revision_token: str) -> bytes:
+    return json.dumps(
+        {"byte_count": byte_count, "content_sha256": digest, "mime_type": mime_type, "revision_token": revision_token},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _write_atomic_snapshot(
+    target: Path,
+    payload: bytes,
+    *,
+    mime_type: str,
+    revision_token: str,
+) -> tuple[str, int]:
+    """Write, fsync, mark, and publish without replacement in one directory."""
     temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+    pending = _pending_path(target)
     try:
         with temporary.open("xb") as handle:
             handle.write(payload)
@@ -141,17 +236,27 @@ def _write_atomic_snapshot(target: Path, payload: bytes) -> tuple[str, int]:
         digest = hashlib.sha256(written).hexdigest()
         if len(written) != len(payload):
             raise CorpusV2AcquisitionError("C2_SNAPSHOT_PARTIAL_OUTPUT")
-        if target.exists() or target.is_symlink():
+        if target.exists() or target.is_symlink() or pending.exists():
             raise CorpusV2AcquisitionError("C2_SNAPSHOT_DUPLICATE")
-        os.rename(temporary, target)
-        if not target.is_file() or target.is_symlink():
+        with pending.open("xb") as handle:
+            handle.write(_pending_payload(
+                digest=digest, byte_count=len(written), mime_type=mime_type, revision_token=revision_token
+            ))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.link(temporary, target)
+        temporary.unlink()
+        _fsync_directory(target.parent)
+        if not target.is_file() or target.is_symlink() or _is_reparse_or_symlink(target):
             raise CorpusV2AcquisitionError("C2_SNAPSHOT_NONREGULAR")
         return digest, len(written)
     except CorpusV2AcquisitionError:
         temporary.unlink(missing_ok=True)
+        pending.unlink(missing_ok=True)
         raise
     except OSError:
         temporary.unlink(missing_ok=True)
+        pending.unlink(missing_ok=True)
         raise CorpusV2AcquisitionError("C2_SNAPSHOT_WRITE_FAILED") from None
 
 
@@ -159,12 +264,14 @@ def acquire_source(
     entry: ApprovedSourceRegisterEntry,
     client: DriveSourceClient,
     *,
+    release_root: Path,
     snapshot_root: Path,
     ledger: CorpusV2Ledger,
 ) -> SnapshotAcquisitionRecord:
     """Acquire one approved identity using its pinned Drive facts and nothing else."""
     if not isinstance(entry, ApprovedSourceRegisterEntry):
         raise CorpusV2AcquisitionError("C2_ACQUISITION_REGISTER_INVALID")
+    snapshot_root = _validate_snapshot_root(release_root=release_root, snapshot_root=snapshot_root)
     relative_path = _relative_snapshot_path(snapshot_root, entry.source_id)
     existing = ledger.snapshot_acquisition(entry.source_id)
     try:
@@ -181,6 +288,28 @@ def acquire_source(
             observed_mime_type=output_mime_type,
         )
 
+    target = snapshot_root / f"{entry.source_id}.blob"
+    if target.exists() or target.is_symlink():
+        digest, byte_count = _load_pending_recovery(
+            target=target,
+            entry=entry,
+            output_mime_type=output_mime_type,
+        )
+        try:
+            ledger.record_snapshot_acquisition(
+                AcquisitionRecord(entry.source_id, _timestamp(), digest, byte_count),
+                snapshot_relative_path=relative_path,
+                mime_type=output_mime_type,
+                revision_token=entry.pinned_revision_token,
+            )
+        except Exception:
+            raise CorpusV2AcquisitionError("C2_ACQUISITION_RECORD_FAILED") from None
+        _pending_path(target).unlink(missing_ok=True)
+        facts = ledger.snapshot_acquisition(entry.source_id)
+        if facts is None:
+            raise CorpusV2AcquisitionError("C2_ACQUISITION_RECORD_FAILED")
+        return _snapshot_record(facts)
+
     try:
         payload = client.download(entry.drive_file_id, entry.approved_export_mime_type)
     except Exception:
@@ -193,8 +322,9 @@ def acquire_source(
         raise CorpusV2AcquisitionError("C2_SNAPSHOT_WRITE_FAILED") from None
     if not snapshot_root.is_dir() or snapshot_root.is_symlink():
         raise CorpusV2AcquisitionError("C2_SNAPSHOT_NONREGULAR")
-    target = snapshot_root / f"{entry.source_id}.blob"
-    digest, byte_count = _write_atomic_snapshot(target, payload)
+    digest, byte_count = _write_atomic_snapshot(
+        target, payload, mime_type=output_mime_type, revision_token=entry.pinned_revision_token
+    )
     try:
         post_download_metadata = client.metadata(entry.drive_file_id)
         _validate_metadata(entry, post_download_metadata, resuming=False)
@@ -211,14 +341,14 @@ def acquire_source(
         )
     except CorpusV2AcquisitionError:
         target.unlink(missing_ok=True)
+        _pending_path(target).unlink(missing_ok=True)
         raise
-    except (CorpusV2LedgerError, OSError):
-        target.unlink(missing_ok=True)
+    except Exception:
         raise CorpusV2AcquisitionError("C2_ACQUISITION_RECORD_FAILED") from None
     facts = ledger.snapshot_acquisition(entry.source_id)
     if facts is None:
-        target.unlink(missing_ok=True)
         raise CorpusV2AcquisitionError("C2_ACQUISITION_RECORD_FAILED")
+    _pending_path(target).unlink(missing_ok=True)
     return _snapshot_record(facts)
 
 
@@ -226,6 +356,7 @@ def acquire_registered_sources(
     entries: tuple[ApprovedSourceRegisterEntry, ...],
     *,
     client_for_source: Callable[[ApprovedSourceRegisterEntry], DriveSourceClient],
+    release_root: Path,
     snapshot_root: Path,
     ledger: CorpusV2Ledger,
 ) -> tuple[SnapshotAcquisitionRecord, ...]:
@@ -236,7 +367,35 @@ def acquire_registered_sources(
     existing_ids = set(ledger.registered_source_ids())
     if set(source_ids) != existing_ids:
         raise CorpusV2AcquisitionError("C2_ACQUISITION_REGISTER_MISMATCH")
-    return tuple(
-        acquire_source(entry, client_for_source(entry), snapshot_root=snapshot_root, ledger=ledger)
-        for entry in entries
-    )
+    records: list[SnapshotAcquisitionRecord] = []
+    for entry in entries:
+        try:
+            client = client_for_source(entry)
+        except Exception:
+            raise CorpusV2AcquisitionError("C2_DRIVE_CLIENT_INVALID") from None
+        records.append(
+            acquire_source(
+                entry, client, release_root=release_root, snapshot_root=snapshot_root, ledger=ledger
+            )
+        )
+    if {record.source_id for record in records} != existing_ids:
+        raise CorpusV2AcquisitionError("C2_ACQUISITION_REGISTER_MISMATCH")
+    try:
+        artifact_sha256 = hashlib.sha256(
+            b"".join(
+                json.dumps(
+                    {"byte_count": record.byte_count, "content_sha256": record.byte_sha256, "mime_type": record.mime_type, "revision_token": record.revision_token, "source_id": record.source_id},
+                    sort_keys=True, separators=(",", ":")
+                ).encode("utf-8") + b"\n"
+                for record in sorted(records, key=lambda item: item.source_id)
+            )
+        ).hexdigest()
+        from .models import Stage, StageArtifactKind
+
+        ledger.record_stage_artifact(
+            Stage.ACQUIRED, artifact_kind=StageArtifactKind.ACQUISITION_MANIFEST, artifact_sha256=artifact_sha256
+        )
+        ledger.complete_stage(Stage.ACQUIRED)
+    except CorpusV2LedgerError:
+        raise CorpusV2AcquisitionError("C2_ACQUISITION_STAGE_FAILED") from None
+    return tuple(records)

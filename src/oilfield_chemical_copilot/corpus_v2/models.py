@@ -47,6 +47,7 @@ class Stage(str, Enum):
 
 
 class StageArtifactKind(str, Enum):
+    ACQUISITION_MANIFEST = "ACQUISITION_MANIFEST"
     CHUNK_MANIFEST = "CHUNK_MANIFEST"
     EMBEDDING_MANIFEST = "EMBEDDING_MANIFEST"
     INDEX_VALIDATION_REPORT = "INDEX_VALIDATION_REPORT"
@@ -57,6 +58,7 @@ class StageArtifactKind(str, Enum):
     @classmethod
     def for_stage(cls, stage: Stage) -> "StageArtifactKind":
         mapping = {
+            Stage.ACQUIRED: cls.ACQUISITION_MANIFEST,
             Stage.CHUNKED: cls.CHUNK_MANIFEST,
             Stage.EMBEDDED: cls.EMBEDDING_MANIFEST,
             Stage.INDEX_VALIDATED: cls.INDEX_VALIDATION_REPORT,
