@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from oilfield_chemical_copilot.corpus_v2.canonical import (
@@ -19,6 +21,36 @@ def test_canonical_jsonl_is_stable_and_newline_terminated() -> None:
 @pytest.mark.parametrize(
     "record",
     [
+        {"source_id": "doc-1", "source_sha256": "a" * 64},
+        {
+            "source_id": "doc-1", "acquired_at": "2026-09-07T00:00:00Z",
+            "content_sha256": "a" * 64, "byte_count": 10,
+        },
+        {
+            "source_id": "doc-1", "extracted_at": "2026-09-07T00:00:00Z",
+            "extractor": "pypdf", "text_sha256": "a" * 64, "character_count": 10,
+            "outcome": "SUCCESS",
+        },
+        {
+            "source_id": "doc-1", "extracted_at": "2026-09-07T00:00:00Z",
+            "extractor": "pypdf", "text_sha256": None, "character_count": 0,
+            "outcome": "EMPTY",
+        },
+        {
+            "chunk_id": "doc-1:0", "embedding_model": "local-model",
+            "embedding_sha256": "a" * 64, "vector_dimensions": 384,
+        },
+    ],
+)
+def test_canonical_jsonl_round_trips_valid_public_task_record_mappings(
+    record: dict[str, object],
+) -> None:
+    assert json.loads(canonical_jsonl([record]).decode("utf-8")) == record
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
         {"score": 1.5},
         {"source_text": "private"},
         {"input_path": "C:/private/document.pdf"},
@@ -27,6 +59,13 @@ def test_canonical_jsonl_is_stable_and_newline_terminated() -> None:
         {"uri": "https://private.example/document"},
         {"password": "secret"},
         {"authorization": "Bearer secret"},
+        {"source_id": "C:/private/document.pdf", "source_sha256": "a" * 64},
+        {"source_id": "Bearer secret", "source_sha256": "a" * 64},
+        {"source_id": "raw private content", "source_sha256": "a" * 64},
+        {
+            "chunk_id": "doc-1:0", "embedding_model": "password=secret",
+            "embedding_sha256": "a" * 64, "vector_dimensions": 384,
+        },
     ],
 )
 def test_canonical_jsonl_rejects_unsafe_public_aggregate_fields(record: dict[str, object]) -> None:

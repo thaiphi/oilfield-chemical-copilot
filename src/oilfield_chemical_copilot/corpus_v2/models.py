@@ -23,6 +23,14 @@ class SourceDisposition(str, Enum):
     UNRESOLVED = "UNRESOLVED"
 
 
+class ExtractionOutcome(str, Enum):
+    SUCCESS = "SUCCESS"
+    NON_TEXT = "NON_TEXT"
+    EMPTY = "EMPTY"
+    UNSUPPORTED = "UNSUPPORTED"
+    FAILED = "FAILED"
+
+
 class Stage(str, Enum):
     REGISTERED = "REGISTERED"
     ACQUIRED = "ACQUIRED"
@@ -160,15 +168,21 @@ class ExtractionRecord:
     source_id: str
     extracted_at: str
     extractor: str
-    text_sha256: str
+    text_sha256: str | None
     character_count: int
+    outcome: ExtractionOutcome = ExtractionOutcome.SUCCESS
 
     def __post_init__(self) -> None:
         _non_empty(self.source_id)
         _non_empty(self.extracted_at)
         _non_empty(self.extractor)
-        _sha256(self.text_sha256)
         _count(self.character_count)
+        if not isinstance(self.outcome, ExtractionOutcome):
+            raise CorpusV2ContractError("C2_EXTRACTION_INVALID")
+        if self.outcome is ExtractionOutcome.SUCCESS:
+            _sha256(self.text_sha256)
+        elif self.text_sha256 is not None or self.character_count != 0:
+            raise CorpusV2ContractError("C2_EXTRACTION_INVALID")
 
 
 @dataclass(frozen=True)

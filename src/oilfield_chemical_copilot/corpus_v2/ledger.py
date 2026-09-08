@@ -8,7 +8,15 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .models import AcquisitionRecord, ApprovedSource, ExtractionRecord, ReleaseConfig, SourceDisposition, Stage
+from .models import (
+    AcquisitionRecord,
+    ApprovedSource,
+    ExtractionOutcome,
+    ExtractionRecord,
+    ReleaseConfig,
+    SourceDisposition,
+    Stage,
+)
 
 
 class CorpusV2LedgerError(RuntimeError):
@@ -36,10 +44,11 @@ _REQUIRED_TABLES = {
     "release": {"release_id", "candidate_database_name", "configured_database_name", "legacy_database_names_json", "expected_source_count", "source_register_sha256"},
     "source_register": {"source_id", "source_sha256"},
     "acquisitions": {"source_id", "acquired_at", "content_sha256", "byte_count"},
-    "extractions": {"source_id", "extracted_at", "extractor", "text_sha256", "character_count"},
+    "extractions": {"source_id", "extracted_at", "extractor", "text_sha256", "character_count", "outcome"},
     "disposition_decisions": {"decision_id", "source_id", "disposition", "reviewer_id", "reason_code", "decided_at"},
     "stage_checkpoints": {"stage", "completed_at"},
     "event_history": {"event_id", "event_type", "occurred_at", "payload_json"},
+    "stage_artifacts": {"stage", "artifact_kind", "artifact_sha256", "recorded_at"},
 }
 
 
@@ -112,8 +121,8 @@ class CorpusV2Ledger:
             )""",
             """CREATE TABLE extractions (
                 source_id TEXT PRIMARY KEY REFERENCES source_register(source_id),
-                extracted_at TEXT NOT NULL, extractor TEXT NOT NULL, text_sha256 TEXT NOT NULL,
-                character_count INTEGER NOT NULL
+                extracted_at TEXT NOT NULL, extractor TEXT NOT NULL, text_sha256 TEXT,
+                character_count INTEGER NOT NULL, outcome TEXT NOT NULL
             )""",
             """CREATE TABLE disposition_decisions (
                 decision_id INTEGER PRIMARY KEY, source_id TEXT NOT NULL REFERENCES source_register(source_id),
@@ -126,6 +135,10 @@ class CorpusV2Ledger:
             """CREATE TABLE event_history (
                 event_id INTEGER PRIMARY KEY, event_type TEXT NOT NULL, occurred_at TEXT NOT NULL,
                 payload_json TEXT NOT NULL
+            )""",
+            """CREATE TABLE stage_artifacts (
+                stage TEXT PRIMARY KEY, artifact_kind TEXT NOT NULL, artifact_sha256 TEXT NOT NULL,
+                recorded_at TEXT NOT NULL
             )""",
         )
         for statement in statements:
@@ -264,8 +277,9 @@ class CorpusV2Ledger:
             with self._connection:
                 self._connection.execute(
                     """
-                    INSERT INTO extractions (source_id, extracted_at, extractor, text_sha256, character_count)
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT INTO extractions
+                        (source_id, extracted_at, extractor, text_sha256, character_count, outcome)
+                    VALUES (?, ?, ?, ?, ?, ?)
                     """,
                     (
                         extraction.source_id,
@@ -273,11 +287,44 @@ class CorpusV2Ledger:
                         extraction.extractor,
                         extraction.text_sha256,
                         extraction.character_count,
+                        extraction.outcome.value,
                     ),
                 )
                 self._event("source_parsed", {"source_id": extraction.source_id})
         except sqlite3.IntegrityError as error:
             raise CorpusV2LedgerError("C2_EXTRACTION_DUPLICATE") from error
+
+    def record_stage_artifact(
+        self, stage: Stage, *, artifact_kind: str, artifact_sha256: str
+    ) -> None:
+        self._ensure_mutable()
+        if not isinstance(stage, Stage) or stage.value not in {
+            "CHUNKED", "EMBEDDED", "INDEX_VALIDATED", "EVALUATED", "PROMOTION_READY", "PROMOTED",
+        }:
+            raise CorpusV2LedgerError("C2_STAGE_ARTIFACT_INVALID")
+        stage_index = _STAGE_ORDER.index(stage)
+        self._require_completed(_STAGE_ORDER[stage_index - 1])
+        self._require_incomplete(stage)
+        if not isinstance(artifact_kind, str) or not artifact_kind:
+            raise CorpusV2LedgerError("C2_STAGE_ARTIFACT_INVALID")
+        if (
+            not isinstance(artifact_sha256, str)
+            or len(artifact_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in artifact_sha256)
+        ):
+            raise CorpusV2LedgerError("C2_STAGE_ARTIFACT_INVALID")
+        try:
+            with self._connection:
+                self._connection.execute(
+                    """
+                    INSERT INTO stage_artifacts (stage, artifact_kind, artifact_sha256, recorded_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (stage.value, artifact_kind, artifact_sha256, _timestamp()),
+                )
+                self._event("stage_artifact_recorded", {"stage": stage.value, "artifact_kind": artifact_kind})
+        except sqlite3.IntegrityError as error:
+            raise CorpusV2LedgerError("C2_STAGE_ARTIFACT_DUPLICATE") from error
 
     def record_disposition(
         self,
@@ -294,6 +341,19 @@ class CorpusV2Ledger:
         self._require_incomplete(Stage.REVIEWED)
         if not isinstance(disposition, SourceDisposition) or not reviewer_id or not reason_code:
             raise CorpusV2LedgerError("C2_DISPOSITION_INVALID")
+        outcome_row = self._connection.execute(
+            "SELECT outcome FROM extractions WHERE source_id = ?", (source_id,)
+        ).fetchone()
+        expected_terminal_outcome = {
+            SourceDisposition.NON_TEXT: ExtractionOutcome.NON_TEXT,
+            SourceDisposition.EMPTY: ExtractionOutcome.EMPTY,
+            SourceDisposition.UNSUPPORTED: ExtractionOutcome.UNSUPPORTED,
+            SourceDisposition.EXTRACTION_FAILED: ExtractionOutcome.FAILED,
+        }.get(disposition)
+        if expected_terminal_outcome is not None and (
+            outcome_row is None or outcome_row["outcome"] != expected_terminal_outcome.value
+        ):
+            raise CorpusV2LedgerError("C2_DISPOSITION_PREREQUISITE")
         with self._connection:
             decided_at = _timestamp()
             self._connection.execute(
@@ -329,7 +389,10 @@ class CorpusV2Ledger:
 
     def _validate_stage_state(self, stage: Stage) -> None:
         source_count = self._connection.execute("SELECT COUNT(*) FROM source_register").fetchone()[0]
-        if stage is Stage.REGISTERED and source_count == 0:
+        expected_source_count = self._connection.execute(
+            "SELECT expected_source_count FROM release"
+        ).fetchone()[0]
+        if stage is Stage.REGISTERED and source_count != expected_source_count:
             raise CorpusV2LedgerError("C2_STAGE_STATE")
         if stage is Stage.ACQUIRED:
             acquisition_count = self._connection.execute("SELECT COUNT(*) FROM acquisitions").fetchone()[0]
@@ -345,6 +408,12 @@ class CorpusV2Ledger:
             ).fetchone()[0]
             if reviewed_count != source_count:
                 raise CorpusV2LedgerError("C2_STAGE_STATE")
+        if stage.value in {"CHUNKED", "EMBEDDED", "INDEX_VALIDATED", "EVALUATED", "PROMOTION_READY", "PROMOTED"}:
+            artifact = self._connection.execute(
+                "SELECT artifact_sha256 FROM stage_artifacts WHERE stage = ?", (stage.value,)
+            ).fetchone()
+            if artifact is None:
+                raise CorpusV2LedgerError("C2_STAGE_ARTIFACT_REQUIRED")
 
     def current_disposition(self, source_id: str) -> DispositionDecision | None:
         row = self._connection.execute(
