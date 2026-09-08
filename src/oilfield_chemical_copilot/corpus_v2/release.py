@@ -8,7 +8,7 @@ this module never weakens its no-replace or exact-tree semantics.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from hashlib import sha256
 from collections.abc import Mapping, Callable
 from contextlib import AbstractContextManager
@@ -25,7 +25,7 @@ class CorpusV2ReleaseError(ValueError):
 REQUIRED_DIGESTS = frozenset({
     "source_register", "acquisition", "extraction", "dispositions", "chunks",
     "embeddings", "index_contract", "evaluation_specification", "evaluation_result",
-    "promotion_state", "ledger_projection",
+    "promotion_state", "ledger_projection", "legacy_guard",
 })
 STAGE_DIGESTS = {
     Stage.ACQUIRED: "acquisition", Stage.CHUNKED: "chunks", Stage.EMBEDDED: "embeddings",
@@ -100,6 +100,36 @@ def validate_operator_restore_evidence(evidence: OperatorRestoreEvidence) -> Non
                       evidence.restored_fingerprint.read_only)
 
 
+@dataclass(frozen=True)
+class LegacyGuardAttestation:
+    release_id: str
+    legacy_database_names: tuple[str, ...]
+    fingerprint: LegacyFingerprint
+    operator_evidence: OperatorRestoreEvidence
+
+
+def legacy_guard_bytes(attestation: LegacyGuardAttestation) -> bytes:
+    """Private operator attestation, bound into the sealed evidence digest set."""
+    validate_operator_restore_evidence(attestation.operator_evidence)
+    if attestation.fingerprint != attestation.operator_evidence.restored_fingerprint:
+        _invalid()
+    return _json(asdict(attestation))
+
+
+def _validate_legacy_guard(config: ReleaseConfig, content: bytes) -> None:
+    facts = json.loads(content)
+    evidence = dict(facts["operator_evidence"])
+    evidence["restored_fingerprint"] = LegacyFingerprint(**evidence["restored_fingerprint"])
+    attestation = LegacyGuardAttestation(
+        facts["release_id"], tuple(facts["legacy_database_names"]),
+        LegacyFingerprint(**facts["fingerprint"]), OperatorRestoreEvidence(**evidence),
+    )
+    if (attestation.release_id != config.release_id
+            or attestation.legacy_database_names != config.legacy_database_names
+            or legacy_guard_bytes(attestation) != content):
+        _invalid()
+
+
 def ledger_projection_bytes(ledger: CorpusV2Ledger) -> bytes:
     return _json(ledger.release_projection())
 
@@ -123,6 +153,7 @@ def _binding(config: ReleaseConfig, ledger: CorpusV2Ledger, artifacts: Mapping[s
     if (set(artifacts) != REQUIRED_DIGESTS
             or any(type(value) is not bytes or not value for value in artifacts.values())):
         _invalid()
+    _validate_legacy_guard(config, artifacts["legacy_guard"])
     projection = ledger.release_projection()
     metadata = projection["release"]
     if (len(metadata) != 1 or metadata[0]["release_id"] != config.release_id
@@ -160,6 +191,15 @@ def seal_release_binding(*, config: ReleaseConfig, ledger: CorpusV2Ledger,
     This freezes evidence, not permission to promote. A changed ledger always
     requires separate evidence; an existing release directory is never replaced.
     """
+    try:
+        with ledger.locked_release():
+            return _seal_locked(config=config, ledger=ledger, artifacts=artifacts,
+                                publication=publication)
+    except Exception:
+        raise CorpusV2ReleaseError("C2_RELEASE_BINDING_INVALID") from None
+
+
+def _seal_locked(*, config, ledger, artifacts, publication) -> str:
     try:
         artifacts = dict(artifacts)
         binding = _binding(config, ledger, artifacts)

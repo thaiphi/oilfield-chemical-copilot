@@ -1,8 +1,10 @@
 from contextlib import contextmanager
 from dataclasses import replace
 from hashlib import sha256
+import sqlite3
 
 import pytest
+from ingestion.corpus_v2_legacy_guard import legacy_guard
 
 from oilfield_chemical_copilot.corpus_v2 import release
 from oilfield_chemical_copilot.corpus_v2.ledger import CorpusV2Ledger
@@ -67,6 +69,13 @@ def candidate(tmp_path):
     ledger.complete_stage(Stage.REGISTERED)
     artifacts = {key: key.encode() for key in release.REQUIRED_DIGESTS}
     artifacts["source_register"] = b"source"
+    @contextmanager
+    def reader(*, default_transaction_read_only):
+        assert default_transaction_read_only is True
+        yield {"source_count": 198, "chunk_count": 4797, "read_only": True}
+    attestation = legacy_guard(reader, config=config, operator_evidence=release.OperatorRestoreEvidence(
+        "b" * 64, True, True, release.LegacyFingerprint(198, 4797, True)))
+    artifacts["legacy_guard"] = release.legacy_guard_bytes(attestation)
     ledger.record_snapshot_acquisition(
         AcquisitionRecord("doc-1", "2026-09-07T00:00:00Z", "a" * 64, 10),
         snapshot_relative_path="snapshots/doc-1.blob", mime_type="application/pdf",
@@ -191,3 +200,101 @@ def test_non_final_ledger_disposition_rejected(candidate, monkeypatch, state):
     with pytest.raises(release.CorpusV2ReleaseError):
         seal(candidate)
     assert not publication.final
+
+
+def test_missing_legacy_preflight_cannot_publish(candidate):
+    del candidate[2]["legacy_guard"]
+    with pytest.raises(release.CorpusV2ReleaseError):
+        seal(candidate)
+    assert not candidate[3].final
+
+
+def test_mutation_at_publication_boundary_cannot_publish_stale_evidence(candidate):
+    config, _, _, publication = candidate
+    original_publish = publication.publish_no_replace
+
+    def race(stage, name):
+        # An independent SQLite connection exercises the real concurrency boundary.
+        with sqlite3.connect(config.release_root / "ledger.sqlite", timeout=0) as writer:
+            writer.execute("INSERT INTO event_history(event_type, occurred_at, payload_json) "
+                           "VALUES ('race', 'synthetic', '{}')")
+        original_publish(stage, name)
+
+    publication.publish_no_replace = race
+    with pytest.raises(release.CorpusV2ReleaseError):
+        seal(candidate)
+    assert not publication.final
+
+
+def test_same_connection_mutation_during_publication_is_rejected(candidate):
+    _, ledger, _, publication = candidate
+
+    def race(stage, name):
+        ledger.record_stage_artifact(Stage.PROMOTED,
+            artifact_kind=StageArtifactKind.PROMOTION_RECEIPT, artifact_sha256="f" * 64)
+        publication.final = True
+
+    publication.publish_no_replace = race
+    with pytest.raises(release.CorpusV2ReleaseError):
+        seal(candidate)
+    assert not publication.final
+
+
+def test_successful_legacy_guard_is_bound_and_failed_restore_never_reads(candidate):
+    config, _, artifacts, publication = candidate
+    @contextmanager
+    def reader(*, default_transaction_read_only):
+        pytest.fail("invalid restore evidence must fail before reader entry")
+        yield
+    evidence = release.OperatorRestoreEvidence("b" * 64, False, True,
+                                               release.LegacyFingerprint(198, 4797, True))
+    with pytest.raises(release.CorpusV2ReleaseError):
+        legacy_guard(reader, config=config, operator_evidence=evidence)
+    binding = seal(candidate)
+    assert len(binding) == 64
+    assert publication.members["sealed/legacy_guard.bin"] == artifacts["legacy_guard"]
+
+
+def test_legacy_attestation_for_another_release_cannot_publish(candidate):
+    candidate[2]["legacy_guard"] = candidate[2]["legacy_guard"].replace(
+        b'corpus-v2-test', b'corpus-v2-other')
+    with pytest.raises(release.CorpusV2ReleaseError):
+        seal(candidate)
+    assert not candidate[3].final
+
+
+def test_contending_writer_cannot_change_successfully_published_projection(candidate):
+    config, ledger, artifacts, publication = candidate
+    original_publish = publication.publish_no_replace
+    blocked = []
+
+    def race(stage, name):
+        writer = sqlite3.connect(config.release_root / "ledger.sqlite", timeout=0)
+        try:
+            with pytest.raises(sqlite3.OperationalError, match="locked"):
+                writer.execute("INSERT INTO event_history(event_type, occurred_at, payload_json) "
+                               "VALUES ('race', 'synthetic', '{}')")
+            blocked.append(True)
+        finally:
+            writer.close()
+        original_publish(stage, name)
+
+    publication.publish_no_replace = race
+    binding = seal(candidate)
+    assert blocked == [True]
+    assert publication.final
+    assert release.ledger_projection_bytes(ledger) == artifacts["ledger_projection"]
+    assert release.verify_release_binding(config=config, ledger=ledger, publication=publication,
+                                          expected_sha256=binding) == binding
+    # The reservation is released after sealing, so subsequent promotion remains possible.
+    ledger.record_stage_artifact(Stage.PROMOTED,
+        artifact_kind=StageArtifactKind.PROMOTION_RECEIPT, artifact_sha256="f" * 64)
+
+
+@pytest.mark.parametrize("old,new", [(b'"restore_succeeded":true', b'"restore_succeeded":false'),
+                                    (b'"source_count":198', b'"source_count":197')])
+def test_invalid_guard_evidence_cannot_publish(candidate, old, new):
+    candidate[2]["legacy_guard"] = candidate[2]["legacy_guard"].replace(old, new)
+    with pytest.raises(release.CorpusV2ReleaseError):
+        seal(candidate)
+    assert not candidate[3].final

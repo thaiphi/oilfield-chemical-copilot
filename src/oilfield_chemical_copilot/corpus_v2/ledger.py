@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -97,6 +98,7 @@ class CorpusV2Ledger:
     def __init__(self, connection: sqlite3.Connection) -> None:
         self._connection = connection
         self._connection.row_factory = sqlite3.Row
+        self._release_locked = False
 
     @classmethod
     def create(cls, database_path: Path, *, release_config: ReleaseConfig) -> "CorpusV2Ledger":
@@ -266,6 +268,8 @@ class CorpusV2Ledger:
         ).fetchone() is not None
 
     def _ensure_mutable(self) -> None:
+        if self._release_locked:
+            raise CorpusV2LedgerError("C2_LEDGER_RELEASE_LOCKED")
         if Stage.PROMOTED in self.completed_stages():
             raise CorpusV2LedgerError("C2_RELEASE_IMMUTABLE")
 
@@ -521,6 +525,7 @@ class CorpusV2Ledger:
             )
 
     def complete_stage(self, stage: Stage) -> None:
+        self._ensure_mutable()
         if not isinstance(stage, Stage):
             raise CorpusV2LedgerError("C2_STAGE_INVALID")
         stage_index = _STAGE_ORDER.index(stage)
@@ -623,19 +628,50 @@ class CorpusV2Ledger:
         The caller must retain this only within the authenticated private release
         tree. A transaction prevents a mixed projection during concurrent writes.
         """
+        if self._release_locked:
+            return self._read_release_projection()
         if self._connection.in_transaction:
             raise CorpusV2LedgerError("C2_LEDGER_TRANSACTION_ACTIVE")
         self._connection.execute("BEGIN")
         try:
-            projection = {}
-            for table in sorted(_REQUIRED_TABLES):
-                rows = [dict(row) for row in self._connection.execute(f"SELECT * FROM {table}")]
-                projection[table] = sorted(
-                    rows, key=lambda row: json.dumps(row, sort_keys=True, separators=(",", ":"))
-                )
-            return projection
+            return self._read_release_projection()
         finally:
             self._connection.rollback()
 
+    def _read_release_projection(self) -> dict[str, list[dict[str, object]]]:
+        projection = {}
+        for table in sorted(_REQUIRED_TABLES):
+            rows = [dict(row) for row in self._connection.execute(f"SELECT * FROM {table}")]
+            projection[table] = sorted(
+                rows, key=lambda row: json.dumps(row, sort_keys=True, separators=(",", ":"))
+            )
+        return projection
+
+    @contextmanager
+    def locked_release(self):
+        """Hold a SQLite writer reservation through final evidence publication.
+
+        Other connections cannot write; this connection permits only reads and
+        cannot commit or roll back through callbacks. No durable ledger change
+        is required, so a publication failure cannot leave a partial DB seal.
+        """
+        if self._release_locked or self._connection.in_transaction:
+            raise CorpusV2LedgerError("C2_LEDGER_TRANSACTION_ACTIVE")
+        self._connection.execute("BEGIN IMMEDIATE")
+        self._release_locked = True
+        self._connection.set_authorizer(
+            lambda action, *_: sqlite3.SQLITE_OK if action in {
+                sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ, sqlite3.SQLITE_FUNCTION,
+            } else sqlite3.SQLITE_DENY
+        )
+        try:
+            yield
+        finally:
+            self._connection.set_authorizer(None)
+            self._release_locked = False
+            self._connection.rollback()
+
     def close(self) -> None:
+        if self._release_locked:
+            raise CorpusV2LedgerError("C2_LEDGER_RELEASE_LOCKED")
         self._connection.close()
