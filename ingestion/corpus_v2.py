@@ -32,6 +32,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     initialize.add_argument("--private-root", type=Path, required=True)
     initialize.add_argument("--ledger", type=Path, required=True)
     initialize.add_argument("--manifest-root", type=Path, required=True)
+    process = subparsers.add_parser("process-snapshots")
+    process.add_argument("--release-config", type=Path, required=True)
+    process.add_argument("--ledger", type=Path, required=True)
+    process.add_argument("--private-root", type=Path, required=True)
+    process.add_argument("--extracted-root", type=Path, required=True)
     arguments = parser.parse_args(argv)
 
     if arguments.command == "initialize-registers":
@@ -47,6 +52,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         except CorpusV2RegisterError:
             return 2
+    if arguments.command == "process-snapshots":
+        # The command shape is intentional.  Real parser execution requires the
+        # separately authorized operational task and is never implicit here.
+        return 2
     return 0
 
 
