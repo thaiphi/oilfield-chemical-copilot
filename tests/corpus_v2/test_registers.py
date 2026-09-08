@@ -17,6 +17,7 @@ from oilfield_chemical_copilot.corpus_v2.registers import (
     load_critical_register,
     validate_critical_register,
 )
+from oilfield_chemical_copilot.corpus_v2 import registers
 
 
 def _private_jsonl(rows: list[dict[str, str]]) -> bytes:
@@ -73,6 +74,11 @@ def test_register_requires_exact_approved_count_and_unique_drive_ids(tmp_path: P
     duplicate_drive[-1]["drive_file_id"] = duplicate_drive[0]["drive_file_id"]
     with pytest.raises(CorpusV2RegisterError, match="C2_SOURCE_REGISTER_INVALID"):
         load_approved_register(_write(tmp_path / "duplicate.jsonl", _private_jsonl(duplicate_drive)))
+
+    source_equals_drive = _sources()
+    source_equals_drive[0]["drive_file_id"] = source_equals_drive[0]["source_id"]
+    with pytest.raises(CorpusV2RegisterError, match="C2_SOURCE_REGISTER_INVALID"):
+        load_approved_register(_write(tmp_path / "same-id.jsonl", _private_jsonl(source_equals_drive)))
 
 
 def test_register_rejects_unknown_keys_and_noncanonical_jsonl(tmp_path: Path) -> None:
@@ -143,7 +149,7 @@ def test_initializer_seals_private_registers_and_registers_all_sources(tmp_path:
         approved_register_path=approved_path,
         critical_register_path=critical_path,
         approved_private_root=private_root,
-        ledger_path=private_root / "ledger.sqlite",
+        ledger_path=private_root / "manifests" / "ledger.sqlite",
         manifest_root=private_root / "manifests",
     )
 
@@ -151,7 +157,9 @@ def test_initializer_seals_private_registers_and_registers_all_sources(tmp_path:
     assert result.critical_source_count == 2
     assert result.approved_register_sha256 == config.source_register_sha256
     assert result.manifest_path.read_bytes().endswith(b"\n")
-    ledger = CorpusV2Ledger.open(private_root / "ledger.sqlite")
+    assert result.manifest_path.parent == private_root / "manifests"
+    assert (private_root / "manifests" / "ledger.sqlite").is_file()
+    ledger = CorpusV2Ledger.open(private_root / "manifests" / "ledger.sqlite")
     assert ledger.completed_stages() == (Stage.REGISTERED,)
     assert sum(event.event_type == "source_registered" for event in ledger.event_history()) == 385
 
@@ -177,7 +185,7 @@ def test_initializer_rejects_path_traversal_digest_mismatch_and_repeat_initializ
             approved_register_path=outside,
             critical_register_path=critical_path,
             approved_private_root=private_root,
-            ledger_path=private_root / "ledger.sqlite",
+            ledger_path=private_root / "manifests" / "ledger.sqlite",
             manifest_root=private_root / "manifests",
         )
 
@@ -188,7 +196,7 @@ def test_initializer_rejects_path_traversal_digest_mismatch_and_repeat_initializ
             approved_register_path=approved_path,
             critical_register_path=critical_path,
             approved_private_root=private_root,
-            ledger_path=private_root / "ledger.sqlite",
+            ledger_path=private_root / "manifests" / "ledger.sqlite",
             manifest_root=private_root / "manifests",
         )
 
@@ -199,7 +207,7 @@ def test_initializer_rejects_path_traversal_digest_mismatch_and_repeat_initializ
             approved_register_path=approved_path,
             critical_register_path=critical_path,
             approved_private_root=private_root,
-            ledger_path=private_root / "ledger.sqlite",
+            ledger_path=private_root / "manifests" / "ledger.sqlite",
             manifest_root=private_root / "manifests",
         )
 
@@ -208,7 +216,7 @@ def test_initializer_rejects_path_traversal_digest_mismatch_and_repeat_initializ
         approved_register_path=approved_path,
         critical_register_path=critical_path,
         approved_private_root=private_root,
-        ledger_path=private_root / "ledger.sqlite",
+        ledger_path=private_root / "manifests" / "ledger.sqlite",
         manifest_root=private_root / "manifests",
     )
     with pytest.raises(CorpusV2RegisterError, match="C2_REGISTER_ALREADY_INITIALIZED"):
@@ -217,6 +225,69 @@ def test_initializer_rejects_path_traversal_digest_mismatch_and_repeat_initializ
             approved_register_path=approved_path,
             critical_register_path=critical_path,
             approved_private_root=private_root,
-            ledger_path=private_root / "ledger.sqlite",
+            ledger_path=private_root / "manifests" / "ledger.sqlite",
             manifest_root=private_root / "manifests",
         )
+
+
+def test_initializer_requires_one_fixed_bundle_layout_and_preserves_unrelated_targets(
+    tmp_path: Path,
+) -> None:
+    private_root = tmp_path / "private-release"
+    approved_payload = _private_jsonl(_sources())
+    approved_digest = hashlib.sha256(approved_payload).hexdigest()
+    critical_payload = _private_jsonl(_critical_rows(approved_digest, "doc-1"))
+    config = _config(private_root, approved_payload, critical_payload)
+    approved_path = _write(private_root / "registers" / "approved.jsonl", approved_payload)
+    critical_path = _write(private_root / "registers" / "critical.jsonl", critical_payload)
+    manifest_root = private_root / "bundle"
+    unrelated = _write(private_root / "unrelated.sqlite", b"keep")
+
+    with pytest.raises(CorpusV2RegisterError, match="C2_REGISTER_LAYOUT_INVALID"):
+        initialize_registers(
+            release_config=config,
+            approved_register_path=approved_path,
+            critical_register_path=critical_path,
+            approved_private_root=private_root,
+            ledger_path=manifest_root / "registers.manifest.v1.json",
+            manifest_root=manifest_root,
+        )
+    with pytest.raises(CorpusV2RegisterError, match="C2_REGISTER_LAYOUT_INVALID"):
+        initialize_registers(
+            release_config=config,
+            approved_register_path=approved_path,
+            critical_register_path=critical_path,
+            approved_private_root=private_root,
+            ledger_path=unrelated,
+            manifest_root=manifest_root,
+        )
+    assert unrelated.read_bytes() == b"keep"
+    assert not manifest_root.exists()
+
+
+def test_initializer_publishes_bundle_only_after_both_files_are_ready(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    private_root = tmp_path / "private-release"
+    approved_payload = _private_jsonl(_sources())
+    approved_digest = hashlib.sha256(approved_payload).hexdigest()
+    critical_payload = _private_jsonl(_critical_rows(approved_digest, "doc-1"))
+    config = _config(private_root, approved_payload, critical_payload)
+    approved_path = _write(private_root / "registers" / "approved.jsonl", approved_payload)
+    critical_path = _write(private_root / "registers" / "critical.jsonl", critical_payload)
+    manifest_root = private_root / "bundle"
+
+    def fail_manifest_write(path: Path, payload: bytes) -> None:
+        raise CorpusV2RegisterError("C2_REGISTER_MANIFEST_INVALID")
+
+    monkeypatch.setattr(registers, "_atomic_write", fail_manifest_write)
+    with pytest.raises(CorpusV2RegisterError, match="C2_REGISTER_INITIALIZATION_INVALID"):
+        initialize_registers(
+            release_config=config,
+            approved_register_path=approved_path,
+            critical_register_path=critical_path,
+            approved_private_root=private_root,
+            ledger_path=manifest_root / "ledger.sqlite",
+            manifest_root=manifest_root,
+        )
+    assert not manifest_root.exists()

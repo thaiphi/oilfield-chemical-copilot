@@ -8,6 +8,8 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
+import tempfile
 import uuid
 from collections.abc import Iterable, Mapping
 from typing import Any
@@ -52,6 +54,8 @@ class ApprovedSourceRegisterEntry:
         if not is_valid_public_source_id(self.source_id):
             raise CorpusV2RegisterError("C2_SOURCE_REGISTER_INVALID")
         if not _DRIVE_FILE_ID.fullmatch(self.drive_file_id):
+            raise CorpusV2RegisterError("C2_SOURCE_REGISTER_INVALID")
+        if self.source_id == self.drive_file_id:
             raise CorpusV2RegisterError("C2_SOURCE_REGISTER_INVALID")
         if not _MIME_TYPE.fullmatch(self.declared_mime_type):
             raise CorpusV2RegisterError("C2_SOURCE_REGISTER_INVALID")
@@ -274,6 +278,22 @@ def _atomic_write(path: Path, payload: bytes) -> None:
         raise CorpusV2RegisterError("C2_REGISTER_MANIFEST_INVALID") from None
 
 
+def _fsync_file(path: Path) -> None:
+    try:
+        with path.open("r+b") as handle:
+            os.fsync(handle.fileno())
+    except OSError:
+        raise CorpusV2RegisterError("C2_REGISTER_INITIALIZATION_INVALID") from None
+
+
+def _remove_owned_staging(path: Path) -> None:
+    """Remove only the unique staging directory created by this invocation."""
+    try:
+        shutil.rmtree(path)
+    except OSError:
+        pass
+
+
 def _register_manifest(
     *,
     release_config: ReleaseConfig,
@@ -306,13 +326,16 @@ def initialize_registers(
     """
     approved_path = _resolved_under_root(approved_register_path, approved_private_root)
     critical_path = _resolved_under_root(critical_register_path, approved_private_root)
-    target_ledger = _target_under_root(ledger_path, approved_private_root)
     target_manifest_root = _target_under_root(manifest_root, approved_private_root)
+    target_ledger = _target_under_root(ledger_path, approved_private_root)
     if release_config.release_root.resolve(strict=False) != approved_private_root.resolve(strict=True):
         raise CorpusV2RegisterError("C2_REGISTER_PATH_INVALID")
     if release_config.expected_source_count != 385:
         raise CorpusV2RegisterError("C2_SOURCE_REGISTER_INVALID")
-    if target_ledger.exists():
+    expected_ledger = target_manifest_root / "ledger.sqlite"
+    if target_ledger != expected_ledger or not target_manifest_root.parent.is_dir():
+        raise CorpusV2RegisterError("C2_REGISTER_LAYOUT_INVALID")
+    if target_manifest_root.exists() or target_ledger.exists():
         raise CorpusV2RegisterError("C2_REGISTER_ALREADY_INITIALIZED")
 
     approved_payload = _read_bytes(approved_path, error_code="C2_SOURCE_REGISTER_INVALID")
@@ -330,12 +353,18 @@ def initialize_registers(
         source_register_sha256=release_config.source_register_sha256,
     )
 
-    if target_manifest_root.exists():
-        raise CorpusV2RegisterError("C2_REGISTER_ALREADY_INITIALIZED")
-    target_manifest_root.mkdir(parents=True, exist_ok=False)
-    temporary_ledger = target_ledger.with_name(f".{target_ledger.name}.{uuid.uuid4().hex}.tmp")
     try:
-        ledger = CorpusV2Ledger.create(temporary_ledger, release_config=release_config)
+        staging_root = Path(
+            tempfile.mkdtemp(
+                prefix=f".{target_manifest_root.name}.{uuid.uuid4().hex}.",
+                dir=target_manifest_root.parent,
+            )
+        )
+    except OSError:
+        raise CorpusV2RegisterError("C2_REGISTER_INITIALIZATION_INVALID") from None
+    try:
+        staging_ledger = staging_root / "ledger.sqlite"
+        ledger = CorpusV2Ledger.create(staging_ledger, release_config=release_config)
         try:
             for source in approved_sources:
                 ledger.record_source(
@@ -344,9 +373,9 @@ def initialize_registers(
             ledger.complete_stage(Stage.REGISTERED)
         finally:
             ledger.close()
-        os.replace(temporary_ledger, target_ledger)
+        _fsync_file(staging_ledger)
         _atomic_write(
-            target_manifest_root / "registers.manifest.v1.json",
+            staging_root / "registers.manifest.v1.json",
             _register_manifest(
                 release_config=release_config,
                 approved_digest=approved_digest,
@@ -354,13 +383,10 @@ def initialize_registers(
                 critical_count=len(critical_sources),
             ),
         )
-    except (CorpusV2LedgerError, OSError, ValueError):
-        temporary_ledger.unlink(missing_ok=True)
-        if target_ledger.exists():
-            target_ledger.unlink(missing_ok=True)
-        for child in target_manifest_root.iterdir():
-            child.unlink(missing_ok=True)
-        target_manifest_root.rmdir()
+        _fsync_file(staging_root / "registers.manifest.v1.json")
+        os.replace(staging_root, target_manifest_root)
+    except (CorpusV2LedgerError, CorpusV2RegisterError, OSError, ValueError):
+        _remove_owned_staging(staging_root)
         raise CorpusV2RegisterError("C2_REGISTER_INITIALIZATION_INVALID") from None
 
     return RegisterInitialization(
