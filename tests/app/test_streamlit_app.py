@@ -70,10 +70,10 @@ def test_rag_service_builds_the_selected_retrieval_mode(monkeypatch) -> None:
     monkeypatch.setattr("app.streamlit_app.build_answer_generator", lambda: sentinel_generator)
     monkeypatch.setattr(
         "app.streamlit_app.build_embedding_provider",
-        lambda: type("Provider", (), {"dimension": 384})(),
+        lambda settings: type("Provider", (), {"dimension": 384, "model_name": settings.ollama_embedding_model})(),
     )
     monkeypatch.setattr(
-        "app.streamlit_app.PgVectorStore", lambda *args, **kwargs: sentinel_store
+        "app.streamlit_app.open_verified_runtime_store", lambda release: sentinel_store
     )
 
     class FakeKeywordIndex:
@@ -95,7 +95,11 @@ def test_rag_service_builds_the_selected_retrieval_mode(monkeypatch) -> None:
     monkeypatch.setattr(
         "app.streamlit_app.RetrievalSettings.from_env", lambda: RetrievalSettings()
     )
-    _build_rag_service.clear()
+    from oilfield_chemical_copilot.corpus_v2.runtime import RuntimeRelease
+    release = RuntimeRelease("v2", "synthetic", "a" * 64, "ollama", "synthetic-model", 384,
+                             "b" * 64, "postgresql://localhost/synthetic")
+    monkeypatch.setattr(streamlit_app, "load_runtime_release", lambda: release)
+    streamlit_app._cached_rag_service.clear()
 
     hybrid_service = _build_rag_service("hybrid")
     assert hybrid_service.generator is sentinel_generator
@@ -108,19 +112,22 @@ def test_rag_service_builds_the_selected_retrieval_mode(monkeypatch) -> None:
     assert vector_service.generator is sentinel_generator
     assert captured["settings"].retrieval_mode == "vector"
     assert captured["keyword_index"] is None
-    _build_rag_service.clear()
+    streamlit_app._cached_rag_service.clear()
 
 
-def test_database_url_defaults_to_localhost_for_local_streamlit(monkeypatch) -> None:
+def test_database_url_never_defaults_to_legacy(monkeypatch) -> None:
     monkeypatch.delenv("DATABASE_URL", raising=False)
 
-    assert _database_url() == "postgresql://postgres:postgres@localhost:5432/oilfield_copilot"
+    monkeypatch.delenv("CORPUS_RELEASE_ID", raising=False)
+    with pytest.raises(ValueError, match="C2_RUNTIME_RELEASE_INVALID"):
+        _database_url()
 
 
 def test_database_url_preserves_explicit_environment_value(monkeypatch) -> None:
     monkeypatch.setenv("DATABASE_URL", "postgresql://custom/value")
 
-    assert _database_url() == "postgresql://custom/value"
+    with pytest.raises(ValueError, match="C2_RUNTIME_RELEASE_INVALID"):
+        _database_url()
 
 
 def test_monitoring_database_url_is_independent_from_rag_database(monkeypatch) -> None:
@@ -513,3 +520,56 @@ def test_pending_feedback_button_records_feedback_on_rerun(monkeypatch) -> None:
 
     assert recorded == [(FeedbackValue.HELPFUL, RetrievalMode.HYBRID)]
     assert FakeStreamlit.session_state.feedback_recorded is True
+
+
+def test_runtime_cache_separates_releases_digest_database_and_mode(monkeypatch):
+    from dataclasses import replace
+    from oilfield_chemical_copilot.corpus_v2.runtime import RuntimeRelease
+    release = RuntimeRelease("v2", "synthetic", "a" * 64, "deterministic",
+                             "deterministic-token-hash-384", 384, "b" * 64,
+                             "postgresql://localhost/synthetic")
+    stores = []
+    def open_store(selected):
+        store = type("Store", (), {"list_chunks": lambda self: [selected.release_id]})()
+        stores.append(store)
+        return store
+    monkeypatch.setattr(streamlit_app, "open_verified_runtime_store", open_store)
+    monkeypatch.setattr(streamlit_app, "build_answer_generator", object)
+    monkeypatch.setattr(streamlit_app.KeywordSearchIndex, "from_hits", lambda hits: tuple(hits))
+    monkeypatch.setattr(streamlit_app, "build_retrieval_pipeline", lambda **kwargs: kwargs)
+    streamlit_app._cached_rag_service.clear()
+    first = streamlit_app._cached_rag_service(release, "hybrid")
+    assert streamlit_app._cached_rag_service(release, "hybrid") is first
+    variants = [replace(release, mode="legacy", release_id="legacy-r1"),
+                replace(release, manifest_sha256="c" * 64),
+                replace(release, database_identity="d" * 64,
+                        database_url="postgresql://localhost/other")]
+    for variant in variants:
+        assert streamlit_app._cached_rag_service(variant, "hybrid") is not first
+    assert streamlit_app._cached_rag_service(release, "vector") is not first
+    assert len(stores) == 5
+    assert first.retriever["keyword_index"] == ("synthetic",)
+    streamlit_app._cached_rag_service.clear()
+
+
+def test_invalid_binding_blocks_even_populated_cache(monkeypatch):
+    from oilfield_chemical_copilot.corpus_v2.runtime import CorpusV2RuntimeError
+    def invalid():
+        raise CorpusV2RuntimeError("C2_RUNTIME_RELEASE_INVALID")
+    monkeypatch.setattr(streamlit_app, "load_runtime_release", invalid)
+    monkeypatch.setattr(streamlit_app, "_cached_rag_service",
+                        lambda *args: pytest.fail("cache accessed before validation"))
+    with pytest.raises(CorpusV2RuntimeError):
+        _build_rag_service("hybrid")
+
+
+def test_wrong_provider_identity_never_loads_keyword_chunks(monkeypatch):
+    from oilfield_chemical_copilot.corpus_v2.runtime import RuntimeRelease, CorpusV2RuntimeError
+    release = RuntimeRelease("v2", "synthetic", "a" * 64, "deterministic", "wrong", 384,
+                             "b" * 64, "postgresql://localhost/synthetic")
+    store = type("Store", (), {"list_chunks": lambda self: pytest.fail("chunks loaded")})()
+    monkeypatch.setattr(streamlit_app, "open_verified_runtime_store", lambda _: store)
+    streamlit_app._cached_rag_service.clear()
+    with pytest.raises(CorpusV2RuntimeError):
+        streamlit_app._cached_rag_service(release, "hybrid")
+    streamlit_app._cached_rag_service.clear()

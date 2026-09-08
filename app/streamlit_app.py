@@ -10,7 +10,6 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = PROJECT_ROOT / "src"
-LOCAL_DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/oilfield_copilot"
 LOCAL_MONITORING_DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/oilfield_copilot"
 _PRODUCT_DOSE_REQUEST = re.compile(r"^\s*product\s+dose\s*:", re.IGNORECASE)
 _PRODUCT_DOSE_INPUT = re.compile(
@@ -42,15 +41,17 @@ from oilfield_chemical_copilot.rag.ollama_client import (
     DEFAULT_OLLAMA_MODEL,
 )
 from oilfield_chemical_copilot.rag.service import BasicRagService
-from oilfield_chemical_copilot.retrieval.embeddings import build_embedding_provider
+from oilfield_chemical_copilot.retrieval.embeddings import EmbeddingSettings, build_embedding_provider
 from oilfield_chemical_copilot.retrieval.keyword import KeywordSearchIndex
 from oilfield_chemical_copilot.retrieval.pipeline import RetrievalSettings, build_retrieval_pipeline
-from oilfield_chemical_copilot.storage.pgvector import PgVectorStore
+from oilfield_chemical_copilot.corpus_v2.runtime import (
+    RuntimeRelease, CorpusV2RuntimeError, load_runtime_release, open_verified_runtime_store,
+)
 from oilfield_chemical_copilot.tools.chemical_dosage import calculate_dosage, product_dosage_answer
 from oilfield_chemical_copilot.tools.water_analysis import summarize_water_analysis
 
 def _database_url() -> str:
-    return os.getenv("DATABASE_URL") or LOCAL_DATABASE_URL
+    return load_runtime_release().database_url
 
 
 def _monitoring_database_url() -> str:
@@ -88,11 +89,26 @@ def _initialize_state() -> None:
         ]
 
 
-@st.cache_resource(show_spinner=False)
 def _build_rag_service(retrieval_mode: str) -> BasicRagService:
+    # Revalidate before cache lookup, including on cache hits.
+    release = load_runtime_release()
+    return _cached_rag_service(release, retrieval_mode)
+
+
+@st.cache_resource(show_spinner=False)
+def _cached_rag_service(release: RuntimeRelease, retrieval_mode: str) -> BasicRagService:
+    if retrieval_mode not in {"hybrid", "vector"}:
+        raise CorpusV2RuntimeError("C2_RUNTIME_RELEASE_INVALID")
     settings = replace(RetrievalSettings.from_env(), retrieval_mode=retrieval_mode)
-    embedding_provider = build_embedding_provider()
-    store = PgVectorStore(_database_url(), embedding_dimension=embedding_provider.dimension)
+    store = open_verified_runtime_store(release)
+    embedding_provider = build_embedding_provider(EmbeddingSettings(
+        provider=release.embedding_provider, dimension=release.embedding_dimension,
+        sentence_transformers_model=release.embedding_model,
+        ollama_embedding_model=release.embedding_model,
+    ))
+    if (embedding_provider.model_name != release.embedding_model
+            or embedding_provider.dimension != release.embedding_dimension):
+        raise CorpusV2RuntimeError("C2_RUNTIME_RELEASE_INVALID")
     keyword_index = (
         KeywordSearchIndex.from_hits(store.list_chunks())
         if settings.retrieval_mode == "hybrid"
