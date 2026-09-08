@@ -98,3 +98,12 @@ def test_canonical_jsonl_round_trips_valid_public_task_record_mappings(
 def test_canonical_jsonl_rejects_unsafe_public_aggregate_fields(record: dict[str, object]) -> None:
     with pytest.raises(CorpusV2CanonicalError, match="C2_CANONICAL_INVALID"):
         canonical_jsonl([record])
+
+
+@pytest.mark.parametrize(("source_id", "ordinal"), [("doc-2", 0), ("doc-1", 1)])
+def test_canonical_chunk_rejects_provenance_mismatch(source_id: str, ordinal: int) -> None:
+    with pytest.raises(CorpusV2CanonicalError, match="C2_CANONICAL_INVALID"):
+        canonical_jsonl([{
+            "chunk_id": "doc-1/chunk-0", "source_id": source_id, "ordinal": ordinal,
+            "text_sha256": "a" * 64, "character_count": 10,
+        }])

@@ -9,6 +9,7 @@ import re
 from typing import Any
 
 from .models import (
+    is_valid_chunk_provenance,
     is_valid_embedding_model,
     is_valid_public_chunk_id,
     is_valid_public_source_id,
@@ -88,6 +89,10 @@ def _validate(record: Mapping[str, Any]) -> None:
                 raise CorpusV2CanonicalError("C2_CANONICAL_INVALID")
         elif field_type == "outcome" and value not in {"SUCCESS", "NON_TEXT", "EMPTY", "UNSUPPORTED", "FAILED"}:
             raise CorpusV2CanonicalError("C2_CANONICAL_INVALID")
+    if "ordinal" in schema and not is_valid_chunk_provenance(
+        record["chunk_id"], record["source_id"], record["ordinal"]
+    ):
+        raise CorpusV2CanonicalError("C2_CANONICAL_INVALID")
     if "outcome" in schema:
         if record["outcome"] == "SUCCESS" and record["text_sha256"] is None:
             raise CorpusV2CanonicalError("C2_CANONICAL_INVALID")

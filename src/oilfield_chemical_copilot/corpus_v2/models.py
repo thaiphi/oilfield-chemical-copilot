@@ -84,6 +84,18 @@ def is_valid_public_chunk_id(value: object) -> bool:
     return isinstance(value, str) and _PUBLIC_CHUNK_ID.fullmatch(value) is not None
 
 
+def is_valid_chunk_provenance(chunk_id: object, source_id: object, ordinal: object) -> bool:
+    """Require the chunk pseudonym to encode this exact source and ordinal."""
+    return (
+        is_valid_public_chunk_id(chunk_id)
+        and is_valid_public_source_id(source_id)
+        and isinstance(ordinal, int)
+        and not isinstance(ordinal, bool)
+        and ordinal >= 0
+        and chunk_id == f"{source_id}/chunk-{ordinal}"
+    )
+
+
 def _public_source_id(value: object) -> None:
     if not is_valid_public_source_id(value):
         raise CorpusV2ContractError("C2_SOURCE_ID_INVALID")
@@ -263,6 +275,8 @@ class CorpusV2Chunk:
         _public_chunk_id(self.chunk_id)
         _public_source_id(self.source_id)
         _count(self.ordinal)
+        if not is_valid_chunk_provenance(self.chunk_id, self.source_id, self.ordinal):
+            raise CorpusV2ContractError("C2_CHUNK_PROVENANCE_INVALID")
         _sha256(self.text_sha256)
         _count(self.character_count)
 

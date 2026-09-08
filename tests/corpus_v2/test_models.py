@@ -146,3 +146,14 @@ def test_public_record_constructors_reject_non_pseudonym_chunk_ids(chunk_id: str
         CorpusV2Chunk(chunk_id, "doc-1", 0, SHA, 0)
     with pytest.raises(CorpusV2ContractError, match="C2_CHUNK_ID_INVALID"):
         EmbeddingRecord(chunk_id, "local-model", SHA, 384)
+
+
+@pytest.mark.parametrize(("source_id", "ordinal"), [("doc-2", 0), ("doc-1", 1)])
+def test_chunk_constructor_rejects_provenance_mismatch(source_id: str, ordinal: int) -> None:
+    with pytest.raises(CorpusV2ContractError, match="C2_CHUNK_PROVENANCE_INVALID"):
+        CorpusV2Chunk("doc-1/chunk-0", source_id, ordinal, SHA, 10)
+
+
+def test_chunk_constructor_accepts_matching_provenance() -> None:
+    chunk = CorpusV2Chunk("doc-385/chunk-12", "doc-385", 12, SHA, 10)
+    assert chunk.chunk_id == f"{chunk.source_id}/chunk-{chunk.ordinal}"
