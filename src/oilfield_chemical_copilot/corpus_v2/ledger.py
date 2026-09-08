@@ -40,11 +40,27 @@ class LedgerEvent:
     payload: dict[str, object]
 
 
+@dataclass(frozen=True)
+class SnapshotAcquisitionFacts:
+    """Private snapshot facts retained without document bytes or upstream names."""
+
+    source_id: str
+    acquired_at: str
+    snapshot_relative_path: str
+    content_sha256: str
+    byte_count: int
+    mime_type: str
+    revision_token: str
+
+
 _STAGE_ORDER = tuple(Stage)
 _REQUIRED_TABLES = {
     "release": {"release_id", "candidate_database_name", "configured_database_name", "legacy_database_names_json", "expected_source_count", "source_register_sha256", "critical_source_register_sha256"},
     "source_register": {"source_id", "source_sha256"},
     "acquisitions": {"source_id", "acquired_at", "content_sha256", "byte_count"},
+    "snapshot_acquisitions": {
+        "source_id", "snapshot_relative_path", "mime_type", "revision_token"
+    },
     "extractions": {"source_id", "extracted_at", "extractor", "text_sha256", "character_count", "outcome"},
     "disposition_decisions": {"decision_id", "source_id", "disposition", "reviewer_id", "reason_code", "decided_at"},
     "stage_checkpoints": {"stage", "completed_at"},
@@ -120,6 +136,11 @@ class CorpusV2Ledger:
             """CREATE TABLE acquisitions (
                 source_id TEXT PRIMARY KEY REFERENCES source_register(source_id),
                 acquired_at TEXT NOT NULL, content_sha256 TEXT NOT NULL, byte_count INTEGER NOT NULL
+            )""",
+            """CREATE TABLE snapshot_acquisitions (
+                source_id TEXT PRIMARY KEY REFERENCES acquisitions(source_id),
+                snapshot_relative_path TEXT NOT NULL UNIQUE, mime_type TEXT NOT NULL,
+                revision_token TEXT NOT NULL
             )""",
             """CREATE TABLE extractions (
                 source_id TEXT PRIMARY KEY REFERENCES source_register(source_id),
@@ -268,6 +289,88 @@ class CorpusV2Ledger:
                         acquisition.content_sha256,
                         acquisition.byte_count,
                     ),
+                )
+                self._event("source_acquired", {"source_id": acquisition.source_id})
+        except sqlite3.IntegrityError as error:
+            raise CorpusV2LedgerError("C2_ACQUISITION_DUPLICATE") from error
+
+    def snapshot_acquisition(self, source_id: str) -> SnapshotAcquisitionFacts | None:
+        """Return the recorded private snapshot facts for one approved identity."""
+        row = self._connection.execute(
+            """
+            SELECT acquisitions.source_id, acquired_at, snapshot_relative_path, content_sha256, byte_count,
+                   mime_type, revision_token
+            FROM acquisitions JOIN snapshot_acquisitions USING (source_id)
+            WHERE acquisitions.source_id = ?
+            """,
+            (source_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return SnapshotAcquisitionFacts(
+            source_id=row["source_id"],
+            acquired_at=row["acquired_at"],
+            snapshot_relative_path=row["snapshot_relative_path"],
+            content_sha256=row["content_sha256"],
+            byte_count=row["byte_count"],
+            mime_type=row["mime_type"],
+            revision_token=row["revision_token"],
+        )
+
+    def registered_source_ids(self) -> tuple[str, ...]:
+        """Return the sealed source identities, never upstream Drive identifiers."""
+        rows = self._connection.execute(
+            "SELECT source_id FROM source_register ORDER BY source_id"
+        ).fetchall()
+        return tuple(row["source_id"] for row in rows)
+
+    def record_snapshot_acquisition(
+        self,
+        acquisition: AcquisitionRecord,
+        *,
+        snapshot_relative_path: str,
+        mime_type: str,
+        revision_token: str,
+    ) -> None:
+        """Atomically bind an acquisition to its opaque private snapshot facts."""
+        self._ensure_mutable()
+        if (
+            not isinstance(snapshot_relative_path, str)
+            or not snapshot_relative_path
+            or "/" not in snapshot_relative_path
+            or snapshot_relative_path.startswith("/")
+            or ".." in snapshot_relative_path.split("/")
+            or not isinstance(mime_type, str)
+            or not mime_type
+            or not isinstance(revision_token, str)
+            or not revision_token
+        ):
+            raise CorpusV2LedgerError("C2_ACQUISITION_INVALID")
+        if not self._source_exists(acquisition.source_id):
+            raise CorpusV2LedgerError("C2_SOURCE_UNKNOWN")
+        self._require_completed(Stage.REGISTERED)
+        self._require_incomplete(Stage.ACQUIRED)
+        try:
+            with self._connection:
+                self._connection.execute(
+                    """
+                    INSERT INTO acquisitions (source_id, acquired_at, content_sha256, byte_count)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        acquisition.source_id,
+                        acquisition.acquired_at,
+                        acquisition.content_sha256,
+                        acquisition.byte_count,
+                    ),
+                )
+                self._connection.execute(
+                    """
+                    INSERT INTO snapshot_acquisitions
+                        (source_id, snapshot_relative_path, mime_type, revision_token)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (acquisition.source_id, snapshot_relative_path, mime_type, revision_token),
                 )
                 self._event("source_acquired", {"source_id": acquisition.source_id})
         except sqlite3.IntegrityError as error:
