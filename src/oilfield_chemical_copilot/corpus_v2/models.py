@@ -72,6 +72,30 @@ class ReleaseConfig:
     expected_source_count: int
     source_register_sha256: str
 
+    def __post_init__(self) -> None:
+        try:
+            _non_empty(self.release_id, code="C2_CONFIG_INVALID")
+            if not isinstance(self.release_root, Path):
+                _invalid_config()
+            candidate = _non_empty(self.candidate_database_name, code="C2_CONFIG_INVALID")
+            configured = _non_empty(self.configured_database_name, code="C2_CONFIG_INVALID")
+            if not isinstance(self.legacy_database_names, tuple):
+                _invalid_config()
+            legacy = tuple(
+                _non_empty(name, code="C2_CONFIG_INVALID") for name in self.legacy_database_names
+            )
+            if (
+                isinstance(self.expected_source_count, bool)
+                or not isinstance(self.expected_source_count, int)
+                or self.expected_source_count <= 0
+            ):
+                _invalid_config()
+            _sha256(self.source_register_sha256)
+        except (CorpusV2ContractError, TypeError):
+            _invalid_config()
+        if candidate == configured or candidate in legacy:
+            _invalid_config()
+
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any]) -> "ReleaseConfig":
         expected = {
@@ -95,8 +119,6 @@ class ReleaseConfig:
                 _invalid_config()
             source_register_sha256 = _sha256(payload["source_register_sha256"])
         except (KeyError, TypeError):
-            _invalid_config()
-        if candidate != configured or candidate in legacy:
             _invalid_config()
         return cls(
             release_id=release_id,

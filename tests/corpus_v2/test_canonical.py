@@ -23,6 +23,10 @@ def test_canonical_jsonl_is_stable_and_newline_terminated() -> None:
         {"source_text": "private"},
         {"input_path": "C:/private/document.pdf"},
         {"api_key": "secret"},
+        {"body": "private"},
+        {"uri": "https://private.example/document"},
+        {"password": "secret"},
+        {"authorization": "Bearer secret"},
     ],
 )
 def test_canonical_jsonl_rejects_unsafe_public_aggregate_fields(record: dict[str, object]) -> None:

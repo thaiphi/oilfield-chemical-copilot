@@ -32,6 +32,15 @@ class LedgerEvent:
 
 
 _STAGE_ORDER = tuple(Stage)
+_REQUIRED_TABLES = {
+    "release": {"release_id", "candidate_database_name", "configured_database_name", "legacy_database_names_json", "expected_source_count", "source_register_sha256"},
+    "source_register": {"source_id", "source_sha256"},
+    "acquisitions": {"source_id", "acquired_at", "content_sha256", "byte_count"},
+    "extractions": {"source_id", "extracted_at", "extractor", "text_sha256", "character_count"},
+    "disposition_decisions": {"decision_id", "source_id", "disposition", "reviewer_id", "reason_code", "decided_at"},
+    "stage_checkpoints": {"stage", "completed_at"},
+    "event_history": {"event_id", "event_type", "occurred_at", "payload_json"},
+}
 
 
 def _timestamp() -> str:
@@ -50,11 +59,14 @@ class CorpusV2Ledger:
         connection = cls._connect(database_path)
         ledger = cls(connection)
         try:
-            with connection:
-                ledger._create_schema()
-                ledger._insert_release(release_config)
-                ledger._event("release_created", {"release_id": release_config.release_id})
+            connection.execute("BEGIN IMMEDIATE")
+            ledger._reject_existing_schema()
+            ledger._create_schema()
+            ledger._insert_release(release_config)
+            ledger._event("release_created", {"release_id": release_config.release_id})
+            connection.commit()
         except Exception:
+            connection.rollback()
             connection.close()
             raise
         return ledger
@@ -62,13 +74,16 @@ class CorpusV2Ledger:
     @classmethod
     def open(cls, database_path: Path) -> "CorpusV2Ledger":
         connection = cls._connect(database_path)
-        tables = connection.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'release'"
-        ).fetchone()
-        if tables is None:
+        ledger = cls(connection)
+        try:
+            connection.execute("BEGIN")
+            ledger._validate_schema_and_metadata()
+            connection.rollback()
+        except (CorpusV2LedgerError, sqlite3.Error, ValueError, TypeError, json.JSONDecodeError):
+            connection.rollback()
             connection.close()
-            raise CorpusV2LedgerError("C2_LEDGER_INVALID")
-        return cls(connection)
+            raise CorpusV2LedgerError("C2_LEDGER_INVALID") from None
+        return ledger
 
     @staticmethod
     def _connect(database_path: Path) -> sqlite3.Connection:
@@ -78,53 +93,84 @@ class CorpusV2Ledger:
         return connection
 
     def _create_schema(self) -> None:
-        self._connection.executescript(
-            """
-            CREATE TABLE release (
+        statements = (
+            """CREATE TABLE release (
                 release_id TEXT PRIMARY KEY,
                 candidate_database_name TEXT NOT NULL,
                 configured_database_name TEXT NOT NULL,
                 legacy_database_names_json TEXT NOT NULL,
                 expected_source_count INTEGER NOT NULL,
                 source_register_sha256 TEXT NOT NULL
-            );
-            CREATE TABLE source_register (
+            )""",
+            """CREATE TABLE source_register (
                 source_id TEXT PRIMARY KEY,
                 source_sha256 TEXT NOT NULL
-            );
-            CREATE TABLE acquisitions (
+            )""",
+            """CREATE TABLE acquisitions (
                 source_id TEXT PRIMARY KEY REFERENCES source_register(source_id),
-                acquired_at TEXT NOT NULL,
-                content_sha256 TEXT NOT NULL,
-                byte_count INTEGER NOT NULL
-            );
-            CREATE TABLE extractions (
+                acquired_at TEXT NOT NULL, content_sha256 TEXT NOT NULL, byte_count INTEGER NOT NULL
+            )""",
+            """CREATE TABLE extractions (
                 source_id TEXT PRIMARY KEY REFERENCES source_register(source_id),
-                extracted_at TEXT NOT NULL,
-                extractor TEXT NOT NULL,
-                text_sha256 TEXT NOT NULL,
+                extracted_at TEXT NOT NULL, extractor TEXT NOT NULL, text_sha256 TEXT NOT NULL,
                 character_count INTEGER NOT NULL
-            );
-            CREATE TABLE disposition_decisions (
-                decision_id INTEGER PRIMARY KEY,
-                source_id TEXT NOT NULL REFERENCES source_register(source_id),
-                disposition TEXT NOT NULL,
-                reviewer_id TEXT NOT NULL,
-                reason_code TEXT NOT NULL,
+            )""",
+            """CREATE TABLE disposition_decisions (
+                decision_id INTEGER PRIMARY KEY, source_id TEXT NOT NULL REFERENCES source_register(source_id),
+                disposition TEXT NOT NULL, reviewer_id TEXT NOT NULL, reason_code TEXT NOT NULL,
                 decided_at TEXT NOT NULL
-            );
-            CREATE TABLE stage_checkpoints (
-                stage TEXT PRIMARY KEY,
-                completed_at TEXT NOT NULL
-            );
-            CREATE TABLE event_history (
-                event_id INTEGER PRIMARY KEY,
-                event_type TEXT NOT NULL,
-                occurred_at TEXT NOT NULL,
+            )""",
+            """CREATE TABLE stage_checkpoints (
+                stage TEXT PRIMARY KEY, completed_at TEXT NOT NULL
+            )""",
+            """CREATE TABLE event_history (
+                event_id INTEGER PRIMARY KEY, event_type TEXT NOT NULL, occurred_at TEXT NOT NULL,
                 payload_json TEXT NOT NULL
-            );
-            """
+            )""",
         )
+        for statement in statements:
+            self._connection.execute(statement)
+
+    def _reject_existing_schema(self) -> None:
+        tables = self._connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+        if tables:
+            raise CorpusV2LedgerError("C2_LEDGER_INVALID")
+
+    def _validate_schema_and_metadata(self) -> None:
+        table_names = {
+            row["name"]
+            for row in self._connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        if not set(_REQUIRED_TABLES).issubset(table_names):
+            raise CorpusV2LedgerError("C2_LEDGER_INVALID")
+        for table_name, columns in _REQUIRED_TABLES.items():
+            actual_columns = {
+                row["name"] for row in self._connection.execute(f"PRAGMA table_info({table_name})")
+            }
+            if not columns.issubset(actual_columns):
+                raise CorpusV2LedgerError("C2_LEDGER_INVALID")
+        rows = self._connection.execute("SELECT * FROM release").fetchall()
+        if len(rows) != 1:
+            raise CorpusV2LedgerError("C2_LEDGER_INVALID")
+        release = rows[0]
+        legacy_names = json.loads(release["legacy_database_names_json"])
+        if (
+            not isinstance(legacy_names, list)
+            or not all(isinstance(name, str) and name for name in legacy_names)
+            or not isinstance(release["candidate_database_name"], str)
+            or not isinstance(release["configured_database_name"], str)
+            or not release["candidate_database_name"]
+            or release["candidate_database_name"] == release["configured_database_name"]
+            or release["candidate_database_name"] in legacy_names
+            or not isinstance(release["expected_source_count"], int)
+            or release["expected_source_count"] <= 0
+            or not isinstance(release["source_register_sha256"], str)
+            or len(release["source_register_sha256"]) != 64
+            or any(character not in "0123456789abcdef" for character in release["source_register_sha256"])
+        ):
+            raise CorpusV2LedgerError("C2_LEDGER_INVALID")
 
     def _insert_release(self, config: ReleaseConfig) -> None:
         self._connection.execute(
@@ -155,7 +201,21 @@ class CorpusV2Ledger:
             "SELECT 1 FROM source_register WHERE source_id = ?", (source_id,)
         ).fetchone() is not None
 
+    def _ensure_mutable(self) -> None:
+        if Stage.PROMOTED in self.completed_stages():
+            raise CorpusV2LedgerError("C2_RELEASE_IMMUTABLE")
+
+    def _require_completed(self, stage: Stage) -> None:
+        if stage not in self.completed_stages():
+            raise CorpusV2LedgerError("C2_STAGE_PREREQUISITE")
+
+    def _require_incomplete(self, stage: Stage) -> None:
+        if stage in self.completed_stages():
+            raise CorpusV2LedgerError("C2_STAGE_STATE")
+
     def record_source(self, source: ApprovedSource) -> None:
+        self._ensure_mutable()
+        self._require_incomplete(Stage.REGISTERED)
         try:
             with self._connection:
                 self._connection.execute(
@@ -167,8 +227,11 @@ class CorpusV2Ledger:
             raise CorpusV2LedgerError("C2_SOURCE_DUPLICATE") from error
 
     def record_acquisition(self, acquisition: AcquisitionRecord) -> None:
+        self._ensure_mutable()
         if not self._source_exists(acquisition.source_id):
             raise CorpusV2LedgerError("C2_SOURCE_UNKNOWN")
+        self._require_completed(Stage.REGISTERED)
+        self._require_incomplete(Stage.ACQUIRED)
         try:
             with self._connection:
                 self._connection.execute(
@@ -188,8 +251,11 @@ class CorpusV2Ledger:
             raise CorpusV2LedgerError("C2_ACQUISITION_DUPLICATE") from error
 
     def record_extraction(self, extraction: ExtractionRecord) -> None:
+        self._ensure_mutable()
         if not self._source_exists(extraction.source_id):
             raise CorpusV2LedgerError("C2_SOURCE_UNKNOWN")
+        self._require_completed(Stage.ACQUIRED)
+        self._require_incomplete(Stage.PARSED)
         if self._connection.execute(
             "SELECT 1 FROM acquisitions WHERE source_id = ?", (extraction.source_id,)
         ).fetchone() is None:
@@ -221,8 +287,11 @@ class CorpusV2Ledger:
         reviewer_id: str,
         reason_code: str,
     ) -> None:
+        self._ensure_mutable()
         if not self._source_exists(source_id):
             raise CorpusV2LedgerError("C2_SOURCE_UNKNOWN")
+        self._require_completed(Stage.PARSED)
+        self._require_incomplete(Stage.REVIEWED)
         if not isinstance(disposition, SourceDisposition) or not reviewer_id or not reason_code:
             raise CorpusV2LedgerError("C2_DISPOSITION_INVALID")
         with self._connection:
@@ -250,12 +319,32 @@ class CorpusV2Ledger:
                 raise CorpusV2LedgerError("C2_STAGE_PREREQUISITE")
         if stage in self.completed_stages():
             raise CorpusV2LedgerError("C2_STAGE_DUPLICATE")
+        self._validate_stage_state(stage)
         with self._connection:
             self._connection.execute(
                 "INSERT INTO stage_checkpoints (stage, completed_at) VALUES (?, ?)",
                 (stage.value, _timestamp()),
             )
             self._event("stage_completed", {"stage": stage.value})
+
+    def _validate_stage_state(self, stage: Stage) -> None:
+        source_count = self._connection.execute("SELECT COUNT(*) FROM source_register").fetchone()[0]
+        if stage is Stage.REGISTERED and source_count == 0:
+            raise CorpusV2LedgerError("C2_STAGE_STATE")
+        if stage is Stage.ACQUIRED:
+            acquisition_count = self._connection.execute("SELECT COUNT(*) FROM acquisitions").fetchone()[0]
+            if acquisition_count != source_count:
+                raise CorpusV2LedgerError("C2_STAGE_STATE")
+        if stage is Stage.PARSED:
+            extraction_count = self._connection.execute("SELECT COUNT(*) FROM extractions").fetchone()[0]
+            if extraction_count != source_count:
+                raise CorpusV2LedgerError("C2_STAGE_STATE")
+        if stage is Stage.REVIEWED:
+            reviewed_count = self._connection.execute(
+                "SELECT COUNT(DISTINCT source_id) FROM disposition_decisions"
+            ).fetchone()[0]
+            if reviewed_count != source_count:
+                raise CorpusV2LedgerError("C2_STAGE_STATE")
 
     def current_disposition(self, source_id: str) -> DispositionDecision | None:
         row = self._connection.execute(

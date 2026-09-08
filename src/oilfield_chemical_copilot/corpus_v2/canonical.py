@@ -13,24 +13,21 @@ class CorpusV2CanonicalError(ValueError):
     """Raised when a record is not safe for public canonicalization."""
 
 
-_FORBIDDEN_FIELD_FRAGMENTS = ("path", "text", "content", "credential", "secret", "token", "key")
+_STRING_FIELDS = {
+    "release_id", "source_id", "chunk_id", "stage", "disposition", "reason_code",
+    "reviewer_id", "status", "model", "sha256", "source_sha256", "content_sha256",
+    "text_sha256", "embedding_sha256", "index_manifest_sha256",
+}
 
 
-def _validate(value: Any, *, field_name: str | None = None) -> None:
-    if field_name and any(fragment in field_name.lower() for fragment in _FORBIDDEN_FIELD_FRAGMENTS):
-        raise CorpusV2CanonicalError("C2_CANONICAL_INVALID")
-    if isinstance(value, (float, Path)):
-        raise CorpusV2CanonicalError("C2_CANONICAL_INVALID")
-    if isinstance(value, Mapping):
-        for key, nested in value.items():
-            if not isinstance(key, str):
-                raise CorpusV2CanonicalError("C2_CANONICAL_INVALID")
-            _validate(nested, field_name=key)
-    elif isinstance(value, (list, tuple)):
-        for nested in value:
-            _validate(nested)
-    elif value is not None and not isinstance(value, (str, int, bool)):
-        raise CorpusV2CanonicalError("C2_CANONICAL_INVALID")
+def _validate(record: Mapping[str, Any]) -> None:
+    for field_name, value in record.items():
+        if not isinstance(field_name, str) or isinstance(value, (float, Path, list, tuple, Mapping)):
+            raise CorpusV2CanonicalError("C2_CANONICAL_INVALID")
+        if isinstance(value, str) and field_name not in _STRING_FIELDS:
+            raise CorpusV2CanonicalError("C2_CANONICAL_INVALID")
+        if value is not None and not isinstance(value, (str, int, bool)):
+            raise CorpusV2CanonicalError("C2_CANONICAL_INVALID")
 
 
 def canonical_jsonl(records: Iterable[Mapping[str, Any]]) -> bytes:
