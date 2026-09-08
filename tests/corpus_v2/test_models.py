@@ -97,6 +97,18 @@ def test_public_records_are_frozen_and_validate_sha256_values() -> None:
         ApprovedSource(source_id="doc-1", source_sha256="A" * 64)
 
 
+def test_record_contracts_accept_documented_model_names_and_offset_timestamps() -> None:
+    acquisition = AcquisitionRecord(
+        source_id="doc-1", acquired_at="2026-09-07T00:00:00+00:00", content_sha256=SHA, byte_count=0
+    )
+    embedding = EmbeddingRecord(
+        chunk_id="doc-1:0", embedding_model="sentence-transformers/all-MiniLM-L6-v2",
+        embedding_sha256=SHA, vector_dimensions=384,
+    )
+    assert acquisition.acquired_at.endswith("+00:00")
+    assert embedding.embedding_model.startswith("sentence-transformers/")
+
+
 def test_source_disposition_has_only_the_approved_values() -> None:
     assert {member.value for member in SourceDisposition} == {
         "INDEXED", "DUPLICATE", "NON_TEXT", "EMPTY", "UNSUPPORTED",

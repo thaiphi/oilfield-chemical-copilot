@@ -13,6 +13,7 @@ from oilfield_chemical_copilot.corpus_v2.models import (
     ExtractionRecord,
     ReleaseConfig,
     SourceDisposition,
+    StageArtifactKind,
     Stage,
 )
 
@@ -103,7 +104,9 @@ def test_ledger_rejects_mutations_after_promotion(tmp_path: Path) -> None:
         Stage.EVALUATED, Stage.PROMOTION_READY, Stage.PROMOTED,
     ):
         if stage.value in {"CHUNKED", "EMBEDDED", "INDEX_VALIDATED", "EVALUATED", "PROMOTION_READY", "PROMOTED"}:
-            ledger.record_stage_artifact(stage, artifact_kind="synthetic-gate", artifact_sha256=SHA)
+            ledger.record_stage_artifact(
+                stage, artifact_kind=StageArtifactKind.for_stage(stage), artifact_sha256=SHA
+            )
         ledger.complete_stage(stage)
 
     with pytest.raises(CorpusV2LedgerError, match="C2_RELEASE_IMMUTABLE"):
@@ -135,7 +138,9 @@ def test_ledger_requires_durable_artifacts_for_chunked_through_promoted_stages(t
     with pytest.raises(CorpusV2LedgerError, match="C2_STAGE_ARTIFACT_REQUIRED"):
         ledger.complete_stage(Stage.CHUNKED)
 
-    ledger.record_stage_artifact(Stage.CHUNKED, artifact_kind="chunk-manifest", artifact_sha256=SHA)
+    ledger.record_stage_artifact(
+        Stage.CHUNKED, artifact_kind=StageArtifactKind.CHUNK_MANIFEST, artifact_sha256=SHA
+    )
     ledger.complete_stage(Stage.CHUNKED)
 
 
@@ -156,6 +161,45 @@ def test_terminal_disposition_accepts_matching_mechanical_extraction_outcome(tmp
         reviewer_id="reviewer-a", reason_code="NO_EXTRACTED_TEXT",
     )
     ledger.complete_stage(Stage.REVIEWED)
+
+
+def test_terminal_extraction_outcome_cannot_be_marked_indexed(tmp_path: Path) -> None:
+    ledger = CorpusV2Ledger.create(tmp_path / "ledger.sqlite", release_config=config())
+    ledger.record_source(ApprovedSource(source_id="doc-1", source_sha256=SHA))
+    ledger.complete_stage(Stage.REGISTERED)
+    ledger.record_acquisition(AcquisitionRecord("doc-1", "2026-09-07T00:00:00Z", SHA, 10))
+    ledger.complete_stage(Stage.ACQUIRED)
+    ledger.record_extraction(
+        ExtractionRecord("doc-1", "2026-09-07T00:00:00Z", "synthetic", None, 0, ExtractionOutcome.EMPTY)
+    )
+    ledger.complete_stage(Stage.PARSED)
+    with pytest.raises(CorpusV2LedgerError, match="C2_DISPOSITION_PREREQUISITE"):
+        ledger.record_disposition(
+            source_id="doc-1", disposition=SourceDisposition.INDEXED,
+            reviewer_id="reviewer-a", reason_code="APPROVED",
+        )
+
+
+def test_ledger_rejects_secret_or_wrong_stage_artifact_kind(tmp_path: Path) -> None:
+    ledger = CorpusV2Ledger.create(tmp_path / "ledger.sqlite", release_config=config())
+    ledger.record_source(ApprovedSource(source_id="doc-1", source_sha256=SHA))
+    ledger.complete_stage(Stage.REGISTERED)
+    ledger.record_acquisition(AcquisitionRecord("doc-1", "2026-09-07T00:00:00Z", SHA, 10))
+    ledger.complete_stage(Stage.ACQUIRED)
+    ledger.record_extraction(ExtractionRecord("doc-1", "2026-09-07T00:00:00Z", "synthetic", SHA, 10))
+    ledger.complete_stage(Stage.PARSED)
+    ledger.record_disposition(
+        source_id="doc-1", disposition=SourceDisposition.INDEXED,
+        reviewer_id="reviewer-a", reason_code="APPROVED",
+    )
+    ledger.complete_stage(Stage.REVIEWED)
+    with pytest.raises(CorpusV2LedgerError, match="C2_STAGE_ARTIFACT_INVALID"):
+        ledger.record_stage_artifact(Stage.CHUNKED, artifact_kind="sk-proj-opaque123", artifact_sha256=SHA)  # type: ignore[arg-type]
+    with pytest.raises(CorpusV2LedgerError, match="C2_STAGE_ARTIFACT_INVALID"):
+        ledger.record_stage_artifact(
+            Stage.CHUNKED, artifact_kind=StageArtifactKind.EMBEDDING_MANIFEST, artifact_sha256=SHA
+        )
+    assert all("sk-proj-opaque123" not in str(event.payload) for event in ledger.event_history())
 
 
 def test_ledger_open_rejects_partial_schema(tmp_path: Path) -> None:

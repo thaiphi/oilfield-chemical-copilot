@@ -5,9 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Iterable, Mapping
-from datetime import datetime
 import re
 from typing import Any
+
+from .models import is_valid_embedding_model, is_valid_timestamp
 
 
 class CorpusV2CanonicalError(ValueError):
@@ -15,33 +16,35 @@ class CorpusV2CanonicalError(ValueError):
 
 
 _RECORD_SCHEMAS = {
-    frozenset({"source_id", "source_sha256"}): {"source_id": "identifier", "source_sha256": "sha256"},
+    frozenset({"source_id", "source_sha256"}): {"source_id": "source_id", "source_sha256": "sha256"},
     frozenset({"source_id", "acquired_at", "content_sha256", "byte_count"}): {
-        "source_id": "identifier", "acquired_at": "timestamp", "content_sha256": "sha256", "byte_count": "count",
+        "source_id": "source_id", "acquired_at": "timestamp", "content_sha256": "sha256", "byte_count": "count",
     },
     frozenset({"source_id", "extracted_at", "extractor", "text_sha256", "character_count"}): {
-        "source_id": "identifier", "extracted_at": "timestamp", "extractor": "identifier",
+        "source_id": "source_id", "extracted_at": "timestamp", "extractor": "extractor",
         "text_sha256": "sha256", "character_count": "count",
     },
     frozenset({"source_id", "extracted_at", "extractor", "text_sha256", "character_count", "outcome"}): {
-        "source_id": "identifier", "extracted_at": "timestamp", "extractor": "identifier",
+        "source_id": "source_id", "extracted_at": "timestamp", "extractor": "extractor",
         "text_sha256": "optional_sha256", "character_count": "count", "outcome": "outcome",
     },
     frozenset({"chunk_id", "source_id", "ordinal", "text_sha256", "character_count"}): {
-        "chunk_id": "identifier", "source_id": "identifier", "ordinal": "count",
+        "chunk_id": "chunk_id", "source_id": "source_id", "ordinal": "count",
         "text_sha256": "sha256", "character_count": "count",
     },
     frozenset({"chunk_id", "embedding_model", "embedding_sha256", "vector_dimensions"}): {
-        "chunk_id": "identifier", "embedding_model": "identifier", "embedding_sha256": "sha256",
+        "chunk_id": "chunk_id", "embedding_model": "embedding_model", "embedding_sha256": "sha256",
         "vector_dimensions": "positive_count",
     },
     frozenset({"release_id", "source_register_sha256", "index_manifest_sha256", "chunk_count"}): {
-        "release_id": "identifier", "source_register_sha256": "sha256",
+        "release_id": "release_id", "source_register_sha256": "sha256",
         "index_manifest_sha256": "sha256", "chunk_count": "count",
     },
 }
-_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
-_SENSITIVE_VALUE = re.compile(r"(?:authorization|bearer|credential|password|secret|token|api[_-]?key)", re.I)
+_SOURCE_ID = re.compile(r"^(?:doc-\d+|drive:[A-Za-z0-9_-]{20,128})$")
+_CHUNK_ID = re.compile(r"^(?:doc-\d+|drive:[A-Za-z0-9_-]{20,128}):\d+$")
+_RELEASE_ID = re.compile(r"^corpus-v2-\d{4}-\d{2}-\d{2}$")
+_EXTRACTOR = re.compile(r"^(?:pypdf|python-docx|synthetic)$")
 
 
 def _validate(record: Mapping[str, Any]) -> None:
@@ -62,16 +65,24 @@ def _validate(record: Mapping[str, Any]) -> None:
                 continue
             if not isinstance(value, str) or len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
                 raise CorpusV2CanonicalError("C2_CANONICAL_INVALID")
-        elif field_type == "identifier":
-            if not isinstance(value, str) or not _IDENTIFIER.fullmatch(value) or _SENSITIVE_VALUE.search(value):
+        elif field_type == "source_id":
+            if not isinstance(value, str) or not _SOURCE_ID.fullmatch(value):
+                raise CorpusV2CanonicalError("C2_CANONICAL_INVALID")
+        elif field_type == "chunk_id":
+            if not isinstance(value, str) or not _CHUNK_ID.fullmatch(value):
+                raise CorpusV2CanonicalError("C2_CANONICAL_INVALID")
+        elif field_type == "release_id":
+            if not isinstance(value, str) or not _RELEASE_ID.fullmatch(value):
+                raise CorpusV2CanonicalError("C2_CANONICAL_INVALID")
+        elif field_type == "extractor":
+            if not isinstance(value, str) or not _EXTRACTOR.fullmatch(value):
+                raise CorpusV2CanonicalError("C2_CANONICAL_INVALID")
+        elif field_type == "embedding_model":
+            if not is_valid_embedding_model(value):
                 raise CorpusV2CanonicalError("C2_CANONICAL_INVALID")
         elif field_type == "timestamp":
-            if not isinstance(value, str) or not value.endswith("Z") or _SENSITIVE_VALUE.search(value):
+            if not is_valid_timestamp(value):
                 raise CorpusV2CanonicalError("C2_CANONICAL_INVALID")
-            try:
-                datetime.fromisoformat(value.removesuffix("Z") + "+00:00")
-            except ValueError as error:
-                raise CorpusV2CanonicalError("C2_CANONICAL_INVALID") from error
         elif field_type == "outcome" and value not in {"SUCCESS", "NON_TEXT", "EMPTY", "UNSUPPORTED", "FAILED"}:
             raise CorpusV2CanonicalError("C2_CANONICAL_INVALID")
     if "outcome" in schema:

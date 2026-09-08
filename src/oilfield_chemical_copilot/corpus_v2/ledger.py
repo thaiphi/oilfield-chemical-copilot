@@ -15,6 +15,7 @@ from .models import (
     ExtractionRecord,
     ReleaseConfig,
     SourceDisposition,
+    StageArtifactKind,
     Stage,
 )
 
@@ -295,7 +296,7 @@ class CorpusV2Ledger:
             raise CorpusV2LedgerError("C2_EXTRACTION_DUPLICATE") from error
 
     def record_stage_artifact(
-        self, stage: Stage, *, artifact_kind: str, artifact_sha256: str
+        self, stage: Stage, *, artifact_kind: StageArtifactKind, artifact_sha256: str
     ) -> None:
         self._ensure_mutable()
         if not isinstance(stage, Stage) or stage.value not in {
@@ -305,7 +306,13 @@ class CorpusV2Ledger:
         stage_index = _STAGE_ORDER.index(stage)
         self._require_completed(_STAGE_ORDER[stage_index - 1])
         self._require_incomplete(stage)
-        if not isinstance(artifact_kind, str) or not artifact_kind:
+        if not isinstance(artifact_kind, StageArtifactKind):
+            raise CorpusV2LedgerError("C2_STAGE_ARTIFACT_INVALID")
+        try:
+            expected_kind = StageArtifactKind.for_stage(stage)
+        except ValueError as error:
+            raise CorpusV2LedgerError("C2_STAGE_ARTIFACT_INVALID") from error
+        if artifact_kind is not expected_kind:
             raise CorpusV2LedgerError("C2_STAGE_ARTIFACT_INVALID")
         if (
             not isinstance(artifact_sha256, str)
@@ -320,9 +327,11 @@ class CorpusV2Ledger:
                     INSERT INTO stage_artifacts (stage, artifact_kind, artifact_sha256, recorded_at)
                     VALUES (?, ?, ?, ?)
                     """,
-                    (stage.value, artifact_kind, artifact_sha256, _timestamp()),
+                    (stage.value, artifact_kind.value, artifact_sha256, _timestamp()),
                 )
-                self._event("stage_artifact_recorded", {"stage": stage.value, "artifact_kind": artifact_kind})
+                self._event(
+                    "stage_artifact_recorded", {"stage": stage.value, "artifact_kind": artifact_kind.value}
+                )
         except sqlite3.IntegrityError as error:
             raise CorpusV2LedgerError("C2_STAGE_ARTIFACT_DUPLICATE") from error
 
@@ -344,15 +353,24 @@ class CorpusV2Ledger:
         outcome_row = self._connection.execute(
             "SELECT outcome FROM extractions WHERE source_id = ?", (source_id,)
         ).fetchone()
-        expected_terminal_outcome = {
+        expected_disposition = {
             SourceDisposition.NON_TEXT: ExtractionOutcome.NON_TEXT,
             SourceDisposition.EMPTY: ExtractionOutcome.EMPTY,
             SourceDisposition.UNSUPPORTED: ExtractionOutcome.UNSUPPORTED,
             SourceDisposition.EXTRACTION_FAILED: ExtractionOutcome.FAILED,
         }.get(disposition)
-        if expected_terminal_outcome is not None and (
-            outcome_row is None or outcome_row["outcome"] != expected_terminal_outcome.value
-        ):
+        terminal_dispositions = {
+            ExtractionOutcome.NON_TEXT: SourceDisposition.NON_TEXT,
+            ExtractionOutcome.EMPTY: SourceDisposition.EMPTY,
+            ExtractionOutcome.UNSUPPORTED: SourceDisposition.UNSUPPORTED,
+            ExtractionOutcome.FAILED: SourceDisposition.EXTRACTION_FAILED,
+        }
+        if outcome_row is None:
+            raise CorpusV2LedgerError("C2_DISPOSITION_PREREQUISITE")
+        outcome = ExtractionOutcome(outcome_row["outcome"])
+        if expected_disposition is not None and outcome is not expected_disposition:
+            raise CorpusV2LedgerError("C2_DISPOSITION_PREREQUISITE")
+        if outcome in terminal_dispositions and disposition is not terminal_dispositions[outcome]:
             raise CorpusV2LedgerError("C2_DISPOSITION_PREREQUISITE")
         with self._connection:
             decided_at = _timestamp()

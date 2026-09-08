@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
+import re
 from typing import Any, Mapping
 
 
@@ -44,6 +46,33 @@ class Stage(str, Enum):
     PROMOTED = "PROMOTED"
 
 
+class StageArtifactKind(str, Enum):
+    CHUNK_MANIFEST = "CHUNK_MANIFEST"
+    EMBEDDING_MANIFEST = "EMBEDDING_MANIFEST"
+    INDEX_VALIDATION_REPORT = "INDEX_VALIDATION_REPORT"
+    EVALUATION_REPORT = "EVALUATION_REPORT"
+    PROMOTION_APPROVAL = "PROMOTION_APPROVAL"
+    PROMOTION_RECEIPT = "PROMOTION_RECEIPT"
+
+    @classmethod
+    def for_stage(cls, stage: Stage) -> "StageArtifactKind":
+        mapping = {
+            Stage.CHUNKED: cls.CHUNK_MANIFEST,
+            Stage.EMBEDDED: cls.EMBEDDING_MANIFEST,
+            Stage.INDEX_VALIDATED: cls.INDEX_VALIDATION_REPORT,
+            Stage.EVALUATED: cls.EVALUATION_REPORT,
+            Stage.PROMOTION_READY: cls.PROMOTION_APPROVAL,
+            Stage.PROMOTED: cls.PROMOTION_RECEIPT,
+        }
+        try:
+            return mapping[stage]
+        except KeyError as error:
+            raise CorpusV2ContractError("C2_STAGE_ARTIFACT_INVALID") from error
+
+
+_EMBEDDING_MODEL = re.compile(r"^(?:local-model|sentence-transformers/[A-Za-z0-9][A-Za-z0-9._-]{0,127})$")
+
+
 def _invalid_config() -> None:
     raise CorpusV2ContractError("C2_CONFIG_INVALID")
 
@@ -68,6 +97,20 @@ def _sha256(value: object) -> str:
     ):
         raise CorpusV2ContractError("C2_SHA256_INVALID")
     return value
+
+
+def is_valid_timestamp(value: object) -> bool:
+    if not isinstance(value, str) or not (value.endswith("Z") or re.search(r"[+-]\d{2}:\d{2}$", value)):
+        return False
+    try:
+        timestamp = value.removesuffix("Z") + "+00:00" if value.endswith("Z") else value
+        return datetime.fromisoformat(timestamp).tzinfo is not None
+    except ValueError:
+        return False
+
+
+def is_valid_embedding_model(value: object) -> bool:
+    return isinstance(value, str) and _EMBEDDING_MODEL.fullmatch(value) is not None
 
 
 @dataclass(frozen=True)
@@ -158,7 +201,8 @@ class AcquisitionRecord:
 
     def __post_init__(self) -> None:
         _non_empty(self.source_id)
-        _non_empty(self.acquired_at)
+        if not is_valid_timestamp(self.acquired_at):
+            raise CorpusV2ContractError("C2_TIMESTAMP_INVALID")
         _sha256(self.content_sha256)
         _count(self.byte_count)
 
@@ -174,7 +218,8 @@ class ExtractionRecord:
 
     def __post_init__(self) -> None:
         _non_empty(self.source_id)
-        _non_empty(self.extracted_at)
+        if not is_valid_timestamp(self.extracted_at):
+            raise CorpusV2ContractError("C2_TIMESTAMP_INVALID")
         _non_empty(self.extractor)
         _count(self.character_count)
         if not isinstance(self.outcome, ExtractionOutcome):
@@ -210,7 +255,8 @@ class EmbeddingRecord:
 
     def __post_init__(self) -> None:
         _non_empty(self.chunk_id)
-        _non_empty(self.embedding_model)
+        if not is_valid_embedding_model(self.embedding_model):
+            raise CorpusV2ContractError("C2_EMBEDDING_MODEL_INVALID")
         _sha256(self.embedding_sha256)
         if _count(self.vector_dimensions) <= 0:
             raise CorpusV2ContractError("C2_COUNT_INVALID")
