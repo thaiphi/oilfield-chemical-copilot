@@ -318,16 +318,30 @@ def record_extraction_candidate(ledger: ExtractionLedger, candidate: ExtractionC
 
 
 def review_gate_status(
+    extractions: Iterable[ExtractionRecord],
     decisions: Iterable[ReviewDecision],
     *,
     sealed_source_ids: Iterable[str],
     critical_source_ids: Iterable[str],
+    usable_chunk_source_ids: Iterable[str],
 ) -> str:
-    """Return READY or BLOCKED after validating explicit final review decisions."""
+    """Return READY or BLOCKED after evidence-bound final review validation."""
     sealed_ids = frozenset(sealed_source_ids)
     critical_ids = frozenset(critical_source_ids)
+    usable_ids = frozenset(usable_chunk_source_ids)
     if not critical_ids.issubset(sealed_ids):
         raise CorpusV2ProcessingError("C2_SOURCE_UNKNOWN")
+    if not usable_ids.issubset(sealed_ids):
+        raise CorpusV2ProcessingError("C2_SOURCE_UNKNOWN")
+    extractions_by_source: dict[str, ExtractionRecord] = {}
+    for extraction in extractions:
+        if not isinstance(extraction, ExtractionRecord) or extraction.source_id not in sealed_ids:
+            raise CorpusV2ProcessingError("C2_SOURCE_UNKNOWN")
+        if extraction.source_id in extractions_by_source:
+            raise CorpusV2ProcessingError("C2_EXTRACTION_DUPLICATE")
+        extractions_by_source[extraction.source_id] = extraction
+    if set(extractions_by_source) != sealed_ids:
+        raise CorpusV2ProcessingError("C2_REVIEW_INCOMPLETE")
     decisions_by_source: dict[str, ReviewDecision] = {}
     for decision in decisions:
         _validate_review_decision(decision, sealed_ids)
@@ -338,20 +352,57 @@ def review_gate_status(
         raise CorpusV2ProcessingError("C2_REVIEW_INCOMPLETE")
 
     for decision in decisions_by_source.values():
+        _validate_disposition_evidence(
+            decision,
+            extraction=extractions_by_source[decision.source_id],
+            usable_chunk_source_ids=usable_ids,
+        )
         if decision.disposition is SourceDisposition.DUPLICATE:
             representative = decisions_by_source.get(decision.representative_source_id)
-            if representative is None or representative.disposition is not SourceDisposition.INDEXED:
+            if (
+                representative is None
+                or representative.disposition is not SourceDisposition.INDEXED
+                or representative.source_id not in usable_ids
+            ):
                 raise CorpusV2ProcessingError("C2_DUPLICATE_REPRESENTATIVE_INVALID")
     for critical_id in critical_ids:
+        extraction = extractions_by_source[critical_id]
         decision = decisions_by_source[critical_id]
-        usable = decision.disposition is SourceDisposition.INDEXED or (
-            decision.disposition is SourceDisposition.DUPLICATE
-            and decisions_by_source[decision.representative_source_id].disposition
-            is SourceDisposition.INDEXED
-        )
+        if extraction.outcome is not ExtractionOutcome.SUCCESS:
+            return "BLOCKED"
+        usable = decision.disposition is SourceDisposition.INDEXED and critical_id in usable_ids
         if not usable:
             return "BLOCKED"
     return "READY"
+
+
+def _validate_disposition_evidence(
+    decision: ReviewDecision,
+    *,
+    extraction: ExtractionRecord,
+    usable_chunk_source_ids: frozenset[str],
+) -> None:
+    terminal_dispositions = {
+        ExtractionOutcome.NON_TEXT: SourceDisposition.NON_TEXT,
+        ExtractionOutcome.EMPTY: SourceDisposition.EMPTY,
+        ExtractionOutcome.UNSUPPORTED: SourceDisposition.UNSUPPORTED,
+        ExtractionOutcome.FAILED: SourceDisposition.EXTRACTION_FAILED,
+    }
+    if extraction.outcome in terminal_dispositions:
+        if decision.disposition is not terminal_dispositions[extraction.outcome]:
+            raise CorpusV2ProcessingError("C2_DISPOSITION_EVIDENCE_MISMATCH")
+        return
+    if extraction.outcome is not ExtractionOutcome.SUCCESS:
+        raise CorpusV2ProcessingError("C2_DISPOSITION_EVIDENCE_MISMATCH")
+    if decision.disposition is SourceDisposition.INDEXED:
+        if (
+            extraction.text_sha256 is None
+            or extraction.character_count <= 0
+            or decision.source_id not in usable_chunk_source_ids
+        ):
+            raise CorpusV2ProcessingError("C2_DISPOSITION_EVIDENCE_MISMATCH")
+    elif decision.disposition not in {SourceDisposition.DUPLICATE, SourceDisposition.INTENTIONALLY_EXCLUDED}:
+        raise CorpusV2ProcessingError("C2_DISPOSITION_EVIDENCE_MISMATCH")
 
 
 def _validate_review_decision(decision: object, sealed_source_ids: frozenset[str]) -> None:
