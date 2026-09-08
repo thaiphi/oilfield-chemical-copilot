@@ -7,6 +7,7 @@ import pytest
 from ingestion.corpus_v2_apply_migrations import (
     CorpusV2MigrationError,
     V2_MIGRATIONS_DIR,
+    _strip_sql_comments,
     assert_v2_migrations_isolated,
     validate_migration_target,
     validate_v2_schema,
@@ -71,3 +72,7 @@ def test_v2_schema_rejects_required_tokens_hidden_in_block_comment(tmp_path: Pat
     )
     with pytest.raises(CorpusV2MigrationError, match="C2_MIGRATION_SCHEMA_INVALID"):
         validate_v2_schema(schema)
+
+
+def test_comment_stripper_removes_mixed_block_and_line_comment_without_residue() -> None:
+    assert _strip_sql_comments("/* hidden -- */") == ""

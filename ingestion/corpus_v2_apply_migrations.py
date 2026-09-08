@@ -28,6 +28,12 @@ class CorpusV2MigrationError(ValueError):
     """Raised before any candidate migration action is possible."""
 
 
+def _strip_sql_comments(schema: str) -> str:
+    """Remove block comments before line comments so delimiters cannot be orphaned."""
+    without_blocks = re.sub(r"/\*.*?\*/", "", schema, flags=re.DOTALL)
+    return re.sub(r"--[^\r\n]*", "", without_blocks)
+
+
 def validate_migration_target(candidate_url: str, legacy_url: str, config: ReleaseConfig) -> None:
     """Reject an unsafe target using URL parsing only; never connect or write."""
     try:
@@ -53,8 +59,7 @@ def validate_v2_schema(schema_path: Path) -> None:
         schema = schema_path.read_text(encoding="utf-8")
     except OSError as error:
         raise CorpusV2MigrationError("C2_MIGRATION_SCHEMA_INVALID") from error
-    uncommented = re.sub(r"--[^\r\n]*", "", schema)
-    uncommented = re.sub(r"/\*.*?\*/", "", uncommented, flags=re.DOTALL).lower()
+    uncommented = _strip_sql_comments(schema).lower()
     release_table = re.search(r"create table corpus_release\s*\((.*?)\n\);", uncommented, re.DOTALL)
     chunks_table = re.search(r"create table chunks\s*\((.*?)\n\);", uncommented, re.DOTALL)
     required_release_fragments = (
