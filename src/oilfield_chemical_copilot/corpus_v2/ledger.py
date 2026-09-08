@@ -617,5 +617,25 @@ class CorpusV2Ledger:
             for row in rows
         )
 
+    def release_projection(self) -> dict[str, list[dict[str, object]]]:
+        """Read one consistent private projection, including artifact digests.
+
+        The caller must retain this only within the authenticated private release
+        tree. A transaction prevents a mixed projection during concurrent writes.
+        """
+        if self._connection.in_transaction:
+            raise CorpusV2LedgerError("C2_LEDGER_TRANSACTION_ACTIVE")
+        self._connection.execute("BEGIN")
+        try:
+            projection = {}
+            for table in sorted(_REQUIRED_TABLES):
+                rows = [dict(row) for row in self._connection.execute(f"SELECT * FROM {table}")]
+                projection[table] = sorted(
+                    rows, key=lambda row: json.dumps(row, sort_keys=True, separators=(",", ":"))
+                )
+            return projection
+        finally:
+            self._connection.rollback()
+
     def close(self) -> None:
         self._connection.close()
