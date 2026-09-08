@@ -155,6 +155,7 @@ class ReleaseConfig:
     legacy_database_names: tuple[str, ...]
     expected_source_count: int
     source_register_sha256: str
+    critical_source_register_sha256: str
 
     def __post_init__(self) -> None:
         try:
@@ -175,6 +176,7 @@ class ReleaseConfig:
             ):
                 _invalid_config()
             _sha256(self.source_register_sha256)
+            _sha256(self.critical_source_register_sha256)
         except (CorpusV2ContractError, TypeError):
             _invalid_config()
         if candidate == configured or candidate in legacy:
@@ -185,7 +187,7 @@ class ReleaseConfig:
         expected = {
             "release_id", "release_root", "candidate_database_name",
             "configured_database_name", "legacy_database_names", "expected_source_count",
-            "source_register_sha256",
+            "source_register_sha256", "critical_source_register_sha256",
         }
         if set(payload) != expected:
             _invalid_config()
@@ -202,6 +204,7 @@ class ReleaseConfig:
             if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
                 _invalid_config()
             source_register_sha256 = _sha256(payload["source_register_sha256"])
+            critical_source_register_sha256 = _sha256(payload["critical_source_register_sha256"])
         except (KeyError, TypeError):
             _invalid_config()
         return cls(
@@ -212,6 +215,7 @@ class ReleaseConfig:
             legacy_database_names=legacy,
             expected_source_count=count,
             source_register_sha256=source_register_sha256,
+            critical_source_register_sha256=critical_source_register_sha256,
         )
 
 

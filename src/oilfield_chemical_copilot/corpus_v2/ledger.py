@@ -42,7 +42,7 @@ class LedgerEvent:
 
 _STAGE_ORDER = tuple(Stage)
 _REQUIRED_TABLES = {
-    "release": {"release_id", "candidate_database_name", "configured_database_name", "legacy_database_names_json", "expected_source_count", "source_register_sha256"},
+    "release": {"release_id", "candidate_database_name", "configured_database_name", "legacy_database_names_json", "expected_source_count", "source_register_sha256", "critical_source_register_sha256"},
     "source_register": {"source_id", "source_sha256"},
     "acquisitions": {"source_id", "acquired_at", "content_sha256", "byte_count"},
     "extractions": {"source_id", "extracted_at", "extractor", "text_sha256", "character_count", "outcome"},
@@ -110,7 +110,8 @@ class CorpusV2Ledger:
                 configured_database_name TEXT NOT NULL,
                 legacy_database_names_json TEXT NOT NULL,
                 expected_source_count INTEGER NOT NULL,
-                source_register_sha256 TEXT NOT NULL
+                source_register_sha256 TEXT NOT NULL,
+                critical_source_register_sha256 TEXT NOT NULL
             )""",
             """CREATE TABLE source_register (
                 source_id TEXT PRIMARY KEY,
@@ -183,6 +184,12 @@ class CorpusV2Ledger:
             or not isinstance(release["source_register_sha256"], str)
             or len(release["source_register_sha256"]) != 64
             or any(character not in "0123456789abcdef" for character in release["source_register_sha256"])
+            or not isinstance(release["critical_source_register_sha256"], str)
+            or len(release["critical_source_register_sha256"]) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in release["critical_source_register_sha256"]
+            )
         ):
             raise CorpusV2LedgerError("C2_LEDGER_INVALID")
 
@@ -191,8 +198,9 @@ class CorpusV2Ledger:
             """
             INSERT INTO release (
                 release_id, candidate_database_name, configured_database_name,
-                legacy_database_names_json, expected_source_count, source_register_sha256
-            ) VALUES (?, ?, ?, ?, ?, ?)
+                legacy_database_names_json, expected_source_count, source_register_sha256,
+                critical_source_register_sha256
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 config.release_id,
@@ -201,6 +209,7 @@ class CorpusV2Ledger:
                 json.dumps(config.legacy_database_names),
                 config.expected_source_count,
                 config.source_register_sha256,
+                config.critical_source_register_sha256,
             ),
         )
 

@@ -30,6 +30,7 @@ def valid_release_config(**overrides: object) -> dict[str, object]:
         "legacy_database_names": ["oilfield_copilot"],
         "expected_source_count": 385,
         "source_register_sha256": SHA,
+        "critical_source_register_sha256": SHA,
     }
     payload.update(overrides)
     return payload
@@ -57,6 +58,13 @@ def test_release_config_requires_exact_non_boolean_source_count() -> None:
         ReleaseConfig.from_mapping(valid_release_config(expected_source_count=True))
 
 
+def test_release_config_requires_a_critical_register_digest() -> None:
+    payload = valid_release_config()
+    del payload["critical_source_register_sha256"]
+    with pytest.raises(CorpusV2ContractError, match="C2_CONFIG_INVALID"):
+        ReleaseConfig.from_mapping(payload)
+
+
 def test_release_config_direct_constructor_enforces_release_isolation() -> None:
     with pytest.raises(CorpusV2ContractError, match="C2_CONFIG_INVALID"):
         ReleaseConfig(
@@ -67,6 +75,7 @@ def test_release_config_direct_constructor_enforces_release_isolation() -> None:
             legacy_database_names=("oilfield_copilot",),
             expected_source_count=385,
             source_register_sha256=SHA,
+            critical_source_register_sha256=SHA,
         )
     with pytest.raises(CorpusV2ContractError, match="C2_CONFIG_INVALID"):
         ReleaseConfig(
@@ -77,6 +86,7 @@ def test_release_config_direct_constructor_enforces_release_isolation() -> None:
             legacy_database_names=("oilfield_copilot",),
             expected_source_count=1.5,
             source_register_sha256=SHA,
+            critical_source_register_sha256=SHA,
         )
 
 

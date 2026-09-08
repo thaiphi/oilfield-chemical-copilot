@@ -31,6 +31,7 @@ def config(*, expected_source_count: int = 1) -> ReleaseConfig:
             "legacy_database_names": ["oilfield_copilot"],
             "expected_source_count": expected_source_count,
             "source_register_sha256": SHA,
+            "critical_source_register_sha256": SHA,
         }
     )
 
