@@ -41,8 +41,8 @@ _RECORD_SCHEMAS = {
         "index_manifest_sha256": "sha256", "chunk_count": "count",
     },
 }
-_SOURCE_ID = re.compile(r"^(?:doc-\d+|drive:[A-Za-z0-9_-]{20,128})$")
-_CHUNK_ID = re.compile(r"^(?:doc-\d+|drive:[A-Za-z0-9_-]{20,128}):\d+$")
+_SOURCE_ID = re.compile(r"^(?:doc-\d+|drive:1[A-Za-z0-9_-]{19,127})$")
+_CHUNK_ID = re.compile(r"^(?:doc-\d+|drive:1[A-Za-z0-9_-]{19,127}):\d+$")
 _RELEASE_ID = re.compile(r"^corpus-v2-\d{4}-\d{2}-\d{2}$")
 _EXTRACTOR = re.compile(r"^(?:pypdf|python-docx|synthetic)$")
 

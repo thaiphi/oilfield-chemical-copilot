@@ -70,7 +70,7 @@ class StageArtifactKind(str, Enum):
             raise CorpusV2ContractError("C2_STAGE_ARTIFACT_INVALID") from error
 
 
-_EMBEDDING_MODEL = re.compile(r"^(?:local-model|sentence-transformers/[A-Za-z0-9][A-Za-z0-9._-]{0,127})$")
+_EMBEDDING_MODELS = frozenset({"local-model", "sentence-transformers/all-MiniLM-L6-v2"})
 
 
 def _invalid_config() -> None:
@@ -110,7 +110,7 @@ def is_valid_timestamp(value: object) -> bool:
 
 
 def is_valid_embedding_model(value: object) -> bool:
-    return isinstance(value, str) and _EMBEDDING_MODEL.fullmatch(value) is not None
+    return isinstance(value, str) and value in _EMBEDDING_MODELS
 
 
 @dataclass(frozen=True)

@@ -107,6 +107,11 @@ def test_record_contracts_accept_documented_model_names_and_offset_timestamps() 
     )
     assert acquisition.acquired_at.endswith("+00:00")
     assert embedding.embedding_model.startswith("sentence-transformers/")
+    with pytest.raises(CorpusV2ContractError, match="C2_EMBEDDING_MODEL_INVALID"):
+        EmbeddingRecord(
+            chunk_id="doc-1:0", embedding_model="sentence-transformers/sk-proj-opaque123",
+            embedding_sha256=SHA, vector_dimensions=384,
+        )
 
 
 def test_source_disposition_has_only_the_approved_values() -> None:

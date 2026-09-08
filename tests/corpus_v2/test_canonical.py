@@ -71,8 +71,13 @@ def test_canonical_jsonl_round_trips_valid_public_task_record_mappings(
         {"source_id": "Bearer secret", "source_sha256": "a" * 64},
         {"source_id": "raw private content", "source_sha256": "a" * 64},
         {"source_id": "sk-proj-opaque123", "source_sha256": "a" * 64},
+        {"source_id": "drive:sk-proj-opaque123456789", "source_sha256": "a" * 64},
         {
             "chunk_id": "doc-1:0", "embedding_model": "password=secret",
+            "embedding_sha256": "a" * 64, "vector_dimensions": 384,
+        },
+        {
+            "chunk_id": "doc-1:0", "embedding_model": "sentence-transformers/sk-proj-opaque123",
             "embedding_sha256": "a" * 64, "vector_dimensions": 384,
         },
     ],
