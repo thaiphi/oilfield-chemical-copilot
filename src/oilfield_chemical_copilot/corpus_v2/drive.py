@@ -163,8 +163,9 @@ def _load_pending_recovery(
     *,
     target: Path,
     entry: ApprovedSourceRegisterEntry,
+    release_id: str,
     output_mime_type: str,
-) -> tuple[str, int]:
+) -> tuple[str, int, str]:
     """Validate a controller-owned publish marker before recovering a crash gap."""
     pending = _pending_path(target)
     if not target.exists():
@@ -181,14 +182,22 @@ def _load_pending_recovery(
     digest = hashlib.sha256(payload).hexdigest()
     if (
         not isinstance(marker, dict)
-        or set(marker) != {"byte_count", "content_sha256", "mime_type", "revision_token"}
+        or set(marker) != {
+            "byte_count", "content_sha256", "mime_type", "owner_nonce", "release_id",
+            "revision_token", "source_id",
+        }
+        or marker.get("source_id") != entry.source_id
+        or marker.get("release_id") != release_id
+        or not isinstance(marker.get("owner_nonce"), str)
+        or len(marker["owner_nonce"]) != 32
+        or any(character not in "0123456789abcdef" for character in marker["owner_nonce"])
         or marker.get("content_sha256") != digest
         or marker.get("byte_count") != len(payload)
         or marker.get("mime_type") != output_mime_type
         or marker.get("revision_token") != entry.pinned_revision_token
     ):
         raise CorpusV2AcquisitionError("C2_ACQUISITION_RESUME_MISMATCH")
-    return digest, len(payload)
+    return digest, len(payload), marker["owner_nonce"]
 
 
 def _fsync_directory(directory: Path) -> None:
@@ -209,9 +218,26 @@ def _pending_path(target: Path) -> Path:
     return target.with_name(f".{target.stem}.pending.json")
 
 
-def _pending_payload(*, digest: str, byte_count: int, mime_type: str, revision_token: str) -> bytes:
+def _pending_payload(
+    *,
+    source_id: str,
+    release_id: str,
+    owner_nonce: str,
+    digest: str,
+    byte_count: int,
+    mime_type: str,
+    revision_token: str,
+) -> bytes:
     return json.dumps(
-        {"byte_count": byte_count, "content_sha256": digest, "mime_type": mime_type, "revision_token": revision_token},
+        {
+            "byte_count": byte_count,
+            "content_sha256": digest,
+            "mime_type": mime_type,
+            "owner_nonce": owner_nonce,
+            "release_id": release_id,
+            "revision_token": revision_token,
+            "source_id": source_id,
+        },
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
@@ -221,12 +247,17 @@ def _write_atomic_snapshot(
     target: Path,
     payload: bytes,
     *,
+    source_id: str,
+    release_id: str,
     mime_type: str,
     revision_token: str,
-) -> tuple[str, int]:
+) -> tuple[str, int, str]:
     """Write, fsync, mark, and publish without replacement in one directory."""
     temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
     pending = _pending_path(target)
+    owner_nonce = uuid.uuid4().hex
+    marker_owned = False
+    published = False
     try:
         with temporary.open("xb") as handle:
             handle.write(payload)
@@ -240,24 +271,59 @@ def _write_atomic_snapshot(
             raise CorpusV2AcquisitionError("C2_SNAPSHOT_DUPLICATE")
         with pending.open("xb") as handle:
             handle.write(_pending_payload(
-                digest=digest, byte_count=len(written), mime_type=mime_type, revision_token=revision_token
+                source_id=source_id,
+                release_id=release_id,
+                owner_nonce=owner_nonce,
+                digest=digest,
+                byte_count=len(written),
+                mime_type=mime_type,
+                revision_token=revision_token,
             ))
             handle.flush()
             os.fsync(handle.fileno())
+        marker_owned = True
         os.link(temporary, target)
+        published = True
         temporary.unlink()
         _fsync_directory(target.parent)
         if not target.is_file() or target.is_symlink() or _is_reparse_or_symlink(target):
             raise CorpusV2AcquisitionError("C2_SNAPSHOT_NONREGULAR")
-        return digest, len(written)
+        return digest, len(written), owner_nonce
     except CorpusV2AcquisitionError:
-        temporary.unlink(missing_ok=True)
-        pending.unlink(missing_ok=True)
+        _cleanup_before_publish(temporary, pending, owner_nonce, marker_owned, published)
         raise
     except OSError:
-        temporary.unlink(missing_ok=True)
-        pending.unlink(missing_ok=True)
-        raise CorpusV2AcquisitionError("C2_SNAPSHOT_WRITE_FAILED") from None
+        _cleanup_before_publish(temporary, pending, owner_nonce, marker_owned, published)
+        error_code = "C2_SNAPSHOT_PUBLISH_FAILED" if published else "C2_SNAPSHOT_WRITE_FAILED"
+        raise CorpusV2AcquisitionError(error_code) from None
+
+
+def _safe_unlink(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _marker_has_owner(pending: Path, owner_nonce: str) -> bool:
+    try:
+        marker = json.loads(pending.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return isinstance(marker, dict) and marker.get("owner_nonce") == owner_nonce
+
+
+def _remove_owned_pending(pending: Path, owner_nonce: str) -> None:
+    if _marker_has_owner(pending, owner_nonce):
+        _safe_unlink(pending)
+
+
+def _cleanup_before_publish(
+    temporary: Path, pending: Path, owner_nonce: str, marker_owned: bool, published: bool
+) -> None:
+    _safe_unlink(temporary)
+    if marker_owned and not published:
+        _remove_owned_pending(pending, owner_nonce)
 
 
 def acquire_source(
@@ -273,6 +339,10 @@ def acquire_source(
         raise CorpusV2AcquisitionError("C2_ACQUISITION_REGISTER_INVALID")
     snapshot_root = _validate_snapshot_root(release_root=release_root, snapshot_root=snapshot_root)
     relative_path = _relative_snapshot_path(snapshot_root, entry.source_id)
+    try:
+        release_id = ledger.release_id()
+    except CorpusV2LedgerError:
+        raise CorpusV2AcquisitionError("C2_ACQUISITION_LEDGER_INVALID") from None
     existing = ledger.snapshot_acquisition(entry.source_id)
     try:
         observed = client.metadata(entry.drive_file_id)
@@ -290,9 +360,10 @@ def acquire_source(
 
     target = snapshot_root / f"{entry.source_id}.blob"
     if target.exists() or target.is_symlink():
-        digest, byte_count = _load_pending_recovery(
+        digest, byte_count, owner_nonce = _load_pending_recovery(
             target=target,
             entry=entry,
+            release_id=release_id,
             output_mime_type=output_mime_type,
         )
         try:
@@ -304,7 +375,7 @@ def acquire_source(
             )
         except Exception:
             raise CorpusV2AcquisitionError("C2_ACQUISITION_RECORD_FAILED") from None
-        _pending_path(target).unlink(missing_ok=True)
+        _remove_owned_pending(_pending_path(target), owner_nonce)
         facts = ledger.snapshot_acquisition(entry.source_id)
         if facts is None:
             raise CorpusV2AcquisitionError("C2_ACQUISITION_RECORD_FAILED")
@@ -322,8 +393,13 @@ def acquire_source(
         raise CorpusV2AcquisitionError("C2_SNAPSHOT_WRITE_FAILED") from None
     if not snapshot_root.is_dir() or snapshot_root.is_symlink():
         raise CorpusV2AcquisitionError("C2_SNAPSHOT_NONREGULAR")
-    digest, byte_count = _write_atomic_snapshot(
-        target, payload, mime_type=output_mime_type, revision_token=entry.pinned_revision_token
+    digest, byte_count, owner_nonce = _write_atomic_snapshot(
+        target,
+        payload,
+        source_id=entry.source_id,
+        release_id=release_id,
+        mime_type=output_mime_type,
+        revision_token=entry.pinned_revision_token,
     )
     try:
         post_download_metadata = client.metadata(entry.drive_file_id)
@@ -340,15 +416,15 @@ def acquire_source(
             revision_token=entry.pinned_revision_token,
         )
     except CorpusV2AcquisitionError:
-        target.unlink(missing_ok=True)
-        _pending_path(target).unlink(missing_ok=True)
+        _safe_unlink(target)
+        _remove_owned_pending(_pending_path(target), owner_nonce)
         raise
     except Exception:
         raise CorpusV2AcquisitionError("C2_ACQUISITION_RECORD_FAILED") from None
     facts = ledger.snapshot_acquisition(entry.source_id)
     if facts is None:
         raise CorpusV2AcquisitionError("C2_ACQUISITION_RECORD_FAILED")
-    _pending_path(target).unlink(missing_ok=True)
+    _remove_owned_pending(_pending_path(target), owner_nonce)
     return _snapshot_record(facts)
 
 

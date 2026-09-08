@@ -13,6 +13,7 @@ from oilfield_chemical_copilot.corpus_v2.drive import (
     acquire_registered_sources,
     acquire_source,
 )
+from oilfield_chemical_copilot.corpus_v2 import drive
 from oilfield_chemical_copilot.corpus_v2.ledger import CorpusV2Ledger, CorpusV2LedgerError
 from oilfield_chemical_copilot.corpus_v2.models import AcquisitionRecord, ApprovedSource, ReleaseConfig, Stage
 from oilfield_chemical_copilot.corpus_v2.registers import ApprovedSourceRegisterEntry
@@ -331,4 +332,74 @@ def test_snapshot_root_symlink_escape_is_rejected_when_supported(tmp_path: Path)
     ledger = _ledger(tmp_path)
     with pytest.raises(CorpusV2AcquisitionError, match="C2_SNAPSHOT_PATH_INVALID"):
         acquire_source(_entry(), FakeDriveClient(), release_root=tmp_path, snapshot_root=alias, ledger=ledger)
+    ledger.close()
+
+
+@pytest.mark.parametrize(
+    ("marker_source_id", "marker_release_id"),
+    (("doc-2", "corpus-v2-test"), ("doc-1", "corpus-v2-other")),
+)
+def test_recovery_rejects_marker_not_bound_to_exact_source_and_release(
+    tmp_path: Path, marker_source_id: str, marker_release_id: str
+) -> None:
+    ledger = _ledger(tmp_path)
+    target = tmp_path / "snapshots" / "doc-1.blob"
+    target.parent.mkdir()
+    payload = b"approved"
+    target.write_bytes(payload)
+    drive._pending_path(target).write_bytes(  # noqa: SLF001
+        drive._pending_payload(  # noqa: SLF001
+            source_id=marker_source_id,
+            release_id=marker_release_id,
+            owner_nonce="a" * 32,
+            digest=hashlib.sha256(payload).hexdigest(),
+            byte_count=len(payload),
+            mime_type="application/pdf",
+            revision_token="revision-1",
+        )
+    )
+
+    with pytest.raises(CorpusV2AcquisitionError, match="C2_ACQUISITION_RESUME_MISMATCH"):
+        acquire_source(_entry(), FakeDriveClient(), release_root=tmp_path, snapshot_root=target.parent, ledger=ledger)
+    ledger.close()
+
+
+def test_existing_pending_marker_is_never_erased_by_another_attempt(tmp_path: Path) -> None:
+    ledger = _ledger(tmp_path)
+    pending = tmp_path / "snapshots" / ".doc-1.pending.json"
+    pending.parent.mkdir()
+    original = b'{"concurrent":"marker"}'
+    pending.write_bytes(original)
+
+    with pytest.raises(CorpusV2AcquisitionError, match="C2_SNAPSHOT_DUPLICATE"):
+        acquire_source(_entry(), FakeDriveClient(), release_root=tmp_path, snapshot_root=pending.parent, ledger=ledger)
+    assert pending.read_bytes() == original
+    ledger.close()
+
+
+def test_temp_cleanup_failure_after_publish_preserves_marker_for_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ledger = _ledger(tmp_path)
+    original_unlink = drive.os.unlink
+    failed_once = False
+
+    def fail_one_temp_unlink(path: str | bytes, *args: object, **kwargs: object) -> None:
+        nonlocal failed_once
+        if not failed_once and str(path).endswith(".tmp"):
+            failed_once = True
+            raise OSError("injected temp unlink failure")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(drive.os, "unlink", fail_one_temp_unlink)
+    with pytest.raises(CorpusV2AcquisitionError, match="C2_SNAPSHOT_PUBLISH_FAILED"):
+        acquire_source(_entry(), FakeDriveClient(), release_root=tmp_path, snapshot_root=tmp_path / "snapshots", ledger=ledger)
+
+    target = tmp_path / "snapshots" / "doc-1.blob"
+    pending = drive._pending_path(target)  # noqa: SLF001
+    assert target.is_file()
+    assert pending.is_file()
+    monkeypatch.setattr(drive.os, "unlink", original_unlink)
+    recovered = acquire_source(_entry(), FakeDriveClient(), release_root=tmp_path, snapshot_root=target.parent, ledger=ledger)
+    assert recovered.source_id == "doc-1"
     ledger.close()

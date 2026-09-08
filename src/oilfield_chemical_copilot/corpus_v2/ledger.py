@@ -341,6 +341,13 @@ class CorpusV2Ledger:
         ).fetchall()
         return tuple(row["source_id"] for row in rows)
 
+    def release_id(self) -> str:
+        """Return the sealed release identifier without exposing private source facts."""
+        row = self._connection.execute("SELECT release_id FROM release").fetchone()
+        if row is None or not isinstance(row["release_id"], str) or not row["release_id"]:
+            raise CorpusV2LedgerError("C2_LEDGER_INVALID")
+        return row["release_id"]
+
     def record_snapshot_acquisition(
         self,
         acquisition: AcquisitionRecord,
