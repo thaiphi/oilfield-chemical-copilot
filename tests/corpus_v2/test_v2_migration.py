@@ -56,3 +56,18 @@ def test_v2_migrations_are_separate_from_legacy_runner() -> None:
 
 def test_v2_schema_requires_immutable_release_and_provenance_bound_chunks() -> None:
     validate_v2_schema(V2_MIGRATIONS_DIR / "0001_corpus_v2_release.sql")
+
+
+def test_v2_schema_rejects_required_tokens_hidden_in_block_comment(tmp_path: Path) -> None:
+    schema = tmp_path / "comment-only.sql"
+    schema.write_text(
+        "/* create table corpus_release (release_id text not null unique, "
+        "index_manifest_sha256 char(64) not null, unique (release_id, index_manifest_sha256)); "
+        "create table chunks (chunk_id text not null, release_id text not null, "
+        "source_id text not null, source_sha256 char(64) not null, text_sha256 char(64) not null, "
+        "manifest_sha256 char(64) not null, embedding vector(384) not null, "
+        "embedding_sha256 char(64) not null, foreign key (release_id, manifest_sha256) "
+        "references corpus_release (release_id, index_manifest_sha256)); */"
+    )
+    with pytest.raises(CorpusV2MigrationError, match="C2_MIGRATION_SCHEMA_INVALID"):
+        validate_v2_schema(schema)

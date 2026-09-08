@@ -53,7 +53,8 @@ def validate_v2_schema(schema_path: Path) -> None:
         schema = schema_path.read_text(encoding="utf-8")
     except OSError as error:
         raise CorpusV2MigrationError("C2_MIGRATION_SCHEMA_INVALID") from error
-    uncommented = re.sub(r"--[^\r\n]*", "", schema).lower()
+    uncommented = re.sub(r"--[^\r\n]*", "", schema)
+    uncommented = re.sub(r"/\*.*?\*/", "", uncommented, flags=re.DOTALL).lower()
     release_table = re.search(r"create table corpus_release\s*\((.*?)\n\);", uncommented, re.DOTALL)
     chunks_table = re.search(r"create table chunks\s*\((.*?)\n\);", uncommented, re.DOTALL)
     required_release_fragments = (

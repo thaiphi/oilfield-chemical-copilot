@@ -58,6 +58,7 @@ def manifest() -> tuple[V2ChunkManifestEntry, ...]:
             "local-model",
             384,
             "evidence",
+            vector_sha256(VECTOR),
         ),
         V2ChunkManifestEntry(
             CorpusV2Chunk("doc-2/chunk-0", "doc-2", 0, CONTENT_SHA, 8),
@@ -67,6 +68,7 @@ def manifest() -> tuple[V2ChunkManifestEntry, ...]:
             "local-model",
             384,
             "evidence",
+            vector_sha256(OTHER_VECTOR),
         ),
     )
 
@@ -162,6 +164,21 @@ def test_validate_release_rejects_vector_with_swapped_sealed_identity(config, bi
         validate_v2_index(store, binding, manifest)
 
 
+def test_validate_release_rejects_rehashed_replacement_vector(config, binding, manifest) -> None:
+    store = CorpusV2Store(
+        "postgresql://user@host/corpus_v2_candidate", "postgresql://user@host/legacy", config
+    )
+    rows = list(store.prepare_rows(manifest, embeddings()))
+    rows[0] = replace(
+        rows[0],
+        vector=OTHER_VECTOR,
+        embedding_sha256=vector_sha256(OTHER_VECTOR),
+    )
+    store.replace_fake_rows(rows)
+    with pytest.raises(CorpusV2StoreError, match="C2_INDEX_EXACT_SET_MISMATCH"):
+        validate_v2_index(store, binding, manifest)
+
+
 def test_store_rejects_manifest_with_non_384_vector_dimension(config) -> None:
     with pytest.raises(CorpusV2StoreError, match="C2_INDEX_METADATA_INVALID"):
         V2ChunkManifestEntry(
@@ -172,4 +189,5 @@ def test_store_rejects_manifest_with_non_384_vector_dimension(config) -> None:
             "local-model",
             3,
             "evidence",
+            vector_sha256(VECTOR),
         )

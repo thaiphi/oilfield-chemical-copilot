@@ -88,6 +88,7 @@ class V2ChunkManifestEntry:
     embedding_model: str
     vector_dimensions: int
     content: str
+    expected_embedding_sha256: str
 
     def __post_init__(self) -> None:
         if not isinstance(self.chunk, CorpusV2Chunk):
@@ -107,6 +108,7 @@ class V2ChunkManifestEntry:
             raise CorpusV2StoreError("C2_INDEX_METADATA_INVALID")
         if hashlib.sha256(self.content.encode("utf-8")).hexdigest() != self.chunk.text_sha256:
             raise CorpusV2StoreError("C2_INDEX_METADATA_INVALID")
+        _require_sha256(self.expected_embedding_sha256)
 
     @property
     def chunk_id(self) -> str:
@@ -138,7 +140,7 @@ class V2StoredChunk:
     release_id: str
     source_id: str
     source_sha256: str
-    content_sha256: str
+    text_sha256: str
     manifest_sha256: str
     location: str
     embedding_model: str
@@ -187,7 +189,10 @@ class CorpusV2Store:
                 _require_finite_vector(embedding.vector)
             except CorpusV2StoreError as error:
                 raise CorpusV2StoreError("C2_EMBEDDING_INVALID") from error
-            if vector_sha256(embedding.vector) != embedding.embedding_sha256:
+            if (
+                vector_sha256(embedding.vector) != embedding.embedding_sha256
+                or embedding.embedding_sha256 != entry.expected_embedding_sha256
+            ):
                 raise CorpusV2StoreError("C2_EMBEDDING_INVALID")
             rows.append(
                 V2StoredChunk(
@@ -195,7 +200,7 @@ class CorpusV2Store:
                     release_id=self._release_config.release_id,
                     source_id=entry.source_id,
                     source_sha256=entry.source_sha256,
-                    content_sha256=entry.chunk.text_sha256,
+                    text_sha256=entry.chunk.text_sha256,
                     manifest_sha256=entry.manifest_sha256,
                     location=entry.location,
                     embedding_model=entry.embedding_model,
@@ -240,7 +245,7 @@ def validate_v2_index(
             row.release_id != release_binding.release_id
             or row.source_id != entry.source_id
             or row.source_sha256 != entry.source_sha256
-            or row.content_sha256 != entry.chunk.text_sha256
+            or row.text_sha256 != entry.chunk.text_sha256
             or hashlib.sha256(row.content.encode("utf-8")).hexdigest() != entry.chunk.text_sha256
             or row.manifest_sha256 != release_binding.index_manifest_sha256
             or row.location != entry.location
@@ -248,6 +253,7 @@ def validate_v2_index(
             or row.vector_dimensions != entry.vector_dimensions
             or row.vector_dimensions != VECTOR_DIMENSIONS
             or row.embedding_sha256 != vector_sha256(row.vector)
+            or row.embedding_sha256 != entry.expected_embedding_sha256
         ):
             raise CorpusV2StoreError("C2_INDEX_EXACT_SET_MISMATCH")
 
