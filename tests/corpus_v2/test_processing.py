@@ -429,3 +429,19 @@ def test_review_validates_duplicate_representative_against_extraction_evidence()
             critical_source_ids=set(),
             usable_chunk_source_ids=set(),
         )
+
+
+def test_critical_duplicate_passes_only_with_usable_indexed_representative() -> None:
+    assert (
+        review_gate_status(
+            [extraction("doc-1"), extraction("doc-2")],
+            [
+                ReviewDecision("doc-1", SourceDisposition.DUPLICATE, "reviewer-a", "DUPLICATE", "doc-2"),
+                ReviewDecision("doc-2", SourceDisposition.INDEXED, "reviewer-a", "APPROVED"),
+            ],
+            sealed_source_ids={"doc-1", "doc-2"},
+            critical_source_ids={"doc-1"},
+            usable_chunk_source_ids={"doc-2"},
+        )
+        == "READY"
+    )

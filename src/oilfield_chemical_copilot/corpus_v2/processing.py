@@ -370,7 +370,21 @@ def review_gate_status(
         decision = decisions_by_source[critical_id]
         if extraction.outcome is not ExtractionOutcome.SUCCESS:
             return "BLOCKED"
-        usable = decision.disposition is SourceDisposition.INDEXED and critical_id in usable_ids
+        if decision.disposition is SourceDisposition.INDEXED:
+            usable = critical_id in usable_ids
+        elif decision.disposition is SourceDisposition.DUPLICATE:
+            representative_id = decision.representative_source_id
+            representative = decisions_by_source.get(representative_id)
+            representative_extraction = extractions_by_source.get(representative_id)
+            usable = (
+                representative is not None
+                and representative.disposition is SourceDisposition.INDEXED
+                and representative_extraction is not None
+                and representative_extraction.outcome is ExtractionOutcome.SUCCESS
+                and representative_id in usable_ids
+            )
+        else:
+            usable = False
         if not usable:
             return "BLOCKED"
     return "READY"
