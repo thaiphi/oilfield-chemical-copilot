@@ -69,6 +69,13 @@ def candidate(tmp_path):
     ledger.complete_stage(Stage.REGISTERED)
     artifacts = {key: key.encode() for key in release.REQUIRED_DIGESTS}
     artifacts["source_register"] = b"source"
+    artifacts["index_contract"] = release.index_contract_bytes(release.IndexContract(
+        mode="v2", release_id=config.release_id, database_name="candidate",
+        database_identity=sha256(b"postgresql://localhost/candidate").hexdigest(),
+        embedding_provider="deterministic", embedding_model="deterministic-token-hash-384",
+        embedding_dimension=384, index_manifest_sha256="c" * 64,
+        source_register_sha256=config.source_register_sha256, source_count=1, chunk_count=1,
+    ))
     @contextmanager
     def reader(*, default_transaction_read_only):
         assert default_transaction_read_only is True
@@ -110,6 +117,30 @@ def test_seal_roundtrip_and_no_replace(candidate):
     config, ledger, _, publication = candidate
     assert release.verify_release_binding(config=config, ledger=ledger, publication=publication,
                                           expected_sha256=binding) == binding
+    with pytest.raises(release.CorpusV2ReleaseError):
+        seal(candidate)
+
+
+def test_task6_publication_is_consumable_by_runtime(candidate):
+    from oilfield_chemical_copilot.corpus_v2.runtime import (
+        AuthenticatedRuntimeBinding, load_runtime_release,
+    )
+    digest = seal(candidate)
+    config, _, artifacts, publication = candidate
+    env = dict(CORPUS_MODE="v2", CORPUS_RELEASE_ID=config.release_id,
+               CORPUS_DATABASE_URL="postgresql://localhost/candidate",
+               CORPUS_EMBEDDING_PROVIDER="deterministic",
+               CORPUS_EMBEDDING_MODEL="deterministic-token-hash-384",
+               CORPUS_EMBEDDING_DIMENSION="384", CORPUS_RELEASE_MANIFEST_SHA256=digest,
+               CORPUS_RELEASE_BINDING_PATH="synthetic")
+    selected = load_runtime_release(env, binding_reader=lambda _: AuthenticatedRuntimeBinding(
+        publication.members["sealed/binding.json"], artifacts["index_contract"]))
+    assert selected.release_id == "corpus-v2-test"
+
+
+@pytest.mark.parametrize("content", [b"index_contract", b"{}\n"])
+def test_task6_rejects_unstructured_index_contract(candidate, content):
+    candidate[2]["index_contract"] = content
     with pytest.raises(release.CorpusV2ReleaseError):
         seal(candidate)
 

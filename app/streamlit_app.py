@@ -4,7 +4,7 @@ import os
 import re
 import sys
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
@@ -34,12 +34,16 @@ from oilfield_chemical_copilot.observability.persistence import (
 )
 from oilfield_chemical_copilot.rag.formatter import scope_limited_answer
 from oilfield_chemical_copilot.rag.agentic_service import AgenticRagService, OllamaToolPlanner
-from oilfield_chemical_copilot.rag.generator_factory import build_answer_generator
+from oilfield_chemical_copilot.rag.generator_factory import (
+    DEFAULT_LLM_PROVIDER,
+    build_answer_generator,
+)
 from oilfield_chemical_copilot.rag.models import RagAnswer, RagConfigurationError, SourceEvidence
 from oilfield_chemical_copilot.rag.ollama_client import (
     DEFAULT_OLLAMA_BASE_URL,
     DEFAULT_OLLAMA_MODEL,
 )
+from oilfield_chemical_copilot.rag.openai_client import DEFAULT_OPENAI_MODEL
 from oilfield_chemical_copilot.rag.service import BasicRagService
 from oilfield_chemical_copilot.retrieval.embeddings import EmbeddingSettings, build_embedding_provider
 from oilfield_chemical_copilot.retrieval.keyword import KeywordSearchIndex
@@ -49,6 +53,21 @@ from oilfield_chemical_copilot.corpus_v2.runtime import (
 )
 from oilfield_chemical_copilot.tools.chemical_dosage import calculate_dosage, product_dosage_answer
 from oilfield_chemical_copilot.tools.water_analysis import summarize_water_analysis
+
+
+@dataclass(frozen=True)
+class AnswerGeneratorSettings:
+    provider: str
+    ollama_base_url: str
+    ollama_model: str
+    openai_model: str
+
+
+@dataclass(frozen=True)
+class RagServiceSettings:
+    retrieval: RetrievalSettings
+    embedding: EmbeddingSettings
+    generator: AnswerGeneratorSettings
 
 def _database_url() -> str:
     return load_runtime_release().database_url
@@ -90,40 +109,72 @@ def _initialize_state() -> None:
 
 
 def _build_rag_service(retrieval_mode: str) -> BasicRagService:
-    # Revalidate before cache lookup, including on cache hits.
+    # Revalidate release and retrieval configuration before every cache lookup.
     release = load_runtime_release()
-    return _cached_rag_service(release, retrieval_mode)
+    if retrieval_mode not in {"hybrid", "vector"}:
+        raise CorpusV2RuntimeError("C2_RUNTIME_RELEASE_INVALID")
+    settings = _validated_rag_service_settings(release, retrieval_mode)
+    return _cached_rag_service(release, settings)
+
+
+def _validated_rag_service_settings(
+    release: RuntimeRelease, retrieval_mode: str
+) -> RagServiceSettings:
+    retrieval = replace(RetrievalSettings.from_env(), retrieval_mode=retrieval_mode)
+    configured_embedding = EmbeddingSettings.from_env()
+    embedding = replace(
+        configured_embedding,
+        provider=release.embedding_provider,
+        dimension=release.embedding_dimension,
+        sentence_transformers_model=release.embedding_model,
+        ollama_embedding_model=release.embedding_model,
+    )
+    if embedding.provider not in {"deterministic", "ollama", "sentence-transformers"}:
+        raise CorpusV2RuntimeError("C2_RUNTIME_RELEASE_INVALID")
+    if embedding.dimension < 1:
+        raise CorpusV2RuntimeError("C2_RUNTIME_RELEASE_INVALID")
+    if not embedding.ollama_base_url.strip() or not embedding.ollama_embedding_model.strip():
+        raise RagConfigurationError("Ollama embedding configuration is required")
+
+    generator = AnswerGeneratorSettings(
+        provider=os.getenv("LLM_PROVIDER", DEFAULT_LLM_PROVIDER),
+        ollama_base_url=os.getenv("OLLAMA_BASE_URL", DEFAULT_OLLAMA_BASE_URL),
+        ollama_model=os.getenv("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL),
+        openai_model=os.getenv("OPENAI_MODEL", DEFAULT_OPENAI_MODEL),
+    )
+    if generator.provider not in {"ollama", "openai"}:
+        raise RagConfigurationError(f"Unsupported LLM provider: {generator.provider}")
+    if not generator.ollama_base_url.strip() or not generator.ollama_model.strip():
+        raise RagConfigurationError("Ollama answer configuration is required")
+    if not generator.openai_model.strip():
+        raise RagConfigurationError("OPENAI_MODEL is required for answer generation")
+    return RagServiceSettings(retrieval=retrieval, embedding=embedding, generator=generator)
 
 
 @st.cache_resource(show_spinner=False)
-def _cached_rag_service(release: RuntimeRelease, retrieval_mode: str) -> BasicRagService:
-    if retrieval_mode not in {"hybrid", "vector"}:
+def _cached_rag_service(release: RuntimeRelease, settings: RagServiceSettings) -> BasicRagService:
+    if settings.retrieval.retrieval_mode not in {"hybrid", "vector"}:
         raise CorpusV2RuntimeError("C2_RUNTIME_RELEASE_INVALID")
-    settings = replace(RetrievalSettings.from_env(), retrieval_mode=retrieval_mode)
     store = open_verified_runtime_store(release)
-    embedding_provider = build_embedding_provider(EmbeddingSettings(
-        provider=release.embedding_provider, dimension=release.embedding_dimension,
-        sentence_transformers_model=release.embedding_model,
-        ollama_embedding_model=release.embedding_model,
-    ))
+    embedding_provider = build_embedding_provider(settings.embedding)
     if (embedding_provider.model_name != release.embedding_model
             or embedding_provider.dimension != release.embedding_dimension):
         raise CorpusV2RuntimeError("C2_RUNTIME_RELEASE_INVALID")
     keyword_index = (
         KeywordSearchIndex.from_hits(store.list_chunks())
-        if settings.retrieval_mode == "hybrid"
+        if settings.retrieval.retrieval_mode == "hybrid"
         else None
     )
     retriever = build_retrieval_pipeline(
         store=store,
         embedding_provider=embedding_provider,
-        settings=settings,
+        settings=settings.retrieval,
         keyword_index=keyword_index,
     )
     return BasicRagService.from_settings(
         retriever=retriever,
         generator=build_answer_generator(),
-        settings=settings,
+        settings=settings.retrieval,
     )
 
 
