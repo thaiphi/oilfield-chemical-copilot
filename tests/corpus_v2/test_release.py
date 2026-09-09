@@ -105,6 +105,29 @@ def candidate(tmp_path):
         if stage is Stage.REVIEWED:
             ledger.record_disposition(source_id="doc-1", disposition=SourceDisposition.INDEXED,
                                       reviewer_id="reviewer", reason_code="APPROVED")
+        if stage is Stage.EVALUATED:
+            spec = dict(release_id=config.release_id,
+                index_sha256=sha256(artifacts["index_contract"]).hexdigest(),
+                development_ids=["dev-new"], unseen_ids=["unseen-new"],
+                historical_ids={"E1a-3": ["old-3"], "E1a-4": ["old-4"]},
+                scoring_protocol="fixed-v1", regression_families=["chemistry"],
+                minimum_accuracy=0.8, minimum_no_answer_safety=1.0,
+                maximum_latency_ms=1000, latency_measurement="end-to-end-p95-ms",
+                no_tuning=True, steward_approved=True)
+            artifacts["evaluation_specification"] = release._json(spec)
+            context = dict(release_id=config.release_id, index_sha256=spec["index_sha256"],
+                spec_sha256=sha256(artifacts["evaluation_specification"]).hexdigest())
+            artifacts["evaluation_result"] = release._json(dict(context, aggregates=dict(
+                accuracy=0.9, no_answer_safety=1.0, latency_ms=900,
+                development_count=1, unseen_count=1, no_answer_count=1,
+                regression_families={"chemistry": 0.9})))
+            context["result_sha256"] = sha256(artifacts["evaluation_result"]).hexdigest()
+            artifacts["promotion_state"] = release._json(dict(context, status="PROMOTION_READY",
+                sealed_gates=dict(legacy_guard=sha256(artifacts["legacy_guard"]).hexdigest(),
+                    source_accounting=sha256(release.final_dispositions_bytes(ledger)).hexdigest(),
+                    critical_source_evidence=config.critical_source_register_sha256,
+                    index_contract=spec["index_sha256"], evaluation_result=context["result_sha256"],
+                    canary_plan="c" * 64, rollback_rehearsal="d" * 64)))
         if stage in release.STAGE_DIGESTS:
             ledger.record_stage_artifact(stage, artifact_kind=StageArtifactKind.for_stage(stage),
                 artifact_sha256=sha256(artifacts[release.STAGE_DIGESTS[stage]]).hexdigest())
@@ -151,6 +174,21 @@ def test_task6_publication_is_consumable_by_runtime(candidate):
 @pytest.mark.parametrize("content", [b"index_contract", b"{}\n"])
 def test_task6_rejects_unstructured_index_contract(candidate, content):
     candidate[2]["index_contract"] = content
+    with pytest.raises(release.CorpusV2ReleaseError):
+        seal(candidate)
+
+
+@pytest.mark.parametrize("key", ["evaluation_specification", "evaluation_result", "promotion_state"])
+def test_release_rejects_opaque_evaluation_evidence_even_with_matching_digest(candidate,
+                                                                           monkeypatch, key):
+    _, ledger, artifacts, _ = candidate
+    artifacts[key] = b"opaque"
+    projection = ledger.release_projection()
+    for row in projection["stage_artifacts"]:
+        if release.STAGE_DIGESTS[Stage(row["stage"])] == key:
+            row["artifact_sha256"] = sha256(artifacts[key]).hexdigest()
+    monkeypatch.setattr(ledger, "release_projection", lambda: projection)
+    artifacts["ledger_projection"] = release._json(projection)
     with pytest.raises(release.CorpusV2ReleaseError):
         seal(candidate)
 

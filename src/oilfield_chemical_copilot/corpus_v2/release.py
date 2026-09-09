@@ -14,6 +14,7 @@ from collections.abc import Mapping, Callable
 from contextlib import AbstractContextManager
 
 from .ledger import CorpusV2Ledger
+from .evaluation import validate_evaluation_artifacts
 from .index_contract import (
     IndexContract as IndexContract, index_contract_bytes as index_contract_bytes, parse_index_contract,
 )
@@ -196,6 +197,8 @@ def _binding(config: ReleaseConfig, ledger: CorpusV2Ledger, artifacts: Mapping[s
             or any(type(value) is not bytes or not value for value in artifacts.values())):
         _invalid()
     _validate_legacy_guard(config, artifacts["legacy_guard"])
+    validate_evaluation_artifacts(artifacts=artifacts, release_id=config.release_id,
+                                 critical_register_sha256=config.critical_source_register_sha256)
     contract = parse_index_contract(artifacts["index_contract"])
     if (contract.mode != "v2" or contract.release_id != config.release_id
             or contract.database_name != config.candidate_database_name
