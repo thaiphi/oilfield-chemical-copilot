@@ -21,7 +21,15 @@ class AnswerGenerator(Protocol):
         ...
 
 
-def build_answer_generator() -> AnswerGenerator:
+def build_answer_generator(settings=None) -> AnswerGenerator:
+    if settings is not None:
+        if settings.provider == "ollama":
+            return LazyOllamaAnswerClient(base_url=settings.ollama_base_url,
+                                          model=settings.ollama_model)
+        if settings.provider == "openai" and settings.openai_api_key.strip():
+            return LazyOpenAIAnswerClient(api_key=settings.openai_api_key,
+                                          model=settings.openai_model)
+        raise RagConfigurationError("Invalid answer generator configuration")
     provider = os.getenv("LLM_PROVIDER", DEFAULT_LLM_PROVIDER)
     if provider == "ollama":
         return LazyOllamaAnswerClient()
