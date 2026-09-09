@@ -108,6 +108,13 @@ class V2ChunkManifestEntry:
             raise CorpusV2StoreError("C2_INDEX_METADATA_INVALID")
         if hashlib.sha256(self.content.encode("utf-8")).hexdigest() != self.chunk.text_sha256:
             raise CorpusV2StoreError("C2_INDEX_METADATA_INVALID")
+        if len(self.content) != self.chunk.character_count:
+            raise CorpusV2StoreError("C2_INDEX_METADATA_INVALID")
+        if self.chunk.provenance is not None and (
+            self.source_sha256 != self.chunk.provenance.source_byte_sha256
+            or self.location != self.chunk.provenance.location
+        ):
+            raise CorpusV2StoreError("C2_INDEX_METADATA_INVALID")
         _require_sha256(self.expected_embedding_sha256)
 
     @property
@@ -182,6 +189,10 @@ class CorpusV2Store:
             raise CorpusV2StoreError("C2_INDEX_EXACT_SET_MISMATCH")
         rows: list[V2StoredChunk] = []
         for chunk_id, entry in expected.items():
+            if entry.chunk.provenance is not None and (
+                entry.chunk.provenance.release_id != self._release_config.release_id
+            ):
+                raise CorpusV2StoreError("C2_INDEX_METADATA_INVALID")
             embedding = observed[chunk_id]
             if embedding.embedding_model != entry.embedding_model or entry.vector_dimensions != VECTOR_DIMENSIONS:
                 raise CorpusV2StoreError("C2_EMBEDDING_INVALID")

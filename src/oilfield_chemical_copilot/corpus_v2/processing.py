@@ -17,6 +17,7 @@ from typing import Callable, Iterable, Protocol, Sequence
 from oilfield_chemical_copilot.ingest.models import ChunkMetadata, LoadedChunk
 
 from .models import (
+    ChunkProvenance,
     ExtractionOutcome,
     ExtractionRecord,
     SourceDisposition,
@@ -161,19 +162,9 @@ def build_v2_chunk(
         raise CorpusV2ProcessingError("C2_PARSER_INVALID")
 
     text_sha256 = _sha256_bytes(text.encode("utf-8"))
-    identity = {
-        "chunk_policy_version": chunk_policy_version,
-        "location": location,
-        "ordinal": ordinal,
-        "parser_policy_version": parser_policy_version,
-        "release_id": release_id,
-        "source_byte_sha256": source_byte_sha256,
-        "source_id": source_id,
-        "text_sha256": text_sha256,
-    }
-    expected_chunk_id = _sha256_bytes(
-        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    )
+    expected_chunk_id = ChunkProvenance(
+        release_id, source_byte_sha256, parser_policy_version, chunk_policy_version, location
+    ).chunk_id(source_id, ordinal, text_sha256)
     if chunk_id is not None and chunk_id != expected_chunk_id:
         raise CorpusV2ProcessingError("C2_CHUNK_ID_INVALID")
     return LoadedChunk(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,36 @@ from oilfield_chemical_copilot.corpus_v2.registers import ApprovedSourceRegister
 
 
 SHA = "a" * 64
+
+
+@pytest.mark.parametrize("changes", [
+    {"drive_file_id": "unapproved-drive"},
+    {"pinned_revision_token": "revision-2"},
+    {"declared_mime_type": "text/plain"},
+    {"approved_export_mime_type": "application/pdf"},
+    {"steward_approval_binding": "unapproved-binding"},
+])
+@pytest.mark.parametrize("resuming", [False, True])
+def test_changed_register_entry_rejected_before_any_client_action(tmp_path, changes, resuming):
+    ledger = _ledger(tmp_path)
+    if resuming:
+        acquire_source(_entry(), FakeDriveClient(), release_root=tmp_path,
+                       snapshot_root=tmp_path / "snapshots", ledger=ledger)
+    changed = replace(_entry(), **changes)
+    client = FakeDriveClient()
+    with pytest.raises(CorpusV2AcquisitionError, match="C2_ACQUISITION_REGISTER_MISMATCH"):
+        acquire_source(changed, client, release_root=tmp_path,
+                       snapshot_root=tmp_path / "snapshots", ledger=ledger)
+    factory_calls = []
+    with pytest.raises(CorpusV2AcquisitionError, match="C2_ACQUISITION_REGISTER_MISMATCH"):
+        acquire_registered_sources((changed,), client_for_source=lambda entry: factory_calls.append(entry),
+                                   release_root=tmp_path, snapshot_root=tmp_path / "snapshots", ledger=ledger)
+    assert factory_calls == client.metadata_calls == client.download_calls == []
+    if resuming:
+        assert (tmp_path / "snapshots/doc-1.blob").read_bytes() == b"approved"
+    else:
+        assert not (tmp_path / "snapshots").exists()
+    ledger.close()
 
 
 class FakeDriveClient:
@@ -67,7 +98,7 @@ def _entry(
     )
 
 
-def _ledger(tmp_path: Path, *, source_ids: tuple[str, ...] = ("doc-1",)) -> CorpusV2Ledger:
+def _ledger(tmp_path: Path, *, source_ids: tuple[str, ...] = ("doc-1",), entries=None) -> CorpusV2Ledger:
     config = ReleaseConfig(
         release_id="corpus-v2-test",
         release_root=tmp_path,
@@ -79,8 +110,9 @@ def _ledger(tmp_path: Path, *, source_ids: tuple[str, ...] = ("doc-1",)) -> Corp
         critical_source_register_sha256=SHA,
     )
     ledger = CorpusV2Ledger.create(tmp_path / "ledger.sqlite", release_config=config)
-    for source_id in source_ids:
-        ledger.record_source(ApprovedSource(source_id=source_id, source_sha256=SHA))
+    entries = entries or tuple(_entry(source_id=sid, file_id=sid.replace("doc-", "drive-")) for sid in source_ids)
+    for entry in entries:
+        ledger.record_source(ApprovedSource(source_id=entry.source_id, source_sha256=entry.record_sha256))
     ledger.complete_stage(Stage.REGISTERED)
     return ledger
 
@@ -112,15 +144,19 @@ def test_acquisition_hashes_downloaded_bytes_and_uses_only_registered_identity(t
 
 
 def test_native_export_requires_explicit_approved_export_mime(tmp_path: Path) -> None:
-    ledger = _ledger(tmp_path)
     native = "application/vnd.google-apps.document"
+    ledger = _ledger(tmp_path, entries=(_entry(mime_type=native),))
     client = FakeDriveClient(metadata=DriveFileMetadata("drive-1", native, "revision-1"))
 
     with pytest.raises(CorpusV2AcquisitionError, match="C2_DRIVE_EXPORT_POLICY_INVALID"):
         acquire_source(_entry(mime_type=native), client, release_root=tmp_path, snapshot_root=tmp_path / "snapshots", ledger=ledger)
 
     allowed = _entry(mime_type=native, export_mime="application/pdf")
-    record = acquire_source(allowed, client, release_root=tmp_path, snapshot_root=tmp_path / "snapshots", ledger=ledger)
+    ledger.close()
+    allowed_root = tmp_path / "allowed"
+    allowed_root.mkdir()
+    ledger = _ledger(allowed_root, entries=(allowed,))
+    record = acquire_source(allowed, client, release_root=allowed_root, snapshot_root=allowed_root / "snapshots", ledger=ledger)
     assert record.mime_type == "application/pdf"
     assert client.download_calls == [("drive-1", "application/pdf")]
     ledger.close()
@@ -170,6 +206,18 @@ def test_acquire_registered_sources_requires_exact_register_acquisition_identity
     )
     assert {record.source_id for record in records} == {"doc-1", "doc-2"}
 
+    ledger.close()
+
+
+def test_entire_register_authenticated_before_first_client_factory(tmp_path):
+    ledger = _ledger(tmp_path, source_ids=("doc-1", "doc-2"))
+    entries = (_entry(), _entry(source_id="doc-2", file_id="changed-drive"))
+    factory_calls = []
+    with pytest.raises(CorpusV2AcquisitionError, match="C2_ACQUISITION_REGISTER_MISMATCH"):
+        acquire_registered_sources(entries, client_for_source=lambda entry: factory_calls.append(entry),
+                                   release_root=tmp_path, snapshot_root=tmp_path / "snapshots", ledger=ledger)
+    assert factory_calls == []
+    assert not (tmp_path / "snapshots").exists()
     ledger.close()
 
 

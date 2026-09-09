@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
+import hashlib
+import json
 from pathlib import Path
 import re
 from typing import Any, Mapping
@@ -84,7 +86,10 @@ def is_valid_public_source_id(value: object) -> bool:
 
 
 def is_valid_public_chunk_id(value: object) -> bool:
-    return isinstance(value, str) and _PUBLIC_CHUNK_ID.fullmatch(value) is not None
+    return isinstance(value, str) and (
+        _PUBLIC_CHUNK_ID.fullmatch(value) is not None
+        or re.fullmatch(r"[0-9a-f]{64}", value) is not None
+    )
 
 
 def is_valid_chunk_provenance(chunk_id: object, source_id: object, ordinal: object) -> bool:
@@ -279,21 +284,90 @@ class ExtractionRecord:
 
 
 @dataclass(frozen=True)
+class ChunkProvenance:
+    """Private provenance required to authenticate a processing SHA256 identity."""
+
+    release_id: str
+    source_byte_sha256: str
+    parser_policy_version: str
+    chunk_policy_version: str
+    location: str
+
+    def __post_init__(self) -> None:
+        from .processing import CorpusV2ProcessingError, validate_location
+
+        if not is_valid_public_release_id(self.release_id):
+            raise CorpusV2ContractError("C2_CHUNK_PROVENANCE_INVALID")
+        _sha256(self.source_byte_sha256)
+        for policy in (self.parser_policy_version, self.chunk_policy_version):
+            if not isinstance(policy, str) or re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,127}", policy) is None:
+                raise CorpusV2ContractError("C2_CHUNK_PROVENANCE_INVALID")
+        try:
+            validate_location(self.location)
+        except CorpusV2ProcessingError:
+            raise CorpusV2ContractError("C2_CHUNK_PROVENANCE_INVALID") from None
+
+    def chunk_id(self, source_id: str, ordinal: int, text_sha256: str) -> str:
+        identity = {
+            "release_id": self.release_id,
+            "source_byte_sha256": self.source_byte_sha256,
+            "parser_policy_version": self.parser_policy_version,
+            "chunk_policy_version": self.chunk_policy_version,
+            "location": self.location,
+            "source_id": source_id,
+            "ordinal": ordinal,
+            "text_sha256": text_sha256,
+        }
+        return hashlib.sha256(
+            json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+
+@dataclass(frozen=True)
 class CorpusV2Chunk:
     chunk_id: str
     source_id: str
     ordinal: int
     text_sha256: str
     character_count: int
+    provenance: ChunkProvenance | None = None
 
     def __post_init__(self) -> None:
         _public_chunk_id(self.chunk_id)
         _public_source_id(self.source_id)
         _count(self.ordinal)
-        if not is_valid_chunk_provenance(self.chunk_id, self.source_id, self.ordinal):
-            raise CorpusV2ContractError("C2_CHUNK_PROVENANCE_INVALID")
         _sha256(self.text_sha256)
         _count(self.character_count)
+        if self.provenance is None:
+            if not is_valid_chunk_provenance(self.chunk_id, self.source_id, self.ordinal):
+                raise CorpusV2ContractError("C2_CHUNK_PROVENANCE_INVALID")
+        elif (
+            not isinstance(self.provenance, ChunkProvenance)
+            or self.chunk_id != self.provenance.chunk_id(self.source_id, self.ordinal, self.text_sha256)
+        ):
+            raise CorpusV2ContractError("C2_CHUNK_PROVENANCE_INVALID")
+
+    @classmethod
+    def from_loaded_chunk(cls, chunk: Any, *, release_id: str) -> "CorpusV2Chunk":
+        """Authenticate processing output without replacing its SHA256 identity."""
+        from oilfield_chemical_copilot.ingest.models import LoadedChunk
+
+        if not isinstance(chunk, LoadedChunk):
+            raise CorpusV2ContractError("C2_CHUNK_PROVENANCE_INVALID")
+        metadata = chunk.metadata
+        try:
+            provenance = ChunkProvenance(
+                release_id, metadata.extra["source_byte_sha256"],
+                metadata.extra["parser_policy_version"], metadata.extra["chunk_policy_version"],
+                metadata.page_or_sheet,
+            )
+            digest = hashlib.sha256(chunk.text.encode("utf-8")).hexdigest()
+            if metadata.extra["text_sha256"] != digest or metadata.source_file != metadata.extra["source_id"]:
+                raise CorpusV2ContractError("C2_CHUNK_PROVENANCE_INVALID")
+            return cls(metadata.chunk_id, metadata.extra["source_id"], metadata.chunk_index,
+                       digest, len(chunk.text), provenance)
+        except (KeyError, TypeError, AttributeError):
+            raise CorpusV2ContractError("C2_CHUNK_PROVENANCE_INVALID") from None
 
 
 @dataclass(frozen=True)

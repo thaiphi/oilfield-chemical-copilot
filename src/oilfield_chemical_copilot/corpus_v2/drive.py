@@ -328,6 +328,17 @@ def _cleanup_before_publish(
         _remove_owned_pending(pending, owner_nonce)
 
 
+def _authenticate_entry(entry: ApprovedSourceRegisterEntry, ledger: CorpusV2Ledger) -> None:
+    if not isinstance(entry, ApprovedSourceRegisterEntry):
+        raise CorpusV2AcquisitionError("C2_ACQUISITION_REGISTER_INVALID")
+    try:
+        approved_digest = ledger.registered_source_sha256(entry.source_id)
+    except CorpusV2LedgerError:
+        raise CorpusV2AcquisitionError("C2_ACQUISITION_LEDGER_INVALID") from None
+    if approved_digest != entry.record_sha256:
+        raise CorpusV2AcquisitionError("C2_ACQUISITION_REGISTER_MISMATCH")
+
+
 def acquire_source(
     entry: ApprovedSourceRegisterEntry,
     client: DriveSourceClient,
@@ -339,6 +350,7 @@ def acquire_source(
     """Acquire one approved identity using its pinned Drive facts and nothing else."""
     if not isinstance(entry, ApprovedSourceRegisterEntry):
         raise CorpusV2AcquisitionError("C2_ACQUISITION_REGISTER_INVALID")
+    _authenticate_entry(entry, ledger)
     snapshot_root = _validate_snapshot_root(release_root=release_root, snapshot_root=snapshot_root)
     relative_path = _relative_snapshot_path(snapshot_root, entry.source_id)
     try:
@@ -439,6 +451,8 @@ def acquire_registered_sources(
     ledger: CorpusV2Ledger,
 ) -> tuple[SnapshotAcquisitionRecord, ...]:
     """Resume a sealed register only when its exact acquisition identity set agrees."""
+    for entry in entries:
+        _authenticate_entry(entry, ledger)
     source_ids = tuple(entry.source_id for entry in entries)
     if len(source_ids) != len(set(source_ids)):
         raise CorpusV2AcquisitionError("C2_ACQUISITION_REGISTER_MISMATCH")

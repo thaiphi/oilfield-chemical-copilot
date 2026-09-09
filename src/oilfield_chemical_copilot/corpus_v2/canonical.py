@@ -9,6 +9,7 @@ import re
 from typing import Any
 
 from .models import (
+    CorpusV2Chunk,
     is_valid_chunk_provenance,
     is_valid_embedding_model,
     is_valid_public_chunk_id,
@@ -51,7 +52,7 @@ _RELEASE_ID = re.compile(r"^corpus-v2-\d{4}-\d{2}-\d{2}$")
 _EXTRACTOR = re.compile(r"^(?:pypdf|python-docx|synthetic)$")
 
 
-def _validate(record: Mapping[str, Any]) -> None:
+def _validate(record: Mapping[str, Any], *, authenticated_chunk: bool = False) -> None:
     schema = _RECORD_SCHEMAS.get(frozenset(record))
     if schema is None:
         if any(not isinstance(key, str) or not isinstance(value, (int, bool, type(None))) for key, value in record.items()):
@@ -89,7 +90,7 @@ def _validate(record: Mapping[str, Any]) -> None:
                 raise CorpusV2CanonicalError("C2_CANONICAL_INVALID")
         elif field_type == "outcome" and value not in {"SUCCESS", "NON_TEXT", "EMPTY", "UNSUPPORTED", "FAILED"}:
             raise CorpusV2CanonicalError("C2_CANONICAL_INVALID")
-    if "ordinal" in schema and not is_valid_chunk_provenance(
+    if "ordinal" in schema and not authenticated_chunk and not is_valid_chunk_provenance(
         record["chunk_id"], record["source_id"], record["ordinal"]
     ):
         raise CorpusV2CanonicalError("C2_CANONICAL_INVALID")
@@ -100,16 +101,22 @@ def _validate(record: Mapping[str, Any]) -> None:
             raise CorpusV2CanonicalError("C2_CANONICAL_INVALID")
 
 
-def canonical_jsonl(records: Iterable[Mapping[str, Any]]) -> bytes:
+def canonical_jsonl(records: Iterable[Mapping[str, Any] | CorpusV2Chunk]) -> bytes:
     """Return newline-terminated UTF-8 JSONL with deterministic key ordering."""
     rows: list[bytes] = []
     for record in records:
+        authenticated_chunk = isinstance(record, CorpusV2Chunk)
+        if authenticated_chunk:
+            record.__post_init__()
+            record = {field: getattr(record, field) for field in (
+                "chunk_id", "source_id", "ordinal", "text_sha256", "character_count"
+            )}
         if not isinstance(record, Mapping):
             raise CorpusV2CanonicalError("C2_CANONICAL_INVALID")
-        _validate(record)
+        _validate(record, authenticated_chunk=authenticated_chunk)
         rows.append(json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
     return b"".join(row + b"\n" for row in rows)
 
 
-def sha256_canonical_jsonl(records: Iterable[Mapping[str, Any]]) -> str:
+def sha256_canonical_jsonl(records: Iterable[Mapping[str, Any] | CorpusV2Chunk]) -> str:
     return hashlib.sha256(canonical_jsonl(records)).hexdigest()

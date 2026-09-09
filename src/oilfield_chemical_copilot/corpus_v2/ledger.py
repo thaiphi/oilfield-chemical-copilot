@@ -341,6 +341,15 @@ class CorpusV2Ledger:
             revision_token=row["revision_token"],
         )
 
+    def registered_source_sha256(self, source_id: str) -> str | None:
+        """Read an approved identity digest only after the register is sealed."""
+        if Stage.REGISTERED not in self.completed_stages():
+            raise CorpusV2LedgerError("C2_REGISTER_NOT_SEALED")
+        row = self._connection.execute(
+            "SELECT source_sha256 FROM source_register WHERE source_id = ?", (source_id,)
+        ).fetchone()
+        return None if row is None else row["source_sha256"]
+
     def registered_source_ids(self) -> tuple[str, ...]:
         """Return the sealed source identities, never upstream Drive identifiers."""
         rows = self._connection.execute(
