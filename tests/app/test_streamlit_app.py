@@ -26,7 +26,26 @@ from oilfield_chemical_copilot.rag.models import RagAnswer
 from oilfield_chemical_copilot.ollama import OllamaClientError
 from oilfield_chemical_copilot.rag.models import RagConfigurationError
 from oilfield_chemical_copilot.rag.models import SourceEvidence
+from oilfield_chemical_copilot.retrieval.embeddings import EmbeddingSettings
 from oilfield_chemical_copilot.retrieval.pipeline import RetrievalSettings
+
+
+def _rag_service_settings(retrieval_mode: str = "hybrid"):
+    return streamlit_app.RagServiceSettings(
+        retrieval=RetrievalSettings(retrieval_mode=retrieval_mode),
+        embedding=EmbeddingSettings(
+            provider="deterministic",
+            dimension=384,
+            sentence_transformers_model="deterministic-token-hash-384",
+            ollama_embedding_model="deterministic-token-hash-384",
+        ),
+        generator=streamlit_app.AnswerGeneratorSettings(
+            provider="ollama",
+            ollama_base_url="http://localhost:11434",
+            ollama_model="granite4.1:8b",
+            openai_model="gpt-4.1-mini",
+        ),
+    )
 
 
 def test_citation_display_hides_absolute_path_and_keeps_chunk_metadata() -> None:
@@ -67,13 +86,13 @@ def test_rag_service_builds_the_selected_retrieval_mode(monkeypatch) -> None:
     sentinel_retriever = object()
     captured: dict[str, object] = {}
 
-    monkeypatch.setattr("app.streamlit_app.build_answer_generator", lambda: sentinel_generator)
+    monkeypatch.setattr("app.streamlit_app.build_answer_generator", lambda settings: sentinel_generator)
     monkeypatch.setattr(
         "app.streamlit_app.build_embedding_provider",
-        lambda: type("Provider", (), {"dimension": 384})(),
+        lambda settings: type("Provider", (), {"dimension": 384, "model_name": settings.ollama_embedding_model})(),
     )
     monkeypatch.setattr(
-        "app.streamlit_app.PgVectorStore", lambda *args, **kwargs: sentinel_store
+        "app.streamlit_app.open_verified_runtime_store", lambda release: sentinel_store
     )
 
     class FakeKeywordIndex:
@@ -95,7 +114,11 @@ def test_rag_service_builds_the_selected_retrieval_mode(monkeypatch) -> None:
     monkeypatch.setattr(
         "app.streamlit_app.RetrievalSettings.from_env", lambda: RetrievalSettings()
     )
-    _build_rag_service.clear()
+    from oilfield_chemical_copilot.corpus_v2.runtime import RuntimeRelease
+    release = RuntimeRelease("v2", "synthetic", "a" * 64, "ollama", "synthetic-model", 384,
+                             "b" * 64, "postgresql://localhost/synthetic")
+    monkeypatch.setattr(streamlit_app, "load_runtime_release", lambda: release)
+    streamlit_app._cached_rag_service.clear()
 
     hybrid_service = _build_rag_service("hybrid")
     assert hybrid_service.generator is sentinel_generator
@@ -108,19 +131,22 @@ def test_rag_service_builds_the_selected_retrieval_mode(monkeypatch) -> None:
     assert vector_service.generator is sentinel_generator
     assert captured["settings"].retrieval_mode == "vector"
     assert captured["keyword_index"] is None
-    _build_rag_service.clear()
+    streamlit_app._cached_rag_service.clear()
 
 
-def test_database_url_defaults_to_localhost_for_local_streamlit(monkeypatch) -> None:
+def test_database_url_never_defaults_to_legacy(monkeypatch) -> None:
     monkeypatch.delenv("DATABASE_URL", raising=False)
 
-    assert _database_url() == "postgresql://postgres:postgres@localhost:5432/oilfield_copilot"
+    monkeypatch.delenv("CORPUS_RELEASE_ID", raising=False)
+    with pytest.raises(ValueError, match="C2_RUNTIME_RELEASE_INVALID"):
+        _database_url()
 
 
 def test_database_url_preserves_explicit_environment_value(monkeypatch) -> None:
     monkeypatch.setenv("DATABASE_URL", "postgresql://custom/value")
 
-    assert _database_url() == "postgresql://custom/value"
+    with pytest.raises(ValueError, match="C2_RUNTIME_RELEASE_INVALID"):
+        _database_url()
 
 
 def test_monitoring_database_url_is_independent_from_rag_database(monkeypatch) -> None:
@@ -513,3 +539,145 @@ def test_pending_feedback_button_records_feedback_on_rerun(monkeypatch) -> None:
 
     assert recorded == [(FeedbackValue.HELPFUL, RetrievalMode.HYBRID)]
     assert FakeStreamlit.session_state.feedback_recorded is True
+
+
+def test_runtime_cache_separates_releases_digest_database_and_mode(monkeypatch):
+    from dataclasses import replace
+    from oilfield_chemical_copilot.corpus_v2.runtime import RuntimeRelease
+    release = RuntimeRelease("v2", "synthetic", "a" * 64, "deterministic",
+                             "deterministic-token-hash-384", 384, "b" * 64,
+                             "postgresql://localhost/synthetic")
+    stores = []
+    def open_store(selected):
+        store = type("Store", (), {"list_chunks": lambda self: [selected.release_id]})()
+        stores.append(store)
+        return store
+    monkeypatch.setattr(streamlit_app, "open_verified_runtime_store", open_store)
+    monkeypatch.setattr(streamlit_app, "build_answer_generator", lambda settings: object())
+    monkeypatch.setattr(streamlit_app.KeywordSearchIndex, "from_hits", lambda hits: tuple(hits))
+    monkeypatch.setattr(streamlit_app, "build_retrieval_pipeline", lambda **kwargs: kwargs)
+    streamlit_app._cached_rag_service.clear()
+    hybrid_settings = _rag_service_settings()
+    first = streamlit_app._cached_rag_service(release, hybrid_settings)
+    assert streamlit_app._cached_rag_service(release, hybrid_settings) is first
+    variants = [replace(release, mode="legacy", release_id="legacy-r1"),
+                replace(release, manifest_sha256="c" * 64),
+                replace(release, database_identity="d" * 64,
+                        database_url="postgresql://localhost/other")]
+    for variant in variants:
+        assert streamlit_app._cached_rag_service(variant, hybrid_settings) is not first
+    assert streamlit_app._cached_rag_service(
+        release, _rag_service_settings("vector")
+    ) is not first
+    assert len(stores) == 5
+    assert first.retriever["keyword_index"] == ("synthetic",)
+    streamlit_app._cached_rag_service.clear()
+
+
+def test_build_rag_service_validates_settings_and_keys_warm_cache(monkeypatch):
+    from oilfield_chemical_copilot.corpus_v2.runtime import RuntimeRelease
+
+    release = RuntimeRelease("v2", "synthetic", "a" * 64, "deterministic",
+                             "deterministic-token-hash-384", 384, "b" * 64,
+                             "postgresql://localhost/synthetic")
+    stores = []
+
+    def open_store(_selected):
+        store = type("Store", (), {"list_chunks": lambda self: ["synthetic"]})()
+        stores.append(store)
+        return store
+
+    monkeypatch.setattr(streamlit_app, "load_runtime_release", lambda: release)
+    monkeypatch.setattr(streamlit_app, "open_verified_runtime_store", open_store)
+    monkeypatch.setattr(streamlit_app, "build_answer_generator", lambda settings: object())
+    monkeypatch.setattr(streamlit_app.KeywordSearchIndex, "from_hits", lambda hits: tuple(hits))
+    monkeypatch.setattr(streamlit_app, "build_retrieval_pipeline", lambda **kwargs: kwargs)
+    monkeypatch.setenv("LLM_PROVIDER", "ollama")
+    monkeypatch.setenv("OLLAMA_BASE_URL", "http://ollama-one.test")
+    monkeypatch.setenv("RAG_TOP_K", "5")
+    streamlit_app._cached_rag_service.clear()
+
+    first = streamlit_app._build_rag_service("hybrid")
+    assert streamlit_app._build_rag_service("hybrid") is first
+
+    monkeypatch.setenv("RAG_TOP_K", "6")
+    second = streamlit_app._build_rag_service("hybrid")
+    assert second is not first
+    assert len(stores) == 2
+
+    monkeypatch.setenv("OLLAMA_BASE_URL", "http://ollama-two.test")
+    third = streamlit_app._build_rag_service("hybrid")
+    assert third is not second
+    assert len(stores) == 3
+
+    monkeypatch.setenv("OLLAMA_MODEL", "granite-test-model")
+    assert streamlit_app._build_rag_service("hybrid") is not third
+    assert len(stores) == 4
+
+    monkeypatch.setenv("RAG_TOP_K", "0")
+    with pytest.raises(ValueError, match="RAG_TOP_K must be at least 1"):
+        streamlit_app._build_rag_service("hybrid")
+    assert len(stores) == 4
+
+    monkeypatch.setenv("RAG_TOP_K", "5")
+    monkeypatch.setenv("LLM_PROVIDER", "unsupported")
+    with pytest.raises(RagConfigurationError, match="Unsupported LLM provider"):
+        streamlit_app._build_rag_service("hybrid")
+    assert len(stores) == 4
+    streamlit_app._cached_rag_service.clear()
+
+    monkeypatch.setenv("LLM_PROVIDER", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-first")
+    first_openai = streamlit_app._build_rag_service("hybrid")
+    assert streamlit_app._build_rag_service("hybrid") is first_openai
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-rotated")
+    assert streamlit_app._build_rag_service("hybrid") is not first_openai
+    monkeypatch.delenv("OPENAI_API_KEY")
+    with pytest.raises(RagConfigurationError, match="OPENAI_API_KEY"):
+        streamlit_app._build_rag_service("hybrid")
+    assert len(stores) == 6
+    streamlit_app._cached_rag_service.clear()
+
+
+def test_invalid_binding_blocks_even_populated_cache(monkeypatch):
+    from oilfield_chemical_copilot.corpus_v2.runtime import CorpusV2RuntimeError
+    def invalid():
+        raise CorpusV2RuntimeError("C2_RUNTIME_RELEASE_INVALID")
+    monkeypatch.setattr(streamlit_app, "load_runtime_release", invalid)
+    monkeypatch.setattr(streamlit_app, "_cached_rag_service",
+                        lambda *args: pytest.fail("cache accessed before validation"))
+    with pytest.raises(CorpusV2RuntimeError):
+        _build_rag_service("hybrid")
+
+
+def test_wrong_provider_identity_never_loads_keyword_chunks(monkeypatch):
+    from oilfield_chemical_copilot.corpus_v2.runtime import RuntimeRelease, CorpusV2RuntimeError
+    release = RuntimeRelease("v2", "synthetic", "a" * 64, "deterministic", "wrong", 384,
+                             "b" * 64, "postgresql://localhost/synthetic")
+    store = type("Store", (), {"list_chunks": lambda self: pytest.fail("chunks loaded")})()
+    monkeypatch.setattr(streamlit_app, "load_runtime_release", lambda: release)
+    monkeypatch.setattr(streamlit_app, "open_verified_runtime_store", lambda _: store)
+    streamlit_app._cached_rag_service.clear()
+    with pytest.raises(CorpusV2RuntimeError):
+        streamlit_app._build_rag_service("hybrid")
+    streamlit_app._cached_rag_service.clear()
+
+
+def test_openai_key_required_before_cache_and_rotations_change_identity(monkeypatch):
+    from oilfield_chemical_copilot.corpus_v2.runtime import RuntimeRelease
+    release = RuntimeRelease("v2", "synthetic", "a" * 64, "deterministic",
+        "deterministic-token-hash-384", 384, "b" * 64, "postgresql://localhost/synthetic")
+    monkeypatch.setattr(streamlit_app, "load_runtime_release", lambda: release)
+    monkeypatch.setenv("LLM_PROVIDER", "openai")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr(streamlit_app, "_cached_rag_service", lambda *a: pytest.fail("cache reached"))
+    with pytest.raises(RagConfigurationError, match="OPENAI_API_KEY"):
+        streamlit_app._build_rag_service("hybrid")
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-key-one")
+    first = streamlit_app._validated_rag_service_settings(release, "hybrid").generator
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-key-two")
+    second = streamlit_app._validated_rag_service_settings(release, "hybrid").generator
+    assert first.cache_identity() != second.cache_identity()
+    assert "synthetic-key" not in repr(first)
+    client = streamlit_app.build_answer_generator(first)
+    assert client.api_key == "synthetic-key-one"
