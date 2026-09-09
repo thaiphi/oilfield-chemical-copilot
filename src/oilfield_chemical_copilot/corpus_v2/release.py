@@ -28,7 +28,7 @@ class CorpusV2ReleaseError(ValueError):
 REQUIRED_DIGESTS = frozenset({
     "source_register", "acquisition", "extraction", "dispositions", "chunks",
     "embeddings", "index_contract", "evaluation_specification", "evaluation_result",
-    "promotion_state", "ledger_projection", "legacy_guard",
+    "promotion_state", "ledger_projection", "legacy_guard", "index_validation",
 })
 STAGE_DIGESTS = {
     Stage.ACQUIRED: "acquisition", Stage.CHUNKED: "chunks", Stage.EMBEDDED: "embeddings",
@@ -152,6 +152,45 @@ def final_dispositions_bytes(ledger: CorpusV2Ledger) -> bytes:
     return _final_dispositions(ledger.release_projection())
 
 
+def _validate_index_evidence(contract, projection, artifacts):
+    """Reconcile canonical manifest identities with the completed build evidence.
+
+    index_validation is the private validation-stage receipt. Its producer must
+    authenticate the actual database transport; sealing does not connect to it.
+    chunks is the canonical index manifest; embeddings records one identity per
+    manifest chunk. Neither receipt is an operational authorization.
+    """
+    chunks = json.loads(artifacts["chunks"])
+    embeddings = json.loads(artifacts["embeddings"])
+    receipt = json.loads(artifacts["index_validation"])
+    if (type(chunks) is not list or not chunks or type(embeddings) is not list
+            or artifacts["chunks"] != _json(chunks)
+            or artifacts["embeddings"] != _json(embeddings)
+            or artifacts["index_validation"] != _json(receipt)):
+        _invalid()
+    chunk_ids = [row["chunk_id"] for row in chunks]
+    source_ids = {row["source_id"] for row in chunks}
+    indexed = {row["source_id"] for row in json.loads(_final_dispositions(projection))
+               if row["disposition"] == SourceDisposition.INDEXED.value}
+    embedding_ids = [row["chunk_id"] for row in embeddings]
+    if (any(not isinstance(value, str) or not value for value in chunk_ids)
+            or len(set(chunk_ids)) != len(chunk_ids)
+            or len(set(embedding_ids)) != len(embedding_ids)
+            or set(embedding_ids) != set(chunk_ids) or source_ids != indexed
+            or contract.chunk_count != len(chunks) or contract.source_count != len(source_ids)
+            or contract.index_manifest_sha256 != sha256(artifacts["chunks"]).hexdigest()
+            or any(type(row["embedding_dimension"]) is not int
+                   or (row["embedding_provider"], row["embedding_model"], row["embedding_dimension"])
+                   != (contract.embedding_provider, contract.embedding_model,
+                       contract.embedding_dimension) for row in embeddings)
+            or receipt != {
+                "release_id": contract.release_id, "database_name": contract.database_name,
+                "database_identity": contract.database_identity,
+                "chunks_sha256": sha256(artifacts["chunks"]).hexdigest(),
+                "embeddings_sha256": sha256(artifacts["embeddings"]).hexdigest()}):
+        _invalid()
+
+
 def _binding(config: ReleaseConfig, ledger: CorpusV2Ledger, artifacts: Mapping[str, bytes]) -> bytes:
     if (set(artifacts) != REQUIRED_DIGESTS
             or any(type(value) is not bytes or not value for value in artifacts.values())):
@@ -163,6 +202,7 @@ def _binding(config: ReleaseConfig, ledger: CorpusV2Ledger, artifacts: Mapping[s
             or contract.source_register_sha256 != config.source_register_sha256):
         _invalid()
     projection = ledger.release_projection()
+    _validate_index_evidence(contract, projection, artifacts)
     metadata = projection["release"]
     if (len(metadata) != 1 or metadata[0]["release_id"] != config.release_id
             or metadata[0]["expected_source_count"] != config.expected_source_count

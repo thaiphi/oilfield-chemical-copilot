@@ -86,7 +86,7 @@ def test_rag_service_builds_the_selected_retrieval_mode(monkeypatch) -> None:
     sentinel_retriever = object()
     captured: dict[str, object] = {}
 
-    monkeypatch.setattr("app.streamlit_app.build_answer_generator", lambda: sentinel_generator)
+    monkeypatch.setattr("app.streamlit_app.build_answer_generator", lambda settings: sentinel_generator)
     monkeypatch.setattr(
         "app.streamlit_app.build_embedding_provider",
         lambda settings: type("Provider", (), {"dimension": 384, "model_name": settings.ollama_embedding_model})(),
@@ -553,7 +553,7 @@ def test_runtime_cache_separates_releases_digest_database_and_mode(monkeypatch):
         stores.append(store)
         return store
     monkeypatch.setattr(streamlit_app, "open_verified_runtime_store", open_store)
-    monkeypatch.setattr(streamlit_app, "build_answer_generator", object)
+    monkeypatch.setattr(streamlit_app, "build_answer_generator", lambda settings: object())
     monkeypatch.setattr(streamlit_app.KeywordSearchIndex, "from_hits", lambda hits: tuple(hits))
     monkeypatch.setattr(streamlit_app, "build_retrieval_pipeline", lambda **kwargs: kwargs)
     streamlit_app._cached_rag_service.clear()
@@ -589,7 +589,7 @@ def test_build_rag_service_validates_settings_and_keys_warm_cache(monkeypatch):
 
     monkeypatch.setattr(streamlit_app, "load_runtime_release", lambda: release)
     monkeypatch.setattr(streamlit_app, "open_verified_runtime_store", open_store)
-    monkeypatch.setattr(streamlit_app, "build_answer_generator", object)
+    monkeypatch.setattr(streamlit_app, "build_answer_generator", lambda settings: object())
     monkeypatch.setattr(streamlit_app.KeywordSearchIndex, "from_hits", lambda hits: tuple(hits))
     monkeypatch.setattr(streamlit_app, "build_retrieval_pipeline", lambda **kwargs: kwargs)
     monkeypatch.setenv("LLM_PROVIDER", "ollama")
@@ -626,6 +626,18 @@ def test_build_rag_service_validates_settings_and_keys_warm_cache(monkeypatch):
     assert len(stores) == 4
     streamlit_app._cached_rag_service.clear()
 
+    monkeypatch.setenv("LLM_PROVIDER", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-first")
+    first_openai = streamlit_app._build_rag_service("hybrid")
+    assert streamlit_app._build_rag_service("hybrid") is first_openai
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-rotated")
+    assert streamlit_app._build_rag_service("hybrid") is not first_openai
+    monkeypatch.delenv("OPENAI_API_KEY")
+    with pytest.raises(RagConfigurationError, match="OPENAI_API_KEY"):
+        streamlit_app._build_rag_service("hybrid")
+    assert len(stores) == 6
+    streamlit_app._cached_rag_service.clear()
+
 
 def test_invalid_binding_blocks_even_populated_cache(monkeypatch):
     from oilfield_chemical_copilot.corpus_v2.runtime import CorpusV2RuntimeError
@@ -649,3 +661,23 @@ def test_wrong_provider_identity_never_loads_keyword_chunks(monkeypatch):
     with pytest.raises(CorpusV2RuntimeError):
         streamlit_app._build_rag_service("hybrid")
     streamlit_app._cached_rag_service.clear()
+
+
+def test_openai_key_required_before_cache_and_rotations_change_identity(monkeypatch):
+    from oilfield_chemical_copilot.corpus_v2.runtime import RuntimeRelease
+    release = RuntimeRelease("v2", "synthetic", "a" * 64, "deterministic",
+        "deterministic-token-hash-384", 384, "b" * 64, "postgresql://localhost/synthetic")
+    monkeypatch.setattr(streamlit_app, "load_runtime_release", lambda: release)
+    monkeypatch.setenv("LLM_PROVIDER", "openai")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr(streamlit_app, "_cached_rag_service", lambda *a: pytest.fail("cache reached"))
+    with pytest.raises(RagConfigurationError, match="OPENAI_API_KEY"):
+        streamlit_app._build_rag_service("hybrid")
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-key-one")
+    first = streamlit_app._validated_rag_service_settings(release, "hybrid").generator
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-key-two")
+    second = streamlit_app._validated_rag_service_settings(release, "hybrid").generator
+    assert first.cache_identity() != second.cache_identity()
+    assert "synthetic-key" not in repr(first)
+    client = streamlit_app.build_answer_generator(first)
+    assert client.api_key == "synthetic-key-one"

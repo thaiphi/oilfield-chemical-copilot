@@ -1,6 +1,8 @@
 # Corpus V2 release and runtime contract verification
 
-Task 7 review fixes remain uncommitted in the isolated design worktree. Verification
+Task 7's earlier review fixes were committed at
+`4a327b179a668b938899892ba36d25d7785e429e`. The subsequent review corrections
+described in `2026-09-08-corpus-v2-task7.md` remain uncommitted. Verification
 uses synthetic fixtures only. No private document processing, network, database
 connection, backup/restore, or promotion occurred.
 
@@ -8,14 +10,19 @@ Task 6 now seals and validates a canonical, typed index contract shared with Tas
 The integration fixture seals a complete Task 6 publication and passes its exact
 binding and index bytes into the runtime consumer. Arbitrary index-contract bytes
 are rejected. The contract binds the release, database identity, embedding identity,
-index manifest, source register, and index counts.
+index manifest, source register, and index counts. Sealing now reconciles counts
+with canonical chunk/embedding evidence and indexed ledger dispositions. The
+required private index-validation receipt binds the database identity and both
+artifact digests. Its producer must authenticate the real transport; this is an
+injected evidence boundary, not a live database adapter or operational proof.
 
 Legacy selection requires a separate authenticated legacy publication. A candidate
 binding cannot authenticate legacy mode. Its separate injected database reader checks
 the explicit 198-source / 4,797-chunk baseline, target, model, vector dimension, and
 read-only transaction. It never queries V2 release metadata.
 
-V2 verification independently queries the database identity, read-only status,
+V2 verification requires an injected authenticated transport-target check against
+the full configured URL, and independently queries database name, read-only status,
 repeatable-read isolation, release metadata, vector column type, ready and valid
 HNSW cosine index, and grouped indexed-row contract. It retains the transaction
 through retrieval operations and closes it on explicit close, owner disposal, or

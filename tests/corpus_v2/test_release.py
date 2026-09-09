@@ -2,6 +2,7 @@ from contextlib import contextmanager
 from dataclasses import replace
 from hashlib import sha256
 import sqlite3
+import json
 
 import pytest
 from ingestion.corpus_v2_legacy_guard import legacy_guard
@@ -69,11 +70,20 @@ def candidate(tmp_path):
     ledger.complete_stage(Stage.REGISTERED)
     artifacts = {key: key.encode() for key in release.REQUIRED_DIGESTS}
     artifacts["source_register"] = b"source"
+    artifacts["chunks"] = release._json([{"chunk_id": "chunk-1", "source_id": "doc-1"}])
+    artifacts["embeddings"] = release._json([{"chunk_id": "chunk-1",
+        "embedding_provider": "deterministic", "embedding_model": "deterministic-token-hash-384",
+        "embedding_dimension": 384}])
+    artifacts["index_validation"] = release._json({
+        "database_identity": sha256(b"postgresql://localhost/candidate").hexdigest(),
+        "database_name": "candidate", "release_id": config.release_id,
+        "chunks_sha256": sha256(artifacts["chunks"]).hexdigest(),
+        "embeddings_sha256": sha256(artifacts["embeddings"]).hexdigest()})
     artifacts["index_contract"] = release.index_contract_bytes(release.IndexContract(
         mode="v2", release_id=config.release_id, database_name="candidate",
         database_identity=sha256(b"postgresql://localhost/candidate").hexdigest(),
         embedding_provider="deterministic", embedding_model="deterministic-token-hash-384",
-        embedding_dimension=384, index_manifest_sha256="c" * 64,
+        embedding_dimension=384, index_manifest_sha256=sha256(artifacts["chunks"]).hexdigest(),
         source_register_sha256=config.source_register_sha256, source_count=1, chunk_count=1,
     ))
     @contextmanager
@@ -143,6 +153,30 @@ def test_task6_rejects_unstructured_index_contract(candidate, content):
     candidate[2]["index_contract"] = content
     with pytest.raises(release.CorpusV2ReleaseError):
         seal(candidate)
+
+
+@pytest.mark.parametrize("field,value", [("source_count", 2), ("chunk_count", 2),
+    ("embedding_provider", "ollama"), ("embedding_model", "wrong"),
+    ("embedding_dimension", 768), ("database_identity", "f" * 64),
+    ("index_manifest_sha256", "f" * 64)])
+def test_structured_false_contract_cannot_seal(candidate, monkeypatch, field, value):
+    _, ledger, artifacts, publication = candidate
+    contract = json.loads(artifacts["index_contract"])
+    contract[field] = value
+    if field == "source_count":
+        contract["chunk_count"] = 2
+    if field == "embedding_model":
+        contract["embedding_provider"] = "ollama"
+    artifacts["index_contract"] = release._json(contract)
+    projection = ledger.release_projection()
+    for row in projection["stage_artifacts"]:
+        if row["stage"] == Stage.INDEX_VALIDATED.value:
+            row["artifact_sha256"] = sha256(artifacts["index_contract"]).hexdigest()
+    monkeypatch.setattr(ledger, "release_projection", lambda: projection)
+    artifacts["ledger_projection"] = release._json(projection)
+    with pytest.raises(release.CorpusV2ReleaseError):
+        seal(candidate)
+    assert not publication.final
 
 
 @pytest.mark.parametrize("damage", ["missing", "extra", "stale", "stage_digest", "disposition"])

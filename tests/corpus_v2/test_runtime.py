@@ -121,7 +121,8 @@ class FakeSession:
     """Synthetic SQL transport; verifier must request and inspect independent rows."""
     def __init__(self, *, readonly="on", database="candidate", metadata=None,
                  rows=None, index_type="vector(384)", isolation="repeatable read",
-                 vector_index=True):
+                 vector_index=True, target_verified=True):
+        self.target_verified = target_verified
         self.active = False
         self.readonly, self.database, self.index_type = readonly, database, index_type
         self.isolation = isolation
@@ -135,6 +136,11 @@ class FakeSession:
     def reader(self, release, *, default_transaction_read_only):
         assert default_transaction_read_only is True
         return self
+
+    def verify_connection_target(self, database_url):
+        assert self.active
+        assert database_url == "postgresql://localhost/candidate"
+        return self.target_verified
 
     def __enter__(self):
         self.active = True
@@ -172,6 +178,7 @@ class FakeSession:
 
 
 @pytest.mark.parametrize("damage", [dict(readonly="off"), dict(database="other"),
+    dict(target_verified=False),
     dict(isolation="read committed"),
     dict(vector_index=False),
     dict(metadata=[]), dict(rows=[]), dict(index_type="vector(768)"),

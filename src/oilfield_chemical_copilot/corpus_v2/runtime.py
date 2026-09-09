@@ -33,6 +33,17 @@ class RuntimeDatabaseSession(Protocol):
 
     def execute(self, query: str) -> RuntimeQueryResult: ...
 
+    def verify_connection_target(self, database_url: str) -> bool:
+        """Authenticate the actual retained transport against the complete URL.
+
+        An adapter must compare its connected server/port, database, authenticated
+        principal and required TLS identity with the URL, resolving host aliases
+        using its authenticated transport. Echoing the supplied URL or querying
+        current_database alone does not satisfy this boundary. No default adapter
+        is supplied; absence or anything other than True fails closed.
+        """
+        ...
+
 
 @dataclass(frozen=True)
 class AuthenticatedRuntimeBinding:
@@ -168,7 +179,8 @@ def open_verified_runtime_store(release: RuntimeRelease, *, reader=None, legacy_
             selected_reader(release, default_transaction_read_only=True))
         def rows(query):
             return session.execute(query).fetchall()
-        if (rows("SHOW transaction_read_only") != [("on",)]
+        if (session.verify_connection_target(release.database_url) is not True
+                or rows("SHOW transaction_read_only") != [("on",)]
                 or rows("SHOW transaction_isolation") != [("repeatable read",)]
                 or rows("SELECT current_database()") != [(contract.database_name,)]
                 or rows("SELECT format_type(atttypid, atttypmod) FROM pg_attribute "

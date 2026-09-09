@@ -4,7 +4,8 @@ import os
 import re
 import sys
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
+from hashlib import sha256
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
@@ -61,6 +62,12 @@ class AnswerGeneratorSettings:
     ollama_base_url: str
     ollama_model: str
     openai_model: str
+    openai_api_key: str = field(default="", repr=False)
+
+    def cache_identity(self):
+        return (self.provider, sha256(self.ollama_base_url.encode()).hexdigest(),
+                self.ollama_model, self.openai_model,
+                sha256(self.openai_api_key.encode()).hexdigest())
 
 
 @dataclass(frozen=True)
@@ -141,6 +148,7 @@ def _validated_rag_service_settings(
         ollama_base_url=os.getenv("OLLAMA_BASE_URL", DEFAULT_OLLAMA_BASE_URL),
         ollama_model=os.getenv("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL),
         openai_model=os.getenv("OPENAI_MODEL", DEFAULT_OPENAI_MODEL),
+        openai_api_key=os.getenv("OPENAI_API_KEY", ""),
     )
     if generator.provider not in {"ollama", "openai"}:
         raise RagConfigurationError(f"Unsupported LLM provider: {generator.provider}")
@@ -148,10 +156,17 @@ def _validated_rag_service_settings(
         raise RagConfigurationError("Ollama answer configuration is required")
     if not generator.openai_model.strip():
         raise RagConfigurationError("OPENAI_MODEL is required for answer generation")
+    if generator.provider == "openai" and not generator.openai_api_key.strip():
+        raise RagConfigurationError("OPENAI_API_KEY is required for answer generation")
     return RagServiceSettings(retrieval=retrieval, embedding=embedding, generator=generator)
 
 
-@st.cache_resource(show_spinner=False)
+@st.cache_resource(show_spinner=False, hash_funcs={
+    RagServiceSettings: lambda value: sha256(repr((
+        value.retrieval, value.embedding, value.generator.cache_identity())).encode()).hexdigest(),
+    RuntimeRelease: lambda value: sha256((repr(value) + value.database_url
+        + repr(value.index_contract)).encode()).hexdigest(),
+})
 def _cached_rag_service(release: RuntimeRelease, settings: RagServiceSettings) -> BasicRagService:
     if settings.retrieval.retrieval_mode not in {"hybrid", "vector"}:
         raise CorpusV2RuntimeError("C2_RUNTIME_RELEASE_INVALID")
@@ -173,7 +188,7 @@ def _cached_rag_service(release: RuntimeRelease, settings: RagServiceSettings) -
     )
     return BasicRagService.from_settings(
         retriever=retriever,
-        generator=build_answer_generator(),
+        generator=build_answer_generator(settings.generator),
         settings=settings.retrieval,
     )
 
