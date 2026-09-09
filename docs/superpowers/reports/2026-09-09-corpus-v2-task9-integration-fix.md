@@ -1,6 +1,6 @@
 # Task 9 integration fixes
 
-Scope: synthetic code and tests in the isolated Corpus V2 worktree. No main checkout, private corpus, live service, database connection, or network operation. The initial integration fixes were committed in `4082e04`; the follow-up locator privacy correction remains uncommitted for review.
+Scope: synthetic code and tests in the isolated Corpus V2 worktree. No main checkout, private corpus, live service, database connection, or network operation. The initial integration fixes were committed in `4082e04`; the follow-up locator privacy correction was committed in `fae9c12` for review.
 
 ## Sealed acquisition identity
 
