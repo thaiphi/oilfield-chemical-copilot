@@ -79,7 +79,11 @@ def database_name_from_url(database_url: object) -> str:
 
 @dataclass(frozen=True)
 class V2ChunkManifestEntry:
-    """The public, fixed metadata expected for exactly one candidate V2 chunk."""
+    """Private authenticated input; only its explicit row projection is stored.
+
+    Location and chunk provenance may contain private sheet labels. Do not
+    serialize this record as a public manifest or index readout.
+    """
 
     chunk: CorpusV2Chunk
     source_sha256: str
@@ -125,6 +129,21 @@ class V2ChunkManifestEntry:
     def source_id(self) -> str:
         return self.chunk.source_id
 
+    @property
+    def public_location(self) -> str:
+        """Project every locator consistently without exposing page/sheet labels.
+
+        The domain-separated digest binds the validated raw locator to this
+        source snapshot and chunk. Private provenance remains necessary to
+        resolve it; the token is an identity check, not a display citation.
+        """
+        payload = json.dumps(
+            ["corpus-v2-location-v1", self.source_id, self.source_sha256,
+             self.chunk_id, self.location],
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return "locator-sha256:" + hashlib.sha256(payload).hexdigest()
+
 
 @dataclass(frozen=True)
 class V2Embedding:
@@ -143,6 +162,8 @@ class V2Embedding:
 
 @dataclass(frozen=True)
 class V2StoredChunk:
+    """Candidate row whose location is an opaque token, never a raw locator."""
+
     chunk_id: str
     release_id: str
     source_id: str
@@ -213,7 +234,7 @@ class CorpusV2Store:
                     source_sha256=entry.source_sha256,
                     text_sha256=entry.chunk.text_sha256,
                     manifest_sha256=entry.manifest_sha256,
-                    location=entry.location,
+                    location=entry.public_location,
                     embedding_model=entry.embedding_model,
                     vector_dimensions=entry.vector_dimensions,
                     embedding_sha256=embedding.embedding_sha256,
@@ -259,7 +280,7 @@ def validate_v2_index(
             or row.text_sha256 != entry.chunk.text_sha256
             or hashlib.sha256(row.content.encode("utf-8")).hexdigest() != entry.chunk.text_sha256
             or row.manifest_sha256 != release_binding.index_manifest_sha256
-            or row.location != entry.location
+            or row.location != entry.public_location
             or row.embedding_model != entry.embedding_model
             or row.vector_dimensions != entry.vector_dimensions
             or row.vector_dimensions != VECTOR_DIMENSIONS

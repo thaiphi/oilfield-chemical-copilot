@@ -19,13 +19,14 @@ from oilfield_chemical_copilot.corpus_v2.store import (
 )
 
 
-def test_processing_sha256_survives_typed_manifest_embedding_and_store(tmp_path):
+@pytest.mark.parametrize("location", ["sheet:Private synthetic label", "page:2"])
+def test_processing_sha256_survives_typed_manifest_embedding_and_store(tmp_path, location):
     release_id = "corpus-v2-2026-09-09"
     source_sha = hashlib.sha256(b"synthetic source").hexdigest()
     loaded = build_v2_chunk(
         release_id=release_id, source_id="doc-1", source_byte_sha256=source_sha,
         parser_policy_version="parser-v1", chunk_policy_version="chunk-v1",
-        location="sheet:Private synthetic label", ordinal=0, text="synthetic evidence",
+        location=location, ordinal=0, text="synthetic evidence",
         sealed_source_ids=("doc-1",),
     )
     typed = CorpusV2Chunk.from_loaded_chunk(loaded, release_id=release_id)
@@ -52,8 +53,18 @@ def test_processing_sha256_survives_typed_manifest_embedding_and_store(tmp_path)
     embedding = V2Embedding(typed.chunk_id, "local-model", embedding_record.embedding_sha256, vector)
     rows = store.prepare_rows((manifest,), (embedding,))
     assert rows[0].chunk_id == loaded.metadata.chunk_id
+    assert rows[0].location.startswith("locator-sha256:")
+    assert len(rows[0].location) == len("locator-sha256:") + 64
+    assert rows[0].location != location
+    assert "Private synthetic label" not in json.dumps(asdict(rows[0]))
+    assert store.prepare_rows((manifest,), (embedding,)) == rows
     store.replace_fake_rows(rows)
     validate_v2_index(store, ReleaseBinding(release_id, "a" * 64, digest, 1), (manifest,))
+    assert "Private synthetic label" not in repr(store.read_rows())
+    for bad_location in (location, "locator-sha256:" + "0" * 64):
+        store.replace_fake_rows((replace(rows[0], location=bad_location),))
+        with pytest.raises(CorpusV2StoreError, match="C2_INDEX_EXACT_SET_MISMATCH"):
+            validate_v2_index(store, ReleaseBinding(release_id, "a" * 64, digest, 1), (manifest,))
 
     for changes in ({"source_id": "doc-2"}, {"ordinal": 1}, {"text_sha256": "c" * 64},
                     {"chunk_id": "d" * 64}):
@@ -61,10 +72,10 @@ def test_processing_sha256_survives_typed_manifest_embedding_and_store(tmp_path)
             replace(typed, **changes)
     for changes in ({"release_id": "corpus-v2-other"}, {"source_byte_sha256": "c" * 64},
                     {"parser_policy_version": "parser-v2"}, {"chunk_policy_version": "chunk-v2"},
-                    {"location": "page:2"}):
+                    {"location": "page:3"}):
         with pytest.raises(CorpusV2ContractError, match="C2_CHUNK_PROVENANCE_INVALID"):
             replace(typed, provenance=replace(typed.provenance, **changes))
-    for changes in ({"source_sha256": "c" * 64}, {"location": "page:2"}):
+    for changes in ({"source_sha256": "c" * 64}, {"location": "page:3"}):
         with pytest.raises(CorpusV2StoreError, match="C2_INDEX_METADATA_INVALID"):
             replace(manifest, **changes)
     with pytest.raises(CorpusV2ContractError, match="C2_CHUNK_PROVENANCE_INVALID"):

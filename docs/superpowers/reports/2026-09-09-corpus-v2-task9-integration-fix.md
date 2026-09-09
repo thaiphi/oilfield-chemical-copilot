@@ -1,6 +1,6 @@
 # Task 9 integration fixes
 
-Scope: synthetic code and tests in the isolated Corpus V2 worktree. No main checkout, private corpus, live service, database connection, network operation, or commit.
+Scope: synthetic code and tests in the isolated Corpus V2 worktree. No main checkout, private corpus, live service, database connection, or network operation. The initial integration fixes were committed in `4082e04`; the follow-up locator privacy correction remains uncommitted for review.
 
 ## Sealed acquisition identity
 
@@ -18,4 +18,10 @@ Canonical JSONL accepts authenticated typed chunks and emits only the five publi
 - `python -m ruff check src/oilfield_chemical_copilot/corpus_v2 tests/corpus_v2 --no-cache`: passed.
 - New tests cover changed approved entries before all client actions, preflight of the entire batch, acquisition/resume protection, processing → typed canonical manifest → embedding → candidate store → index validation, private sheet-label exclusion, and mutation of every provenance dimension.
 
-Environment notes: the first sandboxed run could not create pytest temporary lock files. Authorized elevated synthetic checks ran successfully with short worktree-local temporary roots. An initial long temporary root caused two register initialization failures due to Windows path length; rerunning with short roots passed all tests. These temporary directories contain only synthetic test output. All changes remain uncommitted for the final integrated review.
+Environment notes: the first sandboxed run could not create pytest temporary lock files. Authorized elevated synthetic checks ran successfully with short worktree-local temporary roots. An initial long temporary root caused two register initialization failures due to Windows path length; rerunning with short roots passed all tests. These temporary directories contain only synthetic test output.
+
+## Follow-up locator privacy correction
+
+The store manifest is a private authenticated input, not a public readout. Candidate rows now project every page/sheet/document locator to a domain-separated SHA256 token bound to source pseudonym, source snapshot, chunk identity, and validated location. Index validation derives the expected token from private provenance and rejects raw or altered locators. Raw locator labels remain in private processing/provenance only; the token requires private provenance to resolve and is not a human-readable citation. This change preserves the original processing chunk ID.
+
+Follow-up verification: the new page/sheet projection regressions first failed on the raw stored locators. After the correction, `python -m pytest tests/corpus_v2 -q --basetemp .t9pg -p no:cacheprovider` passed with 279 passed and 1 skipped; the Corpus V2 source/test Ruff check and `git diff --check` also passed. Tests cover deterministic projection, unchanged chunk IDs, exclusion of the synthetic private sheet label from stored/read rows, and rejection of raw or altered locator tokens.
