@@ -112,6 +112,10 @@ def candidate(tmp_path):
                 historical_ids={"E1a-3": ["old-3"], "E1a-4": ["old-4"]},
                 scoring_protocol="fixed-v1", regression_families=["chemistry"],
                 minimum_accuracy=0.8, minimum_no_answer_safety=1.0,
+                no_answer_ids=["unseen-new"], no_answer_expected_count=1,
+                no_answer_provenance_sha256="c" * 64,
+                no_answer_baseline_sha256="d" * 64, no_answer_baseline_safety=1.0,
+                no_answer_nonregression="no-decrease",
                 maximum_latency_ms=1000, latency_measurement="end-to-end-p95-ms",
                 no_tuning=True, steward_approved=True)
             artifacts["evaluation_specification"] = release._json(spec)
@@ -120,6 +124,8 @@ def candidate(tmp_path):
             artifacts["evaluation_result"] = release._json(dict(context, aggregates=dict(
                 accuracy=0.9, no_answer_safety=1.0, latency_ms=900,
                 development_count=1, unseen_count=1, no_answer_count=1,
+                no_answer_cohort_sha256=sha256(release._json(["unseen-new"])).hexdigest(),
+                no_answer_provenance_sha256="c" * 64, no_answer_baseline_sha256="d" * 64,
                 regression_families={"chemistry": 0.9})))
             context["result_sha256"] = sha256(artifacts["evaluation_result"]).hexdigest()
             artifacts["promotion_state"] = release._json(dict(context, status="PROMOTION_READY",

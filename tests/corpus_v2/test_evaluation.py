@@ -1,5 +1,6 @@
 """Synthetic contracts only: no evaluation, services, or private corpus access."""
 from copy import deepcopy
+from hashlib import sha256
 import json
 
 import pytest
@@ -59,6 +60,10 @@ def specification():
                 historical_ids={"E1a-3": ["old-3"], "E1a-4": ["old-4"]},
                 scoring_protocol="fixed-protocol-v1", regression_families=["chemistry"],
                 minimum_accuracy=0.8, minimum_no_answer_safety=1.0,
+                no_answer_ids=["unseen-new"], no_answer_expected_count=1,
+                no_answer_provenance_sha256="c" * 64,
+                no_answer_baseline_sha256="d" * 64, no_answer_baseline_safety=1.0,
+                no_answer_nonregression="no-decrease",
                 maximum_latency_ms=1000, latency_measurement="end-to-end-p95-ms",
                 no_tuning=True, steward_approved=True)
 
@@ -66,12 +71,15 @@ def specification():
 def aggregates():
     return dict(accuracy=0.9, no_answer_safety=1.0, latency_ms=900,
                 development_count=1, unseen_count=1, no_answer_count=1,
+                no_answer_cohort_sha256=sha256(ev._json(["unseen-new"])).hexdigest(),
+                no_answer_provenance_sha256="c" * 64, no_answer_baseline_sha256="d" * 64,
                 regression_families={"chemistry": 0.9})
 
 
 def frozen():
     publication = Publication()
     digest = ev.freeze_evaluation_spec(specification(), publication=publication,
+        verify_safety=lambda spec: spec == specification(),
         verify_historical=lambda cohorts: cohorts == {"E1a-3": ["old-3"], "E1a-4": ["old-4"]})
     return publication, digest
 
@@ -187,14 +195,16 @@ def test_only_explicit_owner_action_promotes_once():
         with pytest.raises(ev.CorpusV2EvaluationError):
             ev.record_owner_promotion(publication=pub, release_id="synthetic-v2",
                 recommendation_sha256=recommendation["sha256"], action_id="action-1",
-                authenticate_owner=lambda: owner, explicit_action=explicit)
+                authenticate_owner=lambda: owner, explicit_action=explicit,
+                verify_gate=lambda *args: True)
     assert ev.record_owner_promotion(publication=pub, release_id="synthetic-v2",
         recommendation_sha256=recommendation["sha256"], action_id="action-1",
-        authenticate_owner=lambda: True, explicit_action=True) == "PROMOTED"
+        authenticate_owner=lambda: True, explicit_action=True,
+        verify_gate=lambda *args: True) == "PROMOTED"
     with pytest.raises(ev.CorpusV2EvaluationError):
         ev.record_owner_promotion(publication=pub, release_id="synthetic-v2",
             recommendation_sha256=recommendation["sha256"], action_id="action-2",
-            authenticate_owner=lambda: True, explicit_action=True)
+            authenticate_owner=lambda: True, explicit_action=True, verify_gate=lambda *args: True)
 
 
 def test_mutated_sealed_spec_is_rejected():
@@ -220,3 +230,91 @@ def test_unverified_historical_inventory_cannot_be_frozen():
     with pytest.raises(ev.CorpusV2EvaluationError):
         ev.freeze_evaluation_spec(specification(), publication=Publication(),
                                   verify_historical=lambda cohorts: False)
+
+
+@pytest.mark.parametrize("change", ["extra", "gates", "index", "metrics", "unauthenticated"])
+def test_owner_rejects_forged_canonical_recommendation(change):
+    metrics = aggregates()
+    if change == "metrics":
+        metrics["accuracy"] = 0.1
+    pub, spec, result = evaluated(metrics)
+    payload = dict(release_id="synthetic-v2", spec_sha256=spec, result_sha256=result,
+                   index_sha256="a" * 64, sealed_gates=gates(result), status="PROMOTION_READY")
+    if change == "extra":
+        payload["unexpected"] = True
+    elif change == "gates":
+        payload["sealed_gates"] = {}
+    elif change == "index":
+        payload["index_sha256"] = "f" * 64
+    digest = ev._publish(pub, "synthetic-v2-recommendation", payload)
+    with pytest.raises(ev.CorpusV2EvaluationError):
+        ev.record_owner_promotion(publication=pub, release_id="synthetic-v2",
+            recommendation_sha256=digest, action_id="action-1", explicit_action=True,
+            authenticate_owner=lambda: True, verify_gate=lambda *args: change != "unauthenticated")
+    assert "synthetic-v2-owner-action" not in pub.trees
+
+
+@pytest.mark.parametrize("field,value", [("no_answer_count", 2),
+    ("no_answer_cohort_sha256", "f" * 64), ("no_answer_provenance_sha256", "f" * 64),
+    ("no_answer_baseline_sha256", "f" * 64)])
+def test_result_requires_frozen_safety_population(field, value):
+    result = aggregates()
+    result[field] = value
+    with pytest.raises(ev.CorpusV2EvaluationError):
+        evaluated(result)
+
+
+def test_absolute_safety_pass_cannot_hide_baseline_regression():
+    spec = specification()
+    spec["minimum_no_answer_safety"] = 0.95
+    pub = Publication()
+    frozen_digest = ev.freeze_evaluation_spec(spec, publication=pub,
+        verify_historical=lambda _: True, verify_safety=lambda _: True)
+    metrics = aggregates()
+    metrics["no_answer_safety"] = 0.97
+    result = ev.publish_evaluation_result(metrics, publication=pub, release_id="synthetic-v2",
+        spec_sha256=frozen_digest, verify_index=lambda _: True)
+    assert ready(pub, frozen_digest, result)["status"] == "BLOCKED"
+
+
+@pytest.mark.parametrize("field,value", [("minimum_no_answer_safety", 0),
+    ("minimum_no_answer_safety", 0.5), ("no_answer_ids", ["other"]),
+    ("no_answer_expected_count", 2), ("no_answer_nonregression", "allow-decrease"),
+    ("no_answer_baseline_sha256", ""), ("no_answer_provenance_sha256", "")])
+def test_safety_policy_cannot_be_weakened(field, value):
+    spec = specification()
+    spec[field] = value
+    with pytest.raises(ev.CorpusV2EvaluationError):
+        ev.freeze_evaluation_spec(spec, publication=Publication(), verify_historical=lambda _: True,
+                                  verify_safety=lambda _: True)
+
+
+@pytest.mark.parametrize("verifier", [None, lambda _: False])
+def test_safety_provenance_must_be_authenticated_before_freeze(verifier):
+    pub = Publication()
+    with pytest.raises(ev.CorpusV2EvaluationError):
+        ev.freeze_evaluation_spec(specification(), publication=pub,
+                                  verify_historical=lambda _: True, verify_safety=verifier)
+    assert not pub.trees
+
+
+def test_owner_reauthenticates_exact_context_and_requires_verifier():
+    pub, spec, result = evaluated()
+    recommendation = ready(pub, spec, result)
+    kwargs = dict(publication=pub, release_id="synthetic-v2",
+        recommendation_sha256=recommendation["sha256"], action_id="action-1",
+        authenticate_owner=lambda: True, explicit_action=True)
+    with pytest.raises(ev.CorpusV2EvaluationError):
+        ev.record_owner_promotion(**kwargs)
+    calls = []
+
+    def verify(name, digest, context):
+        calls.append((name, digest, context))
+        return True
+
+    assert ev.record_owner_promotion(**kwargs, verify_gate=verify) == "PROMOTED"
+    assert len(calls) == 7
+    for name, digest, context in calls:
+        assert digest == gates(result)[name]
+        assert context == dict(release_id="synthetic-v2", index_sha256="a" * 64,
+                               spec_sha256=spec, result_sha256=result)

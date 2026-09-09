@@ -21,9 +21,12 @@ _LAYOUT = {"evidence": frozenset({"payload.bin"})}
 _SPEC_KEYS = frozenset({"release_id", "index_sha256", "development_ids", "unseen_ids",
     "historical_ids", "scoring_protocol", "regression_families", "minimum_accuracy",
     "minimum_no_answer_safety", "maximum_latency_ms", "latency_measurement", "no_tuning",
-    "steward_approved"})
+    "steward_approved", "no_answer_ids", "no_answer_expected_count",
+    "no_answer_provenance_sha256", "no_answer_baseline_sha256", "no_answer_baseline_safety",
+    "no_answer_nonregression"})
 _RESULT_KEYS = frozenset({"accuracy", "no_answer_safety", "latency_ms", "development_count",
-    "unseen_count", "no_answer_count", "regression_families"})
+    "unseen_count", "no_answer_count", "regression_families", "no_answer_cohort_sha256",
+    "no_answer_provenance_sha256", "no_answer_baseline_sha256"})
 REQUIRED_PROMOTION_GATES = frozenset({"legacy_guard", "source_accounting",
     "critical_source_evidence", "index_contract", "evaluation_result", "canary_plan",
     "rollback_rehearsal"})
@@ -71,6 +74,18 @@ def _validate_spec(spec):
     historical = set().union(*map(set, spec["historical_ids"].values()))
     if dev & unseen or (dev | unseen) & historical:
         raise ValueError
+    # A fixed 95% floor cannot be weakened by a supplied specification. The
+    # frozen control can require stronger safety and permits no decrease.
+    if (not _identifiers(spec["no_answer_ids"])
+            or not set(spec["no_answer_ids"]) <= unseen
+            or type(spec["no_answer_expected_count"]) is not int
+            or spec["no_answer_expected_count"] != len(spec["no_answer_ids"])
+            or not _digest(spec["no_answer_provenance_sha256"])
+            or not _digest(spec["no_answer_baseline_sha256"])
+            or not _number(spec["no_answer_baseline_safety"], maximum=1)
+            or spec["minimum_no_answer_safety"] < 0.95
+            or spec["no_answer_nonregression"] != "no-decrease"):
+        raise ValueError
 
 
 def _read(publication, name, digest):
@@ -104,17 +119,22 @@ def _publish(publication, name, payload):
     return digest
 
 
-def freeze_evaluation_spec(spec, *, publication, verify_historical=None):
+def freeze_evaluation_spec(spec, *, publication, verify_historical=None, verify_safety=None):
     """Publish steward-attested cohort exclusions before any run/result exists.
 
     verify_historical must authenticate the sealed E1a-3/E1a-4 artifacts and
     compare their COMPLETE identifier inventories with the supplied mapping.
-    No historical reader is installed; absent verification fails closed.
+    verify_safety must authenticate the cohort provenance and baseline artifact
+    digests, verifying complete membership, expected denominator, scoring protocol,
+    and baseline safety on that same cohort. It receives the full frozen spec.
+    No evidence readers are installed; absent verification fails closed.
     """
     try:
         spec = json.loads(_json(spec))
         _validate_spec(spec)
         if verify_historical is None or verify_historical(spec["historical_ids"]) is not True:
+            raise ValueError
+        if verify_safety is None or verify_safety(json.loads(_json(spec))) is not True:
             raise ValueError
         release_id = spec["release_id"]
         if any(publication.final_exists(f"{release_id}-{suffix}")
@@ -165,6 +185,11 @@ def _validate_aggregates(result, spec):
             or result["development_count"] != len(spec["development_ids"])
             or result["unseen_count"] != len(spec["unseen_ids"])
             or result["no_answer_count"] > result["unseen_count"]
+            or result["no_answer_count"] != spec["no_answer_expected_count"]
+            or result["no_answer_cohort_sha256"] != sha256(
+                _json(sorted(spec["no_answer_ids"]))).hexdigest()
+            or result["no_answer_provenance_sha256"] != spec["no_answer_provenance_sha256"]
+            or result["no_answer_baseline_sha256"] != spec["no_answer_baseline_sha256"]
             or type(result["regression_families"]) is not dict
             or set(result["regression_families"]) != set(spec["regression_families"])
             or not all(_number(v, maximum=1) for v in result["regression_families"].values())):
@@ -197,6 +222,21 @@ def _result(publication, release_id, spec_sha256, result_sha256):
     return spec, result["aggregates"]
 
 
+def _passed(spec, result):
+    return (result["accuracy"] >= spec["minimum_accuracy"]
+            and result["no_answer_safety"] >= max(spec["minimum_no_answer_safety"],
+                                                 spec["no_answer_baseline_safety"])
+            and result["latency_ms"] <= spec["maximum_latency_ms"]
+            and all(v >= spec["minimum_accuracy"] for v in result["regression_families"].values()))
+
+
+def _valid_gates(gates, context):
+    return (type(gates) is dict and set(gates) == REQUIRED_PROMOTION_GATES
+            and all(_digest(v) for v in gates.values())
+            and gates["evaluation_result"] == context["result_sha256"]
+            and gates["index_contract"] == context["index_sha256"])
+
+
 def record_promotion_recommendation(*, publication, release_id, spec_sha256, result_sha256,
                                     sealed_gates, verify_gate, canary_passed, rollback_passed):
     """Authenticate each sealed gate with (name, digest, context) before readiness.
@@ -209,19 +249,12 @@ def record_promotion_recommendation(*, publication, release_id, spec_sha256, res
         spec, result = _result(publication, release_id, spec_sha256, result_sha256)
         context = dict(release_id=release_id, index_sha256=spec["index_sha256"],
                        spec_sha256=spec_sha256, result_sha256=result_sha256)
-        valid = (type(sealed_gates) is dict and set(sealed_gates) == REQUIRED_PROMOTION_GATES
-                 and all(_digest(v) for v in sealed_gates.values())
-                 and sealed_gates["evaluation_result"] == result_sha256
-                 and sealed_gates["index_contract"] == spec["index_sha256"]
+        valid = (_valid_gates(sealed_gates, context)
                  and canary_passed is True and rollback_passed is True)
         if valid:
             valid = all(verify_gate(name, digest, dict(context)) is True
                         for name, digest in sorted(sealed_gates.items()))
-        passed = (result["accuracy"] >= spec["minimum_accuracy"]
-                  and result["no_answer_safety"] >= spec["minimum_no_answer_safety"]
-                  and result["latency_ms"] <= spec["maximum_latency_ms"]
-                  and all(v >= spec["minimum_accuracy"]
-                          for v in result["regression_families"].values()))
+        passed = _passed(spec, result)
         status = "PROMOTION_READY" if valid and passed else "BLOCKED"
         # Reject arbitrary gate fields instead of reflecting them into an artifact.
         gates = sealed_gates if valid else {}
@@ -266,30 +299,38 @@ def validate_evaluation_artifacts(*, artifacts, release_id, critical_register_sh
                 or recommendation != dict(context, status="PROMOTION_READY", sealed_gates=gates)):
             raise ValueError
         metrics = result["aggregates"]
-        if (metrics["accuracy"] < spec["minimum_accuracy"]
-                or metrics["no_answer_safety"] < spec["minimum_no_answer_safety"]
-                or metrics["latency_ms"] > spec["maximum_latency_ms"]
-                or any(v < spec["minimum_accuracy"]
-                       for v in metrics["regression_families"].values())):
+        if not _passed(spec, metrics):
             raise ValueError
     except Exception:
         raise CorpusV2EvaluationError("C2_PROMOTION_BLOCKED") from None
 
 
 def record_owner_promotion(*, publication, release_id, recommendation_sha256, action_id,
-                           authenticate_owner, explicit_action):
-    """Record one authenticated explicit action; does not switch a live release."""
+                           authenticate_owner, explicit_action, verify_gate=None):
+    """Reauthenticate every bound gate before recording an explicit owner action.
+
+    verify_gate has the same authenticated-evidence contract as recommendation
+    production, including the frozen cohort/control provenance in evaluation_result.
+    No verifier is installed by default; missing authentication fails closed.
+    """
     try:
         if (not _identifier(release_id) or not _identifier(action_id)
                 or explicit_action is not True or authenticate_owner() is not True):
             raise ValueError
         recommendation = _read(publication, f"{release_id}-recommendation",
                                recommendation_sha256)
-        if (recommendation["release_id"] != release_id
-                or recommendation["status"] != "PROMOTION_READY"):
+        spec, result = _result(publication, release_id, recommendation["spec_sha256"],
+                               recommendation["result_sha256"])
+        context = dict(release_id=release_id, index_sha256=spec["index_sha256"],
+                       spec_sha256=recommendation["spec_sha256"],
+                       result_sha256=recommendation["result_sha256"])
+        gates = recommendation["sealed_gates"]
+        if (recommendation != dict(context, status="PROMOTION_READY", sealed_gates=gates)
+                or not _valid_gates(gates, context) or not _passed(spec, result)
+                or verify_gate is None
+                or not all(verify_gate(name, digest, dict(context)) is True
+                           for name, digest in sorted(gates.items()))):
             raise ValueError
-        _result(publication, release_id, recommendation["spec_sha256"],
-                recommendation["result_sha256"])
         _publish(publication, f"{release_id}-owner-action", dict(
             release_id=release_id, recommendation_sha256=recommendation_sha256,
             action_id=action_id, status="PROMOTED"))
