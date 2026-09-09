@@ -96,7 +96,8 @@ def test_spec_rejects_unfrozen_or_reused_cohorts(field, value):
     spec = specification()
     spec[field] = value
     with pytest.raises(ev.CorpusV2EvaluationError, match="C2_EVALUATION_SPEC_INVALID"):
-        ev.freeze_evaluation_spec(spec, publication=Publication(), verify_historical=lambda _: True)
+        ev.freeze_evaluation_spec(spec, publication=Publication(), verify_historical=lambda _: True,
+                                  verify_safety=lambda _: True)
 
 
 def test_spec_is_immutable_and_no_result_can_precede_it():
@@ -104,7 +105,8 @@ def test_spec_is_immutable_and_no_result_can_precede_it():
     changed = specification()
     changed["minimum_accuracy"] = 0.1
     with pytest.raises(ev.CorpusV2EvaluationError):
-        ev.freeze_evaluation_spec(changed, publication=pub, verify_historical=lambda _: True)
+        ev.freeze_evaluation_spec(changed, publication=pub, verify_historical=lambda _: True,
+                                  verify_safety=lambda _: True)
     assert ev.verify_evaluation_spec(publication=pub, release_id="synthetic-v2",
                                      expected_sha256=digest)["minimum_accuracy"] == 0.8
     with pytest.raises(ev.CorpusV2EvaluationError):
@@ -221,7 +223,8 @@ def test_preexisting_result_prevents_spec_freeze():
     pub = Publication()
     pub.trees["synthetic-v2-result"] = {}
     with pytest.raises(ev.CorpusV2EvaluationError):
-        ev.freeze_evaluation_spec(specification(), publication=pub, verify_historical=lambda _: True)
+        ev.freeze_evaluation_spec(specification(), publication=pub, verify_historical=lambda _: True,
+                                  verify_safety=lambda _: True)
 
 
 def test_unverified_historical_inventory_cannot_be_frozen():

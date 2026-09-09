@@ -1,7 +1,7 @@
 # Corpus V2 release and runtime contract verification
 
 Task 7's earlier review fixes were committed at
-`4a327b179a668b938899892ba36d25d7785e429e`. The subsequent review corrections
+`65daac8`. The subsequent review corrections
 described in `2026-09-08-corpus-v2-task7.md` remain uncommitted. Verification
 uses synthetic fixtures only. No private document processing, network, database
 connection, backup/restore, or promotion occurred.
